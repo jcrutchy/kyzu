@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+
 use winit::{
   event::*,
   event_loop::{EventLoop, EventLoopWindowTarget},

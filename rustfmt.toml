@@ -4,7 +4,8 @@ tab_spaces = 2
 brace_style = "AlwaysNextLine"
 control_brace_style = "AlwaysNextLine"
 
-# Optional but nice:
 indent_style = "Block"
 reorder_imports = true
 use_small_heuristics = "Max"
+
+group_imports = "StdExternalCrate"

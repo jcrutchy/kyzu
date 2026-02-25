@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
-use winit::window::Window;
 
-use crate::camera::{Camera, CameraUniform};
+use winit::window::Window;
 
 use super::cube::CubeMesh;
 use super::depth::DepthResources;
+use crate::camera::{Camera, CameraUniform};
 
 pub struct Renderer<'a>
 {

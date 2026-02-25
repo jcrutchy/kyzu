@@ -1,5 +1,4 @@
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-
 use winit::keyboard::{Key, NamedKey};
 
 pub struct InputState
