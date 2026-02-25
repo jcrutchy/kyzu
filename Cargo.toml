@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "kyzu-core",
+    "kyzu-native"
+]
+
+resolver = "2"

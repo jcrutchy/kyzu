@@ -1,7 +1,9 @@
-mod camera;
-mod renderer;
 mod app;
+mod camera;
+mod input;
+mod renderer;
 
-fn main() {
-    app::run();
+fn main()
+{
+  app::run();
 }
