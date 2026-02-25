@@ -1,0 +1,26 @@
+[package]
+name = "kyzu-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# wgpu with WebGPU backend enabled for WASM
+wgpu = { version = "0.20", features = ["webgl"] }
+
+# lets us block on async futures in WASM (we’ll use this soon)
+pollster = "0.3"
+
+# only DOM types needed — no WebGPU bindings
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "console"
+] }

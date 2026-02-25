@@ -1,0 +1,20 @@
+[package]
+name = "kyzu-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GPU abstraction layer (Vulkan/Metal/DX12/WebGPU)
+wgpu = "=0.20.1"
+
+# Windowing + event loop
+winit = "0.29"
+
+# Async helper for wgpu initialization
+pollster = "0.3"
+
+# Math library (matrices, vectors, transforms)
+glam = "0.27"
+
+# Safe casting between Rust types and GPU buffers
+bytemuck = { version = "1.15", features = ["derive"] }
