@@ -42,7 +42,7 @@ fn apply_orbit(input: &InputState, camera: &mut Camera)
     return;
   }
 
-  let delta_az = -input.mouse_dx * ORBIT_SENSITIVITY;
+  let delta_az = input.mouse_dx * ORBIT_SENSITIVITY;
   let delta_el = input.mouse_dy * ORBIT_SENSITIVITY;
 
   camera.orbit(delta_az, delta_el);
