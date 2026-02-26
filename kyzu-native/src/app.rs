@@ -1,140 +1,139 @@
 use std::sync::{Arc, Mutex};
 
 use winit::{
-  event::*,
-  event_loop::{EventLoop, EventLoopWindowTarget},
-  window::WindowBuilder,
+  application::ApplicationHandler,
+  event::WindowEvent,
+  event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+  window::{Window, WindowId},
 };
 
 use crate::camera::Camera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
 
-//
-// ──────────────────────────────────────────────────────────────
-//   Entry point
-// ──────────────────────────────────────────────────────────────
-//
-
 pub fn run()
 {
   let event_loop = EventLoop::new().unwrap();
-  let window = create_window(&event_loop);
+  let mut app = KyzuApp::new();
 
-  let camera = Arc::new(Mutex::new(create_camera(&window)));
-  let mut renderer = create_renderer(&window, &camera);
-
-  let mut input = InputState::new();
-
-  let window_ref = window.clone();
-  let camera_ref = camera.clone();
-
-  let _ = event_loop.run(move |event, elwt| {
-    handle_event(&window_ref, &mut renderer, &camera_ref, &mut input, event, elwt);
-  });
+  event_loop.run_app(&mut app).unwrap();
 }
 
-//
-// ──────────────────────────────────────────────────────────────
-//   Setup helpers
-// ──────────────────────────────────────────────────────────────
-//
-
-fn create_window(event_loop: &EventLoop<()>) -> Arc<winit::window::Window>
+struct KyzuApp
 {
-  Arc::new(WindowBuilder::new().with_title("Kyzu — Minimal Cube").build(event_loop).unwrap())
+  window: Option<Arc<Window>>,
+  renderer: Option<Renderer>,
+  camera: Arc<Mutex<Camera>>,
+  input: InputState,
 }
 
-fn create_camera(window: &winit::window::Window) -> Camera
+impl KyzuApp
 {
-  let size = window.inner_size();
-  Camera::new(size.width as f32 / size.height as f32)
-}
-
-fn create_renderer<'a>(
-  window: &'a Arc<winit::window::Window>,
-  camera: &'a Arc<Mutex<Camera>>,
-) -> Renderer<'a>
-{
-  pollster::block_on(Renderer::new(window, camera))
-}
-
-//
-// ──────────────────────────────────────────────────────────────
-//   Event dispatcher
-// ──────────────────────────────────────────────────────────────
-//
-
-fn handle_event(
-  window: &Arc<winit::window::Window>,
-  renderer: &mut Renderer,
-  camera: &Arc<Mutex<Camera>>,
-  input: &mut InputState,
-  event: Event<()>,
-  elwt: &EventLoopWindowTarget<()>,
-)
-{
-  match event
+  fn new() -> Self
   {
-    Event::WindowEvent { event, .. } =>
+    let camera = Camera::new(16.0 / 9.0);
+
+    Self {
+      window: None,
+      renderer: None,
+      camera: Arc::new(Mutex::new(camera)),
+      input: InputState::new(),
+    }
+  }
+
+  fn init_window_and_renderer(&mut self, event_loop: &ActiveEventLoop)
+  {
+    if self.window.is_some()
     {
-      handle_window_event(window, renderer, camera, input, event, elwt);
+      return;
     }
 
-    Event::AboutToWait =>
+    let attrs = Window::default_attributes().with_title("Kyzu — Minimal Cube");
+    let window = Arc::new(event_loop.create_window(attrs).unwrap());
+
+    {
+      let size = window.inner_size();
+      let mut cam = self.camera.lock().unwrap();
+      cam.set_aspect(size.width as f32 / size.height as f32);
+    }
+
+    let renderer = pollster::block_on(Renderer::new(window.clone(), self.camera.clone()));
+
+    self.window = Some(window);
+    self.renderer = Some(renderer);
+  }
+
+  fn handle_window_event(&mut self, elwt: &ActiveEventLoop, window_id: WindowId, event: WindowEvent)
+  {
+    let window = match &self.window
+    {
+      Some(w) if w.id() == window_id => w,
+      _ => return,
+    };
+
+    self.input.handle_event(&event);
+
+    match event
+    {
+      WindowEvent::CloseRequested =>
+      {
+        elwt.exit();
+      }
+
+      WindowEvent::Resized(size) =>
+      {
+        if size.width == 0 || size.height == 0
+        {
+          return;
+        }
+
+        if let Some(renderer) = &mut self.renderer
+        {
+          renderer.resize(size.width, size.height);
+        }
+
+        let mut cam = self.camera.lock().unwrap();
+        cam.set_aspect(size.width as f32 / size.height as f32);
+
+        if let Some(renderer) = &mut self.renderer
+        {
+          renderer.update_camera(&cam);
+        }
+
+        window.request_redraw();
+      }
+
+      _ =>
+      {}
+    }
+  }
+
+  fn frame(&mut self)
+  {
+    if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer)
     {
       renderer.render();
       window.request_redraw();
-
-      input.end_frame();
+      self.input.end_frame();
     }
-
-    _ =>
-    {}
   }
 }
 
-//
-// ──────────────────────────────────────────────────────────────
-//   Window event handler
-// ──────────────────────────────────────────────────────────────
-//
-
-fn handle_window_event(
-  _window: &Arc<winit::window::Window>,
-  renderer: &mut Renderer,
-  camera: &Arc<Mutex<Camera>>,
-  input: &mut InputState,
-  event: WindowEvent,
-  elwt: &EventLoopWindowTarget<()>,
-)
+impl ApplicationHandler for KyzuApp
 {
-  // Always feed input first
-  input.handle_event(&event);
-
-  match event
+  fn resumed(&mut self, event_loop: &ActiveEventLoop)
   {
-    WindowEvent::CloseRequested =>
-    {
-      elwt.exit();
-    }
+    event_loop.set_control_flow(ControlFlow::Wait);
+    self.init_window_and_renderer(event_loop);
+  }
 
-    WindowEvent::Resized(size) =>
-    {
-      if size.width == 0 || size.height == 0
-      {
-        return;
-      }
+  fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent)
+  {
+    self.handle_window_event(event_loop, window_id, event);
+  }
 
-      let mut cam = camera.lock().unwrap();
-      cam.set_aspect(size.width as f32 / size.height as f32);
-      renderer.update_camera(&cam);
-    }
-
-    WindowEvent::ScaleFactorChanged { .. } =>
-    {}
-
-    _ =>
-    {}
+  fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop)
+  {
+    self.frame();
   }
 }

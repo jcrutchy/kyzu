@@ -6,9 +6,9 @@ use super::cube::CubeMesh;
 use super::depth::DepthResources;
 use crate::camera::{Camera, CameraUniform};
 
-pub struct Renderer<'a>
+pub struct Renderer
 {
-  surface: wgpu::Surface<'a>,
+  surface: wgpu::Surface<'static>,
   device: wgpu::Device,
   queue: wgpu::Queue,
   config: wgpu::SurfaceConfiguration,
@@ -21,28 +21,29 @@ pub struct Renderer<'a>
   cube: CubeMesh,
 }
 
-//
-// ──────────────────────────────────────────────────────────────
-//   Public API
-// ──────────────────────────────────────────────────────────────
-//
-
-impl<'a> Renderer<'a>
+impl Renderer
 {
-  pub async fn new(window: &'a Window, camera: &Arc<Mutex<Camera>>) -> Self
+  pub async fn new(window: Arc<Window>, camera: Arc<Mutex<Camera>>) -> Self
   {
     let instance = wgpu::Instance::default();
-    let surface = instance.create_surface(window).unwrap();
+
+    // Unsafe surface creation to get Surface<'static>
+    let surface_target = unsafe {
+      wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
+        .expect("Failed to create surface target from window")
+    };
+
+    let surface = unsafe { instance.create_surface_unsafe(surface_target) }
+      .expect("Failed to create wgpu surface");
 
     let adapter = request_adapter(&instance, &surface).await;
     let (device, queue) = request_device(&adapter).await;
 
-    let config = configure_surface(window, &surface, &adapter, &device);
+    let config = configure_surface(window.as_ref(), &surface, &adapter, &device);
     let depth = DepthResources::create(&device, &config);
 
     let (camera_buffer, camera_bind_group, camera_bgl) = create_camera_resources(&device);
 
-    // Upload initial camera uniform
     {
       let cam = camera.lock().unwrap();
       let uniform = CameraUniform::from_camera(&cam);
@@ -59,6 +60,20 @@ impl<'a> Renderer<'a>
   {
     let uniform = CameraUniform::from_camera(camera);
     self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+  }
+
+  pub fn resize(&mut self, width: u32, height: u32)
+  {
+    if width == 0 || height == 0
+    {
+      return;
+    }
+
+    self.config.width = width;
+    self.config.height = height;
+
+    self.depth = DepthResources::create(&self.device, &self.config);
+    self.surface.configure(&self.device, &self.config);
   }
 
   pub fn render(&mut self)
@@ -93,12 +108,6 @@ impl<'a> Renderer<'a>
   }
 }
 
-//
-// ──────────────────────────────────────────────────────────────
-//   Initialization Helpers
-// ──────────────────────────────────────────────────────────────
-//
-
 async fn request_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> wgpu::Adapter
 {
   instance
@@ -119,6 +128,7 @@ async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue)
         label: Some("Kyzu Device"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
       },
       None,
     )
@@ -208,7 +218,7 @@ fn create_pipeline(
     layout: Some(&layout),
     vertex: wgpu::VertexState {
       module: &shader,
-      entry_point: "vs_main",
+      entry_point: Some("vs_main"),
       buffers: &[wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<[f32; 3]>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
@@ -218,7 +228,7 @@ fn create_pipeline(
     },
     fragment: Some(wgpu::FragmentState {
       module: &shader,
-      entry_point: "fs_main",
+      entry_point: Some("fs_main"),
       targets: &[Some(wgpu::ColorTargetState {
         format: config.format,
         blend: Some(wgpu::BlendState::REPLACE),
@@ -236,14 +246,9 @@ fn create_pipeline(
     }),
     multisample: wgpu::MultisampleState::default(),
     multiview: None,
+    cache: None,
   })
 }
-
-//
-// ──────────────────────────────────────────────────────────────
-//   Render Pass
-// ──────────────────────────────────────────────────────────────
-//
 
 fn record_render_pass(
   encoder: &mut wgpu::CommandEncoder,
