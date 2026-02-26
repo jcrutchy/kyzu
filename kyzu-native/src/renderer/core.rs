@@ -4,6 +4,7 @@ use winit::window::Window;
 
 use super::cube::CubeMesh;
 use super::depth::DepthResources;
+use super::grid::{create_grid_pipeline, GridMesh};
 use crate::camera::{Camera, CameraUniform};
 
 //
@@ -25,6 +26,9 @@ pub struct Renderer
 
   pipeline: wgpu::RenderPipeline,
   cube: CubeMesh,
+
+  grid: GridMesh,
+  grid_pipeline: wgpu::RenderPipeline,
 }
 
 //
@@ -54,13 +58,31 @@ impl Renderer
     let pipeline = create_pipeline(&device, &config, &camera_bgl);
     let cube = CubeMesh::create(&device);
 
-    Self { surface, device, queue, config, depth, camera_buffer, camera_bind_group, pipeline, cube }
+    let grid = GridMesh::create(&device);
+    let grid_pipeline = create_grid_pipeline(&device, &config, &grid.bind_group_layout);
+
+    grid.update(&queue, camera);
+
+    Self {
+      surface,
+      device,
+      queue,
+      config,
+      depth,
+      camera_buffer,
+      camera_bind_group,
+      pipeline,
+      cube,
+      grid,
+      grid_pipeline,
+    }
   }
 
   pub fn update_camera(&mut self, camera: &Camera)
   {
     let uniform = CameraUniform::from_camera(camera);
     self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    self.grid.update(&self.queue, camera);
   }
 
   pub fn resize(&mut self, width: u32, height: u32)
@@ -102,6 +124,8 @@ impl Renderer
       &self.pipeline,
       &self.camera_bind_group,
       &self.cube,
+      &self.grid_pipeline,
+      &self.grid,
     );
 
     self.queue.submit(Some(encoder.finish()));
@@ -268,6 +292,8 @@ fn record_render_pass(
   pipeline: &wgpu::RenderPipeline,
   camera_bg: &wgpu::BindGroup,
   cube: &CubeMesh,
+  grid_pipeline: &wgpu::RenderPipeline,
+  grid: &GridMesh,
 )
 {
   let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -292,9 +318,15 @@ fn record_render_pass(
     timestamp_writes: None,
   });
 
+  // Opaque geometry first
   pass.set_pipeline(pipeline);
   pass.set_bind_group(0, camera_bg, &[]);
   pass.set_vertex_buffer(0, cube.vertex_buffer.slice(..));
   pass.set_index_buffer(cube.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
   pass.draw_indexed(0..cube.index_count, 0, 0..1);
+
+  // Transparent grid on top (no VBO — full-screen triangle, 3 verts)
+  pass.set_pipeline(grid_pipeline);
+  pass.set_bind_group(0, &grid.bind_group, &[]);
+  pass.draw(0..3, 0..1);
 }

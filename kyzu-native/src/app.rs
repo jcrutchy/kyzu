@@ -8,7 +8,7 @@ use winit::{
 };
 
 use crate::camera::Camera;
-use crate::input::InputState;
+use crate::input::{apply_input_to_camera, InputState};
 use crate::renderer::Renderer;
 
 //
@@ -112,6 +112,13 @@ impl KyzuApp
       Some(r) => r,
       None => return,
     };
+
+    // Apply input to camera then upload if anything changed
+    {
+      let mut cam = self.camera.lock().unwrap();
+      apply_input_to_camera(&self.input, &mut cam);
+      renderer.update_camera(&cam);
+    }
 
     renderer.render();
     window.request_redraw();

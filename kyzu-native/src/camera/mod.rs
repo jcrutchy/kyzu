@@ -1,3 +1,5 @@
-mod fixed;
+mod spherical;
+mod uniform;
 
-pub use fixed::{Camera, CameraUniform};
+pub use spherical::Camera;
+pub use uniform::CameraUniform;

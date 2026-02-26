@@ -1,5 +1,14 @@
+mod camera_control;
+
+pub use camera_control::apply_input_to_camera;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
+
+//
+// ──────────────────────────────────────────────────────────────
+//   Input state
+// ──────────────────────────────────────────────────────────────
+//
 
 pub struct InputState
 {
@@ -69,7 +78,7 @@ impl InputState
 
       WindowEvent::MouseWheel { delta, .. } => match delta
       {
-        MouseScrollDelta::LineDelta(_, y) => self.scroll += *y,
+        MouseScrollDelta::LineDelta(_, y) => self.scroll += y,
         MouseScrollDelta::PixelDelta(p) => self.scroll += p.y as f32,
       },
 
