@@ -1,10 +1,16 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use winit::window::Window;
 
 use super::cube::CubeMesh;
 use super::depth::DepthResources;
 use crate::camera::{Camera, CameraUniform};
+
+//
+// ──────────────────────────────────────────────────────────────
+//   Renderer
+// ──────────────────────────────────────────────────────────────
+//
 
 pub struct Renderer
 {
@@ -21,34 +27,29 @@ pub struct Renderer
   cube: CubeMesh,
 }
 
+//
+// ──────────────────────────────────────────────────────────────
+//   Public API
+// ──────────────────────────────────────────────────────────────
+//
+
 impl Renderer
 {
-  pub async fn new(window: Arc<Window>, camera: Arc<Mutex<Camera>>) -> Self
+  pub async fn new(window: Arc<Window>, camera: &Camera) -> Self
   {
     let instance = wgpu::Instance::default();
-
-    // Unsafe surface creation to get Surface<'static>
-    let surface_target = unsafe {
-      wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
-        .expect("Failed to create surface target from window")
-    };
-
-    let surface = unsafe { instance.create_surface_unsafe(surface_target) }
-      .expect("Failed to create wgpu surface");
+    let surface = instance.create_surface(window).expect("Failed to create wgpu surface");
 
     let adapter = request_adapter(&instance, &surface).await;
     let (device, queue) = request_device(&adapter).await;
 
-    let config = configure_surface(window.as_ref(), &surface, &adapter, &device);
+    let config = configure_surface(&surface, &adapter, &device);
     let depth = DepthResources::create(&device, &config);
 
     let (camera_buffer, camera_bind_group, camera_bgl) = create_camera_resources(&device);
 
-    {
-      let cam = camera.lock().unwrap();
-      let uniform = CameraUniform::from_camera(&cam);
-      queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
-    }
+    let uniform = CameraUniform::from_camera(camera);
+    queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
 
     let pipeline = create_pipeline(&device, &config, &camera_bgl);
     let cube = CubeMesh::create(&device);
@@ -72,8 +73,8 @@ impl Renderer
     self.config.width = width;
     self.config.height = height;
 
-    self.depth = DepthResources::create(&self.device, &self.config);
     self.surface.configure(&self.device, &self.config);
+    self.depth = DepthResources::create(&self.device, &self.config);
   }
 
   pub fn render(&mut self)
@@ -84,7 +85,7 @@ impl Renderer
       Err(_) =>
       {
         self.surface.configure(&self.device, &self.config);
-        self.surface.get_current_texture().expect("Failed to acquire frame")
+        self.surface.get_current_texture().expect("Failed to acquire frame after reconfigure")
       }
     };
 
@@ -108,6 +109,12 @@ impl Renderer
   }
 }
 
+//
+// ──────────────────────────────────────────────────────────────
+//   Initialisation helpers
+// ──────────────────────────────────────────────────────────────
+//
+
 async fn request_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> wgpu::Adapter
 {
   instance
@@ -117,7 +124,7 @@ async fn request_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>)
       force_fallback_adapter: false,
     })
     .await
-    .expect("No suitable GPU adapters found")
+    .expect("No suitable GPU adapter found")
 }
 
 async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue)
@@ -137,21 +144,19 @@ async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue)
 }
 
 fn configure_surface(
-  window: &Window,
   surface: &wgpu::Surface<'_>,
   adapter: &wgpu::Adapter,
   device: &wgpu::Device,
 ) -> wgpu::SurfaceConfiguration
 {
-  let size = window.inner_size();
   let caps = surface.get_capabilities(adapter);
   let format = caps.formats[0];
 
   let config = wgpu::SurfaceConfiguration {
     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
     format,
-    width: size.width,
-    height: size.height,
+    width: 1,
+    height: 1,
     present_mode: wgpu::PresentMode::Fifo,
     alpha_mode: wgpu::CompositeAlphaMode::Auto,
     view_formats: vec![],
@@ -250,6 +255,12 @@ fn create_pipeline(
   })
 }
 
+//
+// ──────────────────────────────────────────────────────────────
+//   Render pass
+// ──────────────────────────────────────────────────────────────
+//
+
 fn record_render_pass(
   encoder: &mut wgpu::CommandEncoder,
   color_view: &wgpu::TextureView,
@@ -260,7 +271,7 @@ fn record_render_pass(
 )
 {
   let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-    label: Some("Cube Render Pass"),
+    label: Some("Render Pass"),
     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
       view: color_view,
       resolve_target: None,

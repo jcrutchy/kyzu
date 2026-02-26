@@ -11,6 +11,12 @@ use crate::camera::Camera;
 use crate::input::InputState;
 use crate::renderer::Renderer;
 
+//
+// ──────────────────────────────────────────────────────────────
+//   Entry point
+// ──────────────────────────────────────────────────────────────
+//
+
 pub fn run()
 {
   let event_loop = EventLoop::new().unwrap();
@@ -18,6 +24,12 @@ pub fn run()
 
   event_loop.run_app(&mut app).unwrap();
 }
+
+//
+// ──────────────────────────────────────────────────────────────
+//   Application state
+// ──────────────────────────────────────────────────────────────
+//
 
 struct KyzuApp
 {
@@ -31,12 +43,10 @@ impl KyzuApp
 {
   fn new() -> Self
   {
-    let camera = Camera::new(16.0 / 9.0);
-
     Self {
       window: None,
       renderer: None,
-      camera: Arc::new(Mutex::new(camera)),
+      camera: Arc::new(Mutex::new(Camera::new(16.0 / 9.0))),
       input: InputState::new(),
     }
   }
@@ -48,7 +58,7 @@ impl KyzuApp
       return;
     }
 
-    let attrs = Window::default_attributes().with_title("Kyzu — Minimal Cube");
+    let attrs = Window::default_attributes().with_title("Kyzu");
     let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
     {
@@ -57,67 +67,63 @@ impl KyzuApp
       cam.set_aspect(size.width as f32 / size.height as f32);
     }
 
-    let renderer = pollster::block_on(Renderer::new(window.clone(), self.camera.clone()));
+    let cam = self.camera.lock().unwrap();
+    let renderer = pollster::block_on(Renderer::new(window.clone(), &cam));
 
     self.window = Some(window);
     self.renderer = Some(renderer);
   }
 
-  fn handle_window_event(&mut self, elwt: &ActiveEventLoop, window_id: WindowId, event: WindowEvent)
+  fn on_resize(&mut self, width: u32, height: u32)
+  {
+    if width == 0 || height == 0
+    {
+      return;
+    }
+
+    let renderer = match &mut self.renderer
+    {
+      Some(r) => r,
+      None => return,
+    };
+
+    renderer.resize(width, height);
+
+    let mut cam = self.camera.lock().unwrap();
+    cam.set_aspect(width as f32 / height as f32);
+    renderer.update_camera(&cam);
+
+    if let Some(window) = &self.window
+    {
+      window.request_redraw();
+    }
+  }
+
+  fn on_frame(&mut self)
   {
     let window = match &self.window
     {
-      Some(w) if w.id() == window_id => w,
-      _ => return,
+      Some(w) => w,
+      None => return,
     };
 
-    self.input.handle_event(&event);
-
-    match event
+    let renderer = match &mut self.renderer
     {
-      WindowEvent::CloseRequested =>
-      {
-        elwt.exit();
-      }
+      Some(r) => r,
+      None => return,
+    };
 
-      WindowEvent::Resized(size) =>
-      {
-        if size.width == 0 || size.height == 0
-        {
-          return;
-        }
-
-        if let Some(renderer) = &mut self.renderer
-        {
-          renderer.resize(size.width, size.height);
-        }
-
-        let mut cam = self.camera.lock().unwrap();
-        cam.set_aspect(size.width as f32 / size.height as f32);
-
-        if let Some(renderer) = &mut self.renderer
-        {
-          renderer.update_camera(&cam);
-        }
-
-        window.request_redraw();
-      }
-
-      _ =>
-      {}
-    }
-  }
-
-  fn frame(&mut self)
-  {
-    if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer)
-    {
-      renderer.render();
-      window.request_redraw();
-      self.input.end_frame();
-    }
+    renderer.render();
+    window.request_redraw();
+    self.input.end_frame();
   }
 }
+
+//
+// ──────────────────────────────────────────────────────────────
+//   winit ApplicationHandler impl
+// ──────────────────────────────────────────────────────────────
+//
 
 impl ApplicationHandler for KyzuApp
 {
@@ -129,11 +135,34 @@ impl ApplicationHandler for KyzuApp
 
   fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent)
   {
-    self.handle_window_event(event_loop, window_id, event);
+    let is_our_window = self.window.as_ref().map_or(false, |w| w.id() == window_id);
+
+    if !is_our_window
+    {
+      return;
+    }
+
+    self.input.handle_event(&event);
+
+    match event
+    {
+      WindowEvent::CloseRequested =>
+      {
+        event_loop.exit();
+      }
+
+      WindowEvent::Resized(size) =>
+      {
+        self.on_resize(size.width, size.height);
+      }
+
+      _ =>
+      {}
+    }
   }
 
   fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop)
   {
-    self.frame();
+    self.on_frame();
   }
 }
