@@ -1,6 +1,3 @@
-use glam::Mat4;
-use wgpu::util::DeviceExt;
-
 use crate::camera::Camera;
 
 //
@@ -13,11 +10,14 @@ use crate::camera::Camera;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniform
 {
-  pub view_proj: [[f32; 4]; 4],
-  pub inv_view_proj: [[f32; 4]; 4],
-  pub eye_pos: [f32; 3],
-  pub _pad: f32,
-}
+  pub view_proj: [[f32; 4]; 4],     //  64 bytes
+  pub inv_view_proj: [[f32; 4]; 4], //  64 bytes
+  pub eye_pos: [f32; 3],            //  12 bytes
+  pub _pad0: f32,                   //   4 bytes  -- pads eye_pos to vec3 alignment (16)
+  pub fade_near: f32,               //   4 bytes
+  pub fade_far: f32,                //   4 bytes
+  pub _pad1: [f32; 2],              //   8 bytes  -- pads struct to 176 (next 16-byte boundary)
+} // = 176 bytes total
 
 impl GridUniform
 {
@@ -31,7 +31,10 @@ impl GridUniform
       view_proj: view_proj.to_cols_array_2d(),
       inv_view_proj: inv_view_proj.to_cols_array_2d(),
       eye_pos: eye.to_array(),
-      _pad: 0.0,
+      _pad0: 0.0,
+      fade_near: camera.radius * 2.5,
+      fade_far: camera.radius * 25.0,
+      _pad1: [0.0; 2],
     }
   }
 }

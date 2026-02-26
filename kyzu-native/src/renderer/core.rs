@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+use super::axes::{create_axes_pipeline, AxesMesh};
 use super::cube::CubeMesh;
+use super::debug::DebugMesh;
 use super::depth::DepthResources;
 use super::grid::{create_grid_pipeline, GridMesh};
 use crate::camera::{Camera, CameraUniform};
@@ -23,12 +25,19 @@ pub struct Renderer
   depth: DepthResources,
   camera_buffer: wgpu::Buffer,
   camera_bind_group: wgpu::BindGroup,
+  #[allow(dead_code)]
+  camera_bgl: wgpu::BindGroupLayout,
 
   pipeline: wgpu::RenderPipeline,
   cube: CubeMesh,
 
   grid: GridMesh,
   grid_pipeline: wgpu::RenderPipeline,
+
+  axes: AxesMesh,
+  axes_pipeline: wgpu::RenderPipeline,
+
+  debug: DebugMesh,
 }
 
 //
@@ -60,8 +69,13 @@ impl Renderer
 
     let grid = GridMesh::create(&device);
     let grid_pipeline = create_grid_pipeline(&device, &config, &grid.bind_group_layout);
-
     grid.update(&queue, camera);
+
+    let axes = AxesMesh::create(&device);
+    let axes_pipeline = create_axes_pipeline(&device, &config, &camera_bgl);
+
+    let mut debug = DebugMesh::create(&device);
+    debug.update(&queue, camera);
 
     Self {
       surface,
@@ -71,10 +85,14 @@ impl Renderer
       depth,
       camera_buffer,
       camera_bind_group,
+      camera_bgl,
       pipeline,
       cube,
       grid,
       grid_pipeline,
+      axes,
+      axes_pipeline,
+      debug,
     }
   }
 
@@ -83,6 +101,7 @@ impl Renderer
     let uniform = CameraUniform::from_camera(camera);
     self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     self.grid.update(&self.queue, camera);
+    self.debug.update(&self.queue, camera);
   }
 
   pub fn resize(&mut self, width: u32, height: u32)
@@ -126,6 +145,9 @@ impl Renderer
       &self.cube,
       &self.grid_pipeline,
       &self.grid,
+      &self.axes_pipeline,
+      &self.axes,
+      &self.debug,
     );
 
     self.queue.submit(Some(encoder.finish()));
@@ -294,6 +316,9 @@ fn record_render_pass(
   cube: &CubeMesh,
   grid_pipeline: &wgpu::RenderPipeline,
   grid: &GridMesh,
+  axes_pipeline: &wgpu::RenderPipeline,
+  axes: &AxesMesh,
+  debug: &DebugMesh,
 )
 {
   let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -318,14 +343,27 @@ fn record_render_pass(
     timestamp_writes: None,
   });
 
-  // Opaque geometry first
+  // Opaque geometry
   pass.set_pipeline(pipeline);
   pass.set_bind_group(0, camera_bg, &[]);
   pass.set_vertex_buffer(0, cube.vertex_buffer.slice(..));
   pass.set_index_buffer(cube.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
   pass.draw_indexed(0..cube.index_count, 0, 0..1);
 
-  // Transparent grid on top (no VBO — full-screen triangle, 3 verts)
+  // Axis arrows (opaque lines, depth tested)
+  pass.set_pipeline(axes_pipeline);
+  pass.set_bind_group(0, camera_bg, &[]);
+  pass.set_vertex_buffer(0, axes.vertex_buffer.slice(..));
+  pass.draw(0..axes.vertex_count, 0..1);
+
+  // Debug markers (reuses axes pipeline — same vertex layout and shader)
+  if debug.vertex_count > 0
+  {
+    pass.set_vertex_buffer(0, debug.vertex_buffer.slice(..));
+    pass.draw(0..debug.vertex_count, 0..1);
+  }
+
+  // Transparent grid last
   pass.set_pipeline(grid_pipeline);
   pass.set_bind_group(0, &grid.bind_group, &[]);
   pass.draw(0..3, 0..1);
