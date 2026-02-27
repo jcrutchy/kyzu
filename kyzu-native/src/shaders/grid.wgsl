@@ -4,12 +4,13 @@
 
 struct GridUniform
 {
-  view_proj:     mat4x4<f32>,   //  64 bytes
-  inv_view_proj: mat4x4<f32>,   //  64 bytes
-  eye_pos:       vec3<f32>,     //  16 bytes (vec3 is 16-byte aligned in WGSL)
-  fade_near:     f32,           //   4 bytes
-  fade_far:      f32,           //   4 bytes
-  _pad:          vec2<f32>,     //   8 bytes  → 176 total
+  view_proj:     mat4x4<f32>,
+  inv_view_proj: mat4x4<f32>,
+  eye_pos:       vec3<f32>,
+  _pad0:         f32,       // offset 140
+  fade_near:     f32,       // offset 144
+  fade_far:      f32,       // offset 148
+  _pad1:         vec2<f32>, // offset 152
 };
 
 @group(0) @binding(0)

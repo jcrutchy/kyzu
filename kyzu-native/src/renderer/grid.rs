@@ -3,6 +3,20 @@ use crate::camera::Camera;
 //
 // ──────────────────────────────────────────────────────────────
 //   Grid Uniform (GPU side)
+//
+//   WGSL alignment rules differ from Rust:
+//     vec3<f32> occupies 16 bytes (not 12) due to vec3 alignment.
+//   The Rust struct must manually pad to match. See grid.wgsl.
+//
+//   Layout:
+//     view_proj     : mat4x4<f32>  →  64 bytes  (offset   0)
+//     inv_view_proj : mat4x4<f32>  →  64 bytes  (offset  64)
+//     eye_pos       : vec3<f32>    →  12 bytes  (offset 128)
+//     _pad0         : f32          →   4 bytes  (offset 140) ← pads eye_pos to 16
+//     fade_near     : f32          →   4 bytes  (offset 144)
+//     fade_far      : f32          →   4 bytes  (offset 148)
+//     _pad1         : vec2<f32>    →   8 bytes  (offset 152) ← pads to 16-byte boundary
+//   Total: 160 bytes
 // ──────────────────────────────────────────────────────────────
 //
 
@@ -10,14 +24,18 @@ use crate::camera::Camera;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniform
 {
-  pub view_proj: [[f32; 4]; 4],     //  64 bytes
-  pub inv_view_proj: [[f32; 4]; 4], //  64 bytes
-  pub eye_pos: [f32; 3],            //  12 bytes
-  pub _pad0: f32,                   //   4 bytes  -- pads eye_pos to vec3 alignment (16)
-  pub fade_near: f32,               //   4 bytes
-  pub fade_far: f32,                //   4 bytes
-  pub _pad1: [f32; 2],              //   8 bytes  -- pads struct to 176 (next 16-byte boundary)
-} // = 176 bytes total
+  pub view_proj: [[f32; 4]; 4],     //  64 bytes  (offset   0)
+  pub inv_view_proj: [[f32; 4]; 4], //  64 bytes  (offset  64)
+  pub eye_pos: [f32; 3],            //  12 bytes  (offset 128)
+  pub _pad0: f32,                   //   4 bytes  (offset 140) — pads eye_pos to WGSL vec3 size
+  pub fade_near: f32,               //   4 bytes  (offset 144)
+  pub fade_far: f32,                //   4 bytes  (offset 148)
+  pub _pad1: [f32; 2],              //   8 bytes  (offset 152) — pads struct to 160
+}
+
+// Catch CPU/GPU layout mismatches at compile time.
+// If this fails, recheck WGSL struct alignment in grid.wgsl.
+const _: () = assert!(std::mem::size_of::<GridUniform>() == 160);
 
 impl GridUniform
 {
@@ -122,7 +140,7 @@ pub fn create_grid_pipeline(
     vertex: wgpu::VertexState {
       module: &shader,
       entry_point: Some("vs_main"),
-      buffers: &[], // no VBO — verts generated in shader
+      buffers: &[], // no VBO — full-screen triangle generated in shader
       compilation_options: wgpu::PipelineCompilationOptions::default(),
     },
     fragment: Some(wgpu::FragmentState {
@@ -137,17 +155,13 @@ pub fn create_grid_pipeline(
     }),
     primitive: wgpu::PrimitiveState {
       topology: wgpu::PrimitiveTopology::TriangleList,
-      strip_index_format: None,
-      front_face: wgpu::FrontFace::Ccw,
-      cull_mode: None, // full-screen tri — no culling
-      unclipped_depth: false,
-      polygon_mode: wgpu::PolygonMode::Fill,
-      conservative: false,
+      cull_mode: None, // full-screen triangle — culling makes no sense
+      ..Default::default()
     },
     depth_stencil: Some(wgpu::DepthStencilState {
       format: wgpu::TextureFormat::Depth32Float,
-      depth_write_enabled: false, // grid is transparent — don't write depth
-      depth_compare: wgpu::CompareFunction::LessEqual,
+      depth_write_enabled: false, // transparent — must not occlude geometry behind it
+      depth_compare: wgpu::CompareFunction::LessEqual, // full-screen tri is at far plane
       stencil: wgpu::StencilState::default(),
       bias: wgpu::DepthBiasState::default(),
     }),

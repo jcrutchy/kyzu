@@ -25,6 +25,9 @@ pub struct Renderer
   depth: DepthResources,
   camera_buffer: wgpu::Buffer,
   camera_bind_group: wgpu::BindGroup,
+
+  // Stored so future pipelines that share the camera uniform can be created
+  // without needing a full Renderer rebuild. Not currently read after init.
   #[allow(dead_code)]
   camera_bgl: wgpu::BindGroupLayout,
 
@@ -54,6 +57,14 @@ impl Renderer
     let surface = instance.create_surface(window).expect("Failed to create wgpu surface");
 
     let adapter = request_adapter(&instance, &surface).await;
+
+    let info = adapter.get_info();
+    println!("--------------------------------------------------");
+    println!("ACTIVE GPU: {}", info.name);
+    println!("BACKEND:    {:?}", info.backend);
+    println!("TYPE:       {:?}", info.device_type);
+    println!("--------------------------------------------------");
+
     let (device, queue) = request_device(&adapter).await;
 
     let config = configure_surface(&surface, &adapter, &device);
@@ -64,7 +75,7 @@ impl Renderer
     let uniform = CameraUniform::from_camera(camera);
     queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&uniform));
 
-    let pipeline = create_pipeline(&device, &config, &camera_bgl);
+    let pipeline = create_cube_pipeline(&device, &config, &camera_bgl);
     let cube = CubeMesh::create(&device);
 
     let grid = GridMesh::create(&device);
@@ -125,6 +136,7 @@ impl Renderer
       Ok(frame) => frame,
       Err(_) =>
       {
+        // Surface lost (e.g. window minimised then restored) — reconfigure and retry once
         self.surface.configure(&self.device, &self.config);
         self.surface.get_current_texture().expect("Failed to acquire frame after reconfigure")
       }
@@ -198,11 +210,14 @@ fn configure_surface(
   let caps = surface.get_capabilities(adapter);
   let format = caps.formats[0];
 
+  // Start at a sensible size — on_resize will correct this to the real window size
+  // before any frame is rendered. Starting at 1×1 risks a validation error if a
+  // frame is somehow submitted before the first resize event.
   let config = wgpu::SurfaceConfiguration {
     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
     format,
-    width: 1,
-    height: 1,
+    width: 800,
+    height: 600,
     present_mode: wgpu::PresentMode::Fifo,
     alpha_mode: wgpu::CompositeAlphaMode::Auto,
     view_formats: vec![],
@@ -247,7 +262,7 @@ fn create_camera_resources(
   (camera_buffer, camera_bind_group, camera_bgl)
 }
 
-fn create_pipeline(
+fn create_cube_pipeline(
   device: &wgpu::Device,
   config: &wgpu::SurfaceConfiguration,
   camera_bgl: &wgpu::BindGroupLayout,
@@ -303,7 +318,10 @@ fn create_pipeline(
 
 //
 // ──────────────────────────────────────────────────────────────
-//   Render pass
+//   Render pass — draw order matters:
+//     1. Opaque geometry  (cube)      — writes depth
+//     2. Opaque lines     (axes, debug) — depth tested, writes depth
+//     3. Transparent      (grid)      — depth tested, no depth write
 // ──────────────────────────────────────────────────────────────
 //
 
@@ -343,27 +361,26 @@ fn record_render_pass(
     timestamp_writes: None,
   });
 
-  // Opaque geometry
+  // 1. Opaque geometry
   pass.set_pipeline(pipeline);
   pass.set_bind_group(0, camera_bg, &[]);
   pass.set_vertex_buffer(0, cube.vertex_buffer.slice(..));
   pass.set_index_buffer(cube.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
   pass.draw_indexed(0..cube.index_count, 0, 0..1);
 
-  // Axis arrows (opaque lines, depth tested)
+  // 2. Opaque lines — axes and debug share the same pipeline and vertex layout
   pass.set_pipeline(axes_pipeline);
   pass.set_bind_group(0, camera_bg, &[]);
   pass.set_vertex_buffer(0, axes.vertex_buffer.slice(..));
   pass.draw(0..axes.vertex_count, 0..1);
 
-  // Debug markers (reuses axes pipeline — same vertex layout and shader)
   if debug.vertex_count > 0
   {
     pass.set_vertex_buffer(0, debug.vertex_buffer.slice(..));
     pass.draw(0..debug.vertex_count, 0..1);
   }
 
-  // Transparent grid last
+  // 3. Transparent grid — drawn last so it blends over everything
   pass.set_pipeline(grid_pipeline);
   pass.set_bind_group(0, &grid.bind_group, &[]);
   pass.draw(0..3, 0..1);

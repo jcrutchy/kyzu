@@ -8,12 +8,12 @@ use wgpu::util::DeviceExt;
 
 const AXIS_LENGTH: f32 = 5.0;
 
-// Positive arm colours
+// Positive arm colours (bright)
 const COL_X_POS: [f32; 3] = [1.0, 0.2, 0.2];
 const COL_Y_POS: [f32; 3] = [0.2, 1.0, 0.2];
 const COL_Z_POS: [f32; 3] = [0.2, 0.4, 1.0];
 
-// Negative arm colours (dimmed)
+// Negative arm colours (dimmed — same hue, lower value)
 const COL_X_NEG: [f32; 3] = [0.3, 0.1, 0.1];
 const COL_Y_NEG: [f32; 3] = [0.1, 0.3, 0.1];
 const COL_Z_NEG: [f32; 3] = [0.1, 0.15, 0.3];
@@ -67,23 +67,23 @@ fn make_vertex(pos: [f32; 3], col: [f32; 3]) -> Vertex
 
 fn build_vertices() -> Vec<Vertex>
 {
-  let origin = [0.0_f32, 0.0, 0.0];
+  let o = [0.0_f32, 0.0, 0.0];
 
   vec![
     // +X / -X
-    make_vertex(origin, COL_X_POS),
+    make_vertex(o, COL_X_POS),
     make_vertex([AXIS_LENGTH, 0.0, 0.0], COL_X_POS),
-    make_vertex(origin, COL_X_NEG),
+    make_vertex(o, COL_X_NEG),
     make_vertex([-AXIS_LENGTH, 0.0, 0.0], COL_X_NEG),
     // +Y / -Y
-    make_vertex(origin, COL_Y_POS),
+    make_vertex(o, COL_Y_POS),
     make_vertex([0.0, AXIS_LENGTH, 0.0], COL_Y_POS),
-    make_vertex(origin, COL_Y_NEG),
+    make_vertex(o, COL_Y_NEG),
     make_vertex([0.0, -AXIS_LENGTH, 0.0], COL_Y_NEG),
     // +Z / -Z
-    make_vertex(origin, COL_Z_POS),
+    make_vertex(o, COL_Z_POS),
     make_vertex([0.0, 0.0, AXIS_LENGTH], COL_Z_POS),
-    make_vertex(origin, COL_Z_NEG),
+    make_vertex(o, COL_Z_NEG),
     make_vertex([0.0, 0.0, -AXIS_LENGTH], COL_Z_NEG),
   ]
 }
@@ -139,12 +139,7 @@ pub fn create_axes_pipeline(
     }),
     primitive: wgpu::PrimitiveState {
       topology: wgpu::PrimitiveTopology::LineList,
-      strip_index_format: None,
-      front_face: wgpu::FrontFace::Ccw,
-      cull_mode: None,
-      unclipped_depth: false,
-      polygon_mode: wgpu::PolygonMode::Fill,
-      conservative: false,
+      ..Default::default()
     },
     depth_stencil: Some(wgpu::DepthStencilState {
       format: wgpu::TextureFormat::Depth32Float,

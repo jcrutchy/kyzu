@@ -2,14 +2,31 @@ use crate::camera::Camera;
 
 //
 // ──────────────────────────────────────────────────────────────
+//   Debug visualisation for the camera target
+//
+//   Draws:
+//     - White cross  at camera target (world space)
+//     - Yellow cross at target projected onto Z=0 (XY plane)
+//     - Grey line    connecting them (only when target.z != 0)
+//
+//   Reuses the axes shader and pipeline — same vertex layout [pos: vec3, col: vec3].
+//   Buffer is pre-allocated at startup and written each frame via write_buffer.
+// ──────────────────────────────────────────────────────────────
+//
+
+//
+// ──────────────────────────────────────────────────────────────
 //   Constants
 // ──────────────────────────────────────────────────────────────
 //
 
 const MARKER_ARM: f32 = 0.3;
-const COL_TARGET: [f32; 3] = [1.0, 1.0, 1.0]; // white
-const COL_PROJ: [f32; 3] = [1.0, 1.0, 0.2]; // yellow
-const COL_CONNECT: [f32; 3] = [0.5, 0.5, 0.5]; // grey
+const COL_TARGET: [f32; 3] = [1.0, 1.0, 1.0]; // white  — camera target
+const COL_PROJ: [f32; 3] = [1.0, 1.0, 0.2]; // yellow — XY plane projection
+const COL_CONNECT: [f32; 3] = [0.5, 0.5, 0.5]; // grey   — vertical connecting line
+
+// Minimum Z offset before projection cross and connecting line are drawn
+const Z_THRESHOLD: f32 = 0.001;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -19,8 +36,7 @@ const COL_CONNECT: [f32; 3] = [0.5, 0.5, 0.5]; // grey
 
 type Vertex = [f32; 6];
 
-// Maximum number of vertices we will ever emit (fixed upper bound for buffer alloc)
-// 3 axes * 2 verts * 2 markers = 12, plus 2 for connecting line = 14
+// Two 3-axis crosses = 12 verts, plus 2 for the connecting line = 14 maximum
 const MAX_VERTS: u64 = 14;
 
 //
@@ -56,15 +72,13 @@ impl DebugMesh
 
     let mut verts: Vec<Vertex> = Vec::with_capacity(MAX_VERTS as usize);
 
-    // Target marker (white cross)
+    // White cross at camera target (always drawn)
     push_cross(&mut verts, target.into(), COL_TARGET);
 
-    // XY projection marker (yellow cross) — only if target is meaningfully off the plane
-    push_cross(&mut verts, proj.into(), COL_PROJ);
-
-    // Connecting line — only draw if target has meaningful Z offset
-    if target.z.abs() > 0.001
+    // Yellow cross and grey connecting line only when target is off the XY plane
+    if target.z.abs() > Z_THRESHOLD
     {
+      push_cross(&mut verts, proj.into(), COL_PROJ);
       verts.push(make_vertex(target.into(), COL_CONNECT));
       verts.push(make_vertex(proj.into(), COL_CONNECT));
     }
@@ -88,19 +102,14 @@ fn make_vertex(pos: [f32; 3], col: [f32; 3]) -> Vertex
 
 fn push_cross(verts: &mut Vec<Vertex>, centre: [f32; 3], col: [f32; 3])
 {
-  let x = centre[0];
-  let y = centre[1];
-  let z = centre[2];
+  let [x, y, z] = centre;
 
-  // X arm
   verts.push(make_vertex([x - MARKER_ARM, y, z], col));
   verts.push(make_vertex([x + MARKER_ARM, y, z], col));
 
-  // Y arm
   verts.push(make_vertex([x, y - MARKER_ARM, z], col));
   verts.push(make_vertex([x, y + MARKER_ARM, z], col));
 
-  // Z arm
   verts.push(make_vertex([x, y, z - MARKER_ARM], col));
   verts.push(make_vertex([x, y, z + MARKER_ARM], col));
 }

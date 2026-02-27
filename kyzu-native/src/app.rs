@@ -61,6 +61,9 @@ impl KyzuApp
     let attrs = Window::default_attributes().with_title("Kyzu");
     let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
+    // Set the real aspect ratio from the window before creating the renderer,
+    // then drop and re-acquire the lock so the borrow is immutable for Renderer::new.
+    // The renderer init is synchronous (pollster), so no deadlock risk.
     {
       let size = window.inner_size();
       let mut cam = self.camera.lock().unwrap();
@@ -113,7 +116,6 @@ impl KyzuApp
       None => return,
     };
 
-    // Apply input to camera then upload if anything changed
     {
       let mut cam = self.camera.lock().unwrap();
       apply_input_to_camera(&self.input, &mut cam);
@@ -121,6 +123,10 @@ impl KyzuApp
     }
 
     renderer.render();
+
+    // NOTE: ControlFlow::Wait sleeps between OS events — correct for a tool/editor feel.
+    // When the world simulation needs to tick every frame regardless of input,
+    // switch to ControlFlow::Poll and drive updates from on_frame's elapsed time.
     window.request_redraw();
     self.input.end_frame();
   }
