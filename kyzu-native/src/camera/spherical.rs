@@ -26,8 +26,6 @@ pub struct Camera
 
   pub aspect: f32,
   pub fovy: f32,
-  pub znear: f32,
-  pub zfar: f32,
 }
 
 //
@@ -59,8 +57,6 @@ impl Camera
 
       aspect,
       fovy: std::f32::consts::FRAC_PI_4, // 45° vertical FOV
-      znear: 0.1,
-      zfar: 100_000.0,
     }
   }
 
@@ -153,7 +149,7 @@ fn build_view_matrix(cam: &Camera) -> Mat4
 
 fn build_projection_matrix(cam: &Camera) -> Mat4
 {
-  // Ensure the far plane is always significantly further than the grid fade
-  let dynamic_zfar = cam.zfar.max(cam.radius * 25.0);
-  Mat4::perspective_rh(cam.fovy, cam.aspect, cam.znear, dynamic_zfar)
+  let znear = (cam.radius * 0.01).max(0.0001); // Scale near plane with zoom
+  let zfar = (cam.radius * 100.0).max(10000.0); // Scale far plane with zoom
+  Mat4::perspective_rh(cam.fovy, cam.aspect, znear, zfar)
 }

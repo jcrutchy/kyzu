@@ -28,26 +28,21 @@ impl GridUniform
 {
   pub fn from_camera(camera: &Camera) -> Self
   {
-    let view_proj = camera.build_view_proj();
-    let inv_view_proj = view_proj.inverse();
-    let eye = camera.eye_position();
-
-    // Use log10 to find our current "Power of 10" scale
-    let continuous_log = (camera.radius / 5.0).log10();
-    let lod_level = continuous_log.floor();
-
-    // Correct way to get a 0.0 -> 1.0 fade for both positive and negative zoom
-    let lod_fade = continuous_log - lod_level;
+    // 1. Determine the "Power of 10" we are currently viewing
+    // Dividing by a 'magic number' like 5.0 sets the visual density
+    let log_zoom = (camera.radius / 5.0).log10();
+    let lod_level = log_zoom.floor(); // e.g., -1, 0, 1, 2
+    let lod_fade = log_zoom - lod_level; // 0.0 to 1.0 smooth transition
 
     Self {
-      view_proj: inv_view_proj.to_cols_array_2d(), // Note: Sending Inverse for unproject
-      inv_view_proj: inv_view_proj.to_cols_array_2d(),
-      eye_pos: eye.to_array(),
+      view_proj: camera.build_view_proj().to_cols_array_2d(),
+      inv_view_proj: camera.build_view_proj().inverse().to_cols_array_2d(),
+      eye_pos: camera.eye_position().to_array(),
 
-      // These scale with radius so the grid always reaches the horizon
-      fade_near: camera.radius * 3.0,
-      fade_far: camera.radius * 15.0,
+      fade_near: (camera.radius * 4.0).max(10.0),
+      fade_far: (camera.radius * 15.0).max(40.0),
 
+      // 3. Send the base scale (1, 10, 100, etc.)
       lod_scale: 10.0_f32.powf(lod_level),
       lod_fade,
       _pad: 0.0,
