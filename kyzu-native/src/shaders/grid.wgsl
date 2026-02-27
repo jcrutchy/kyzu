@@ -2,15 +2,12 @@
 //   Grid Uniform
 // ──────────────────────────────────────────────────────────────
 
-struct GridUniform
-{
-  view_proj:     mat4x4<f32>,
-  inv_view_proj: mat4x4<f32>,
-  eye_pos:       vec3<f32>,
-  _pad0:         f32,       // offset 140
-  fade_near:     f32,       // offset 144
-  fade_far:      f32,       // offset 148
-  _pad1:         vec2<f32>, // offset 152
+struct GridUniform {
+    view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    eye_pos: vec3<f32>,
+    fade_near: f32, // Automatically occupies the 4th component of the eye_pos alignment
+    fade_far: f32,  // Starts the next 16-byte block
 };
 
 @group(0) @binding(0)

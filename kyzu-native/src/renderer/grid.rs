@@ -24,13 +24,12 @@ use crate::camera::Camera;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniform
 {
-  pub view_proj: [[f32; 4]; 4],     //  64 bytes  (offset   0)
-  pub inv_view_proj: [[f32; 4]; 4], //  64 bytes  (offset  64)
-  pub eye_pos: [f32; 3],            //  12 bytes  (offset 128)
-  pub _pad0: f32,                   //   4 bytes  (offset 140) — pads eye_pos to WGSL vec3 size
-  pub fade_near: f32,               //   4 bytes  (offset 144)
-  pub fade_far: f32,                //   4 bytes  (offset 148)
-  pub _pad1: [f32; 2],              //   8 bytes  (offset 152) — pads struct to 160
+  pub view_proj: [[f32; 4]; 4],     // 64 bytes (Offset 0)
+  pub inv_view_proj: [[f32; 4]; 4], // 64 bytes (Offset 64)
+  pub eye_pos: [f32; 3],            // 12 bytes (Offset 128)
+  pub fade_near: f32,               //  4 bytes (Offset 140) - Fills the vec3 gap!
+  pub fade_far: f32,                //  4 bytes (Offset 144)
+  pub _pad: [f32; 3],               // 12 bytes (Offset 148) - Pads to 160
 }
 
 // Catch CPU/GPU layout mismatches at compile time.
@@ -49,10 +48,11 @@ impl GridUniform
       view_proj: view_proj.to_cols_array_2d(),
       inv_view_proj: inv_view_proj.to_cols_array_2d(),
       eye_pos: eye.to_array(),
-      _pad0: 0.0,
+      // No _pad0 here! fade_near immediately follows eye_pos
       fade_near: camera.radius * 2.5,
       fade_far: camera.radius * 25.0,
-      _pad1: [0.0; 2],
+      // 3 floats of padding at the end to reach 160 bytes
+      _pad: [0.0; 3],
     }
   }
 }
