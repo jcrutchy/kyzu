@@ -188,15 +188,13 @@ async fn request_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>)
 async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue)
 {
   adapter
-    .request_device(
-      &wgpu::DeviceDescriptor {
-        label: Some("Kyzu Device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
-      },
-      None,
-    )
+    .request_device(&wgpu::DeviceDescriptor {
+      label: Some("Kyzu Device"),
+      required_features: wgpu::Features::empty(),
+      required_limits: wgpu::Limits::default(),
+      memory_hints: wgpu::MemoryHints::Performance,
+      ..Default::default()
+    })
     .await
     .expect("Failed to create device")
 }
@@ -348,6 +346,7 @@ fn record_render_pass(
         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.03, a: 1.0 }),
         store: wgpu::StoreOp::Store,
       },
+      depth_slice: None,
     })],
     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
       view: depth_view,

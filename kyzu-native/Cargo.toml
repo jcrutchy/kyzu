@@ -10,7 +10,7 @@ description = "Kyzu native application"
 winit = "0.30"
 
 # GPU API (Vulkan/Metal/DX12 abstraction)
-wgpu = "23.0"
+wgpu = "27.0"
 
 # Math — bytemuck feature allows Vec3/Mat4 to be sent directly to the GPU
 glam = { version = "0.29", features = ["bytemuck", "std"] }
@@ -24,3 +24,7 @@ pollster = "0.4"
 # wgpu's own logging (errors, validation messages) — initialised in main()
 log        = "0.4"
 env_logger = "0.11"
+
+egui = "0.33.3"
+egui-wgpu = "0.33.3"
+egui-winit = "0.33.3"
