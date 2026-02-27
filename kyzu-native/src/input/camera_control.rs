@@ -9,7 +9,6 @@ use crate::input::InputState;
 
 const ORBIT_SENSITIVITY: f32 = 0.005; // radians per pixel
 const PAN_SENSITIVITY: f32 = 0.002; // world units per pixel (scaled by radius)
-const ZOOM_FACTOR: f32 = 0.1; // 10% radius change per scroll line
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -76,7 +75,7 @@ fn apply_zoom(input: &InputState, camera: &mut Camera)
   }
 
   // Scroll up (positive) zooms in, scroll down zooms out
-  let factor = 1.0 - input.scroll * ZOOM_FACTOR;
+  let factor = (1.1_f32).powf(-input.scroll);
 
   camera.zoom(factor);
 }

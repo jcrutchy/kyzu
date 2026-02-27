@@ -39,8 +39,8 @@ impl GridUniform
       inv_view_proj: camera.build_view_proj().inverse().to_cols_array_2d(),
       eye_pos: camera.eye_position().to_array(),
 
-      fade_near: (camera.radius * 4.0).max(10.0),
-      fade_far: (camera.radius * 15.0).max(40.0),
+      fade_near: (camera.radius * 4.0).max(20.0),
+      fade_far: (camera.radius * 15.0).max(80.0),
 
       // 3. Send the base scale (1, 10, 100, etc.)
       lod_scale: 10.0_f32.powf(lod_level),

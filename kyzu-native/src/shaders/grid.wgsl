@@ -75,24 +75,19 @@ fn fs_main(in : VsOut) -> FsOut {
 
     let t = -pos_near.z / (pos_far.z - pos_near.z);
     
-    // Kill pixels above horizon or too far for float precision (relative to zoom)
     if t <= 0.0 || t > 1e9 { discard; }
 
     let world_pos = pos_near + t * (pos_far - pos_near);
 
-    // 1. Horizon Safety: Fades grid when view is nearly parallel to plane
     let view_dir = normalize(pos_far - pos_near);
     let horizon_fade = smoothstep(0.0, 0.1, abs(view_dir.z));
 
-    // 2. Relative Distance Fade
     let dist = length(world_pos.xy - grid.eye_pos.xy);
     let dist_fade = 1.0 - smoothstep(grid.fade_near, grid.fade_far, dist);
 
     let total_fade = dist_fade * horizon_fade;
     if total_fade <= 0.0 { discard; }
 
-    // 3. Scale-Invariant Procedural Draw
-    // s0 = fading sub-grid, s1 = standard grid, s2 = major grid
     let s0 = grid.lod_scale;
     let s1 = grid.lod_scale * 10.0;
     let s2 = grid.lod_scale * 100.0;
@@ -101,14 +96,33 @@ fn fs_main(in : VsOut) -> FsOut {
     let lod1 = max(grid_factor(world_pos.x, s1), grid_factor(world_pos.y, s1));
     let lod2 = max(grid_factor(world_pos.x, s2), grid_factor(world_pos.y, s2));
 
-    // Transition math: lod0 dissolves as you zoom out
     let final_minor = max(lod1, lod0 * (1.0 - grid.lod_fade));
     let final_major = lod2;
 
-    if final_minor < 0.001 && final_major < 0.001 { discard; }
+    // --- NEW: Axis Detection ---
+    // Calculate how many world units are in one pixel at this location
+    let fw = fwidth(world_pos.xy);
+    
+    // Y-Axis (Green): occurs where world_pos.x is 0
+    // X-Axis (Red): occurs where world_pos.y is 0
+    // We divide by the derivative to keep the line exactly 1.5 - 2.0 pixels wide
+    let axis_x = 1.0 - smoothstep(0.0, 1.0, abs(world_pos.y) / fw.y);
+    let axis_y = 1.0 - smoothstep(0.0, 1.0, abs(world_pos.x) / fw.x);
 
-    let color = mix(MINOR_COLOR, MAJOR_COLOR, final_major);
-    let alpha = max(final_minor, final_major) * total_fade;
+    // --- NEW: Color Composition ---
+    let grid_base_color = mix(MINOR_COLOR, MAJOR_COLOR, final_major);
+    
+    // Start with the grid color, then layer Red (X) and Green (Y) on top
+    var final_color = grid_base_color;
+    final_color = mix(final_color, vec3<f32>(0.8, 0.1, 0.1), axis_x); // Red X-axis
+    final_color = mix(final_color, vec3<f32>(0.1, 0.6, 0.1), axis_y); // Green Y-axis
 
-    return FsOut(vec4<f32>(color, alpha));
+    // Combine all visibility factors
+    let line_strength = max(max(final_minor, final_major), max(axis_x, axis_y));
+    
+    if line_strength < 0.001 { discard; }
+
+    let alpha = line_strength * total_fade;
+
+    return FsOut(vec4<f32>(final_color, alpha));
 }
