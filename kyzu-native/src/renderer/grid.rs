@@ -3,20 +3,6 @@ use crate::camera::Camera;
 //
 // ──────────────────────────────────────────────────────────────
 //   Grid Uniform (GPU side)
-//
-//   WGSL alignment rules differ from Rust:
-//     vec3<f32> occupies 16 bytes (not 12) due to vec3 alignment.
-//   The Rust struct must manually pad to match. See grid.wgsl.
-//
-//   Layout:
-//     view_proj     : mat4x4<f32>  →  64 bytes  (offset   0)
-//     inv_view_proj : mat4x4<f32>  →  64 bytes  (offset  64)
-//     eye_pos       : vec3<f32>    →  12 bytes  (offset 128)
-//     _pad0         : f32          →   4 bytes  (offset 140) ← pads eye_pos to 16
-//     fade_near     : f32          →   4 bytes  (offset 144)
-//     fade_far      : f32          →   4 bytes  (offset 148)
-//     _pad1         : vec2<f32>    →   8 bytes  (offset 152) ← pads to 16-byte boundary
-//   Total: 160 bytes
 // ──────────────────────────────────────────────────────────────
 //
 
@@ -29,7 +15,9 @@ pub struct GridUniform
   pub eye_pos: [f32; 3],            // 12 bytes (Offset 128)
   pub fade_near: f32,               //  4 bytes (Offset 140) - Fills the vec3 gap!
   pub fade_far: f32,                //  4 bytes (Offset 144)
-  pub _pad: [f32; 3],               // 12 bytes (Offset 148) - Pads to 160
+  pub lod_scale: f32,               //  4 bytes (Offset 148)
+  pub lod_fade: f32,                //  4 bytes (Offset 152)
+  pub _pad: f32,                    //  4 bytes (Offset 156) - Pads to 160
 }
 
 // Catch CPU/GPU layout mismatches at compile time.
@@ -44,15 +32,25 @@ impl GridUniform
     let inv_view_proj = view_proj.inverse();
     let eye = camera.eye_position();
 
+    // Use log10 to find our current "Power of 10" scale
+    let continuous_log = (camera.radius / 5.0).log10();
+    let lod_level = continuous_log.floor();
+
+    // Correct way to get a 0.0 -> 1.0 fade for both positive and negative zoom
+    let lod_fade = continuous_log - lod_level;
+
     Self {
-      view_proj: view_proj.to_cols_array_2d(),
+      view_proj: inv_view_proj.to_cols_array_2d(), // Note: Sending Inverse for unproject
       inv_view_proj: inv_view_proj.to_cols_array_2d(),
       eye_pos: eye.to_array(),
-      // No _pad0 here! fade_near immediately follows eye_pos
-      fade_near: camera.radius * 2.5,
-      fade_far: camera.radius * 25.0,
-      // 3 floats of padding at the end to reach 160 bytes
-      _pad: [0.0; 3],
+
+      // These scale with radius so the grid always reaches the horizon
+      fade_near: camera.radius * 3.0,
+      fade_far: camera.radius * 15.0,
+
+      lod_scale: 10.0_f32.powf(lod_level),
+      lod_fade,
+      _pad: 0.0,
     }
   }
 }

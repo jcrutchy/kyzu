@@ -36,8 +36,8 @@ pub struct Camera
 // ──────────────────────────────────────────────────────────────
 //
 
-const RADIUS_MIN: f32 = 0.5;
-const RADIUS_MAX: f32 = 100_000.0;
+const RADIUS_MIN: f32 = 0.0001; // Allow deep zoom-in
+const RADIUS_MAX: f32 = 100_000_000.0; // Allow massive zoom-out
 const ELEVATION_MIN: f32 = 0.01; // just above XY plane
 const ELEVATION_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.01; // just below zenith
 
@@ -153,5 +153,7 @@ fn build_view_matrix(cam: &Camera) -> Mat4
 
 fn build_projection_matrix(cam: &Camera) -> Mat4
 {
-  Mat4::perspective_rh(cam.fovy, cam.aspect, cam.znear, cam.zfar)
+  // Ensure the far plane is always significantly further than the grid fade
+  let dynamic_zfar = cam.zfar.max(cam.radius * 25.0);
+  Mat4::perspective_rh(cam.fovy, cam.aspect, cam.znear, dynamic_zfar)
 }
