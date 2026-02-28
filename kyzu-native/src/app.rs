@@ -117,18 +117,70 @@ impl KyzuApp
     };
 
     {
+      // braces are for reduced scope to control the lifetime of a mutex guard
       let mut cam = self.camera.lock().unwrap();
       apply_input_to_camera(&self.input, &mut cam);
       renderer.update_camera(&cam);
     }
 
-    renderer.render();
+    let raw_input = renderer.gui.state.take_egui_input(window);
 
-    // NOTE: ControlFlow::Wait sleeps between OS events — correct for a tool/editor feel.
-    // When the world simulation needs to tick every frame regardless of input,
-    // switch to ControlFlow::Poll and drive updates from on_frame's elapsed time.
+    let full_output = renderer.gui.context.run(raw_input, |ctx| {
+      self.run_ui(ctx);
+    });
+
+    renderer.render(window, full_output);
+
     window.request_redraw();
     self.input.end_frame();
+  }
+
+  /// Defines the on-screen debug panels.
+  /// This is called once per frame inside the on_frame loop.
+  fn run_ui(&self, ctx: &egui::Context)
+  {
+    // 1. Acquire data
+    let cam = self.camera.lock().unwrap();
+    let renderer = match &self.renderer
+    {
+      Some(r) => r,
+      None => return, // Early return if renderer isn't ready
+    };
+
+    // 2. Define the Telemetry Window
+    egui::Window::new("📊 Kyzu Telemetry")
+      .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
+      .resizable(false)
+      .collapsible(true)
+      .show(ctx, |ui| {
+        // Adaptor Info
+        ui.heading("Hardware");
+        ui.label(format!("Device:  {}", renderer.adapter_info.name));
+        ui.label(format!("Backend: {:?}", renderer.adapter_info.backend));
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Camera Transforms
+        ui.heading("Camera");
+        ui.monospace(format!("Radius:    {:.4}", cam.radius));
+        ui.monospace(format!(
+          "Target:    {:.2}, {:.2}, {:.2}",
+          cam.target.x, cam.target.y, cam.target.z
+        ));
+        ui.monospace(format!("Azimuth:   {:.1}°", cam.azimuth.to_degrees()));
+        ui.monospace(format!("Elevation: {:.1}°", cam.elevation.to_degrees()));
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Grid/LOD Info
+        ui.heading("Grid System");
+        ui.label(format!("LOD Scale: {:.1}", renderer.grid_lod_scale));
+        ui.label(format!("LOD Fade:  {:.3}", renderer.grid_lod_fade));
+      });
   }
 }
 
@@ -153,6 +205,16 @@ impl ApplicationHandler for KyzuApp
     if !is_our_window
     {
       return;
+    }
+
+    if let Some(renderer) = &mut self.renderer
+    {
+      let response = renderer.gui.state.on_window_event(self.window.as_ref().unwrap(), &event);
+
+      if response.consumed
+      {
+        return;
+      }
     }
 
     self.input.handle_event(&event);

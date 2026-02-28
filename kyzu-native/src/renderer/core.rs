@@ -8,6 +8,7 @@ use super::debug::DebugMesh;
 use super::depth::DepthResources;
 use super::grid::{create_grid_pipeline, GridMesh};
 use crate::camera::{Camera, CameraUniform};
+use crate::renderer::gui::GuiRenderer;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -17,6 +18,11 @@ use crate::camera::{Camera, CameraUniform};
 
 pub struct Renderer
 {
+  pub gui: GuiRenderer,
+  pub adapter_info: wgpu::AdapterInfo,
+  pub grid_lod_scale: f32,
+  pub grid_lod_fade: f32,
+
   surface: wgpu::Surface<'static>,
   device: wgpu::Device,
   queue: wgpu::Queue,
@@ -54,21 +60,23 @@ impl Renderer
   pub async fn new(window: Arc<Window>, camera: &Camera) -> Self
   {
     let instance = wgpu::Instance::default();
-    let surface = instance.create_surface(window).expect("Failed to create wgpu surface");
+    let surface = instance.create_surface(&window).expect("Failed to create wgpu surface");
 
     let adapter = request_adapter(&instance, &surface).await;
 
-    let info = adapter.get_info();
+    let adapter_info = adapter.get_info();
     println!("--------------------------------------------------");
-    println!("ACTIVE GPU: {}", info.name);
-    println!("BACKEND:    {:?}", info.backend);
-    println!("TYPE:       {:?}", info.device_type);
+    println!("ACTIVE GPU: {}", adapter_info.name);
+    println!("BACKEND:    {:?}", adapter_info.backend);
+    println!("TYPE:       {:?}", adapter_info.device_type);
     println!("--------------------------------------------------");
 
     let (device, queue) = request_device(&adapter).await;
 
     let config = configure_surface(&surface, &adapter, &device);
     let depth = DepthResources::create(&device, &config);
+
+    let gui = GuiRenderer::new(&device, config.format, &window);
 
     let (camera_buffer, camera_bind_group, camera_bgl) = create_camera_resources(&device);
 
@@ -89,6 +97,10 @@ impl Renderer
     debug.update(&queue, camera);
 
     Self {
+      gui,
+      adapter_info,
+      grid_lod_scale: 1.0,
+      grid_lod_fade: 1.0,
       surface,
       device,
       queue,
@@ -129,16 +141,16 @@ impl Renderer
     self.depth = DepthResources::create(&self.device, &self.config);
   }
 
-  pub fn render(&mut self)
+  // 1. Change the signature to accept 'full_output' from app.rs
+  pub fn render(&mut self, window: &winit::window::Window, full_output: egui::FullOutput)
   {
     let frame = match self.surface.get_current_texture()
     {
       Ok(frame) => frame,
       Err(_) =>
       {
-        // Surface lost (e.g. window minimised then restored) — reconfigure and retry once
         self.surface.configure(&self.device, &self.config);
-        self.surface.get_current_texture().expect("Failed to acquire frame after reconfigure")
+        self.surface.get_current_texture().expect("Failed after reconfigure")
       }
     };
 
@@ -148,6 +160,7 @@ impl Renderer
       .device
       .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
 
+    // Step A: Record your 3D scene (Grid, Cube, Axes)
     record_render_pass(
       &mut encoder,
       &view,
@@ -161,6 +174,10 @@ impl Renderer
       &self.axes,
       &self.debug,
     );
+
+    // Step B: Record the GUI on top of the 3D scene
+    // We call the 'render' method in your new gui.rs (which we'll define next)
+    self.gui.render(&self.device, &self.queue, &mut encoder, window, &view, full_output);
 
     self.queue.submit(Some(encoder.finish()));
     frame.present();
