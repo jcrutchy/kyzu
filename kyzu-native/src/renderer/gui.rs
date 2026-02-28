@@ -27,7 +27,12 @@ impl GuiRenderer
     let renderer = Renderer::new(
       device,
       output_format,
-      RendererOptions { depth_format: None, antialiasing: None, dithering: true },
+      RendererOptions {
+        depth_stencil_format: None,
+        msaa_samples: 1,
+        predictable_texture_filtering: false,
+        dithering: true,
+      },
     );
 
     Self { context, state, renderer }
@@ -56,10 +61,8 @@ impl GuiRenderer
     let tris = self.context.tessellate(full_output.shapes, ppp);
     self.renderer.update_buffers(device, queue, encoder, &tris, &screen_descriptor);
 
-    // FIX for the "escapes" error:
-    // We use a scope and an explicit type to keep the compiler happy.
     {
-      let mut pass: wgpu::RenderPass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+      let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Egui Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
           view,
@@ -70,8 +73,12 @@ impl GuiRenderer
         ..Default::default()
       });
 
+      // Safety: the pass is dropped at the end of this block, before
+      // `encoder` is used again — we're just erasing the lifetime annotation.
+      let mut pass = pass.forget_lifetime();
+
       self.renderer.render(&mut pass, &tris, &screen_descriptor);
-    } // 'pass' drops here, releasing the 'encoder' borrow
+    } // pass drops here
 
     for id in full_output.textures_delta.free
     {

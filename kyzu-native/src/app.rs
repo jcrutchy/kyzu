@@ -106,30 +106,45 @@ impl KyzuApp
   {
     let window = match &self.window
     {
-      Some(w) => w,
-      None => return,
-    };
-
-    let renderer = match &mut self.renderer
-    {
-      Some(r) => r,
+      Some(w) => w.clone(), // Clone the Arc — cheap, releases the borrow
       None => return,
     };
 
     {
-      // braces are for reduced scope to control the lifetime of a mutex guard
       let mut cam = self.camera.lock().unwrap();
-      apply_input_to_camera(&self.input, &mut cam);
-      renderer.update_camera(&cam);
+      if let Some(renderer) = &mut self.renderer
+      {
+        apply_input_to_camera(&self.input, &mut cam);
+        renderer.update_camera(&cam);
+      }
     }
 
-    let raw_input = renderer.gui.state.take_egui_input(window);
+    // Take egui input before the immutable self borrow in run_ui
+    let raw_input = {
+      let renderer = match &mut self.renderer
+      {
+        Some(r) => r,
+        None => return,
+      };
+      renderer.gui.state.take_egui_input(&window)
+    }; // mutable borrow of renderer ends here
 
-    let full_output = renderer.gui.context.run(raw_input, |ctx| {
-      self.run_ui(ctx);
-    });
+    // Now run_ui only needs &self (no conflict)
+    let full_output = {
+      let renderer = match &self.renderer
+      {
+        Some(r) => r,
+        None => return,
+      };
+      renderer.gui.context.run(raw_input, |ctx| {
+        self.run_ui(ctx); // fine — self is immutably borrowed here
+      })
+    };
 
-    renderer.render(window, full_output);
+    if let Some(renderer) = &mut self.renderer
+    {
+      renderer.render(&window, full_output);
+    }
 
     window.request_redraw();
     self.input.end_frame();

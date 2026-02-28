@@ -60,7 +60,7 @@ impl Renderer
   pub async fn new(window: Arc<Window>, camera: &Camera) -> Self
   {
     let instance = wgpu::Instance::default();
-    let surface = instance.create_surface(&window).expect("Failed to create wgpu surface");
+    let surface = instance.create_surface(window.clone()).expect("Failed to create wgpu surface");
 
     let adapter = request_adapter(&instance, &surface).await;
 
@@ -223,7 +223,13 @@ fn configure_surface(
 ) -> wgpu::SurfaceConfiguration
 {
   let caps = surface.get_capabilities(adapter);
-  let format = caps.formats[0];
+
+  let format = caps
+    .formats
+    .iter()
+    .copied()
+    .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm || *f == wgpu::TextureFormat::Rgba8Unorm)
+    .unwrap_or(caps.formats[0]);
 
   // Start at a sensible size — on_resize will correct this to the real window size
   // before any frame is rendered. Starting at 1×1 risks a validation error if a
