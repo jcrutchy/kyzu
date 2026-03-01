@@ -195,20 +195,6 @@ values small and avoiding single-precision jitter at large coordinates.
 
 ---
 
-## Known Issues / Immediate TODOs
-
-1. **Depth buffer not resized on window resize** — `DepthResources` must be recreated
-   alongside surface reconfigure when `WindowEvent::Resized` fires
-2. **Surface not reconfigured on resize** — currently only reconfigured lazily on
-   frame error; should be done explicitly in the resize handler
-3. **Input collected but not consumed** — `InputState` tracks mouse/scroll/keyboard
-   but nothing reads it yet to drive the camera
-4. **Camera refactor** — replace fixed camera with spherical coordinate system (see above)
-5. **Origin axis arrows** — X/Y/Z arrows at world origin for orientation reference
-6. **Infinite XY grid** — Tron:Legacy-style fading grid on the XY plane
-
----
-
 ## History
 
 Started as **Cartographica** — a JavaScript/WebGL/WebSocket massively multiplayer game
