@@ -1,5 +1,7 @@
 struct CameraUniform {
     view_proj : mat4x4<f32>,
+    eye_world : vec3<f32>,
+    _pad      : f32,
 };
 
 @group(0) @binding(0)
@@ -16,12 +18,13 @@ struct VsOut {
 @vertex
 fn vs_main(input : VsIn) -> VsOut {
     var out : VsOut;
-    out.pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    // Rebase: subtract eye so geometry is in camera-relative space
+    let rel_pos = input.position - camera.eye_world;
+    out.pos = camera.view_proj * vec4<f32>(rel_pos, 1.0);
     return out;
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
-    // Simple unlit cube color
     return vec4<f32>(0.8, 0.3, 0.3, 1.0);
 }

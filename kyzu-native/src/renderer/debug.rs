@@ -1,3 +1,5 @@
+use glam::DVec3;
+
 use crate::camera::Camera;
 
 //
@@ -68,23 +70,24 @@ impl DebugMesh
   pub fn update(&mut self, queue: &wgpu::Queue, camera: &Camera)
   {
     let target = camera.target;
-    let proj = glam::Vec3::new(target.x, target.y, 0.0);
+    let proj = DVec3::new(target.x, target.y, 0.0);
+
+    // Emit world-space positions — the axes shader will rebase via eye_world
+    let target_ws: [f32; 3] = target.as_vec3().into();
+    let proj_ws: [f32; 3] = proj.as_vec3().into();
 
     let mut verts: Vec<Vertex> = Vec::with_capacity(MAX_VERTS as usize);
 
-    // White cross at camera target (always drawn)
-    push_cross(&mut verts, target.into(), COL_TARGET);
+    push_cross(&mut verts, target_ws, COL_TARGET);
 
-    // Yellow cross and grey connecting line only when target is off the XY plane
-    if target.z.abs() > Z_THRESHOLD
+    if target.z.abs() > Z_THRESHOLD as f64
     {
-      push_cross(&mut verts, proj.into(), COL_PROJ);
-      verts.push(make_vertex(target.into(), COL_CONNECT));
-      verts.push(make_vertex(proj.into(), COL_CONNECT));
+      push_cross(&mut verts, proj_ws, COL_PROJ);
+      verts.push(make_vertex(target_ws, COL_CONNECT));
+      verts.push(make_vertex(proj_ws, COL_CONNECT));
     }
 
     self.vertex_count = verts.len() as u32;
-
     queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
   }
 }

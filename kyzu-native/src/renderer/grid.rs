@@ -28,21 +28,22 @@ impl GridUniform
 {
   pub fn from_camera(camera: &Camera) -> Self
   {
-    // 1. Determine the "Power of 10" we are currently viewing
-    // Dividing by a 'magic number' like 5.0 sets the visual density
-    let log_zoom = (camera.radius / 5.0).log10();
-    let lod_level = log_zoom.floor(); // e.g., -1, 0, 1, 2
-    let lod_fade = log_zoom - lod_level; // 0.0 to 1.0 smooth transition
+    let radius = camera.radius as f32;
+    let log_zoom = ((camera.radius / 5.0) as f32).log10();
+    let lod_level = log_zoom.floor();
+    let lod_fade = log_zoom - lod_level;
+
+    // eye_pos is used only for distance-fade in the shader — f32 precision is fine here
+    let eye = camera.eye_position();
 
     Self {
       view_proj: camera.build_view_proj().to_cols_array_2d(),
-      inv_view_proj: camera.build_view_proj().inverse().to_cols_array_2d(),
-      eye_pos: camera.eye_position().to_array(),
+      inv_view_proj: camera.build_inv_view_proj().to_cols_array_2d(),
+      eye_pos: [eye.x as f32, eye.y as f32, eye.z as f32],
 
-      fade_near: (camera.radius * 4.0).max(20.0),
-      fade_far: (camera.radius * 15.0).max(80.0),
+      fade_near: (radius * 4.0).max(20.0),
+      fade_far: (radius * 15.0).max(80.0),
 
-      // 3. Send the base scale (1, 10, 100, etc.)
       lod_scale: 10.0_f32.powf(lod_level),
       lod_fade,
       _pad: 0.0,

@@ -7,6 +7,7 @@ use super::cube::CubeMesh;
 use super::debug::DebugMesh;
 use super::depth::DepthResources;
 use super::grid::{create_grid_pipeline, GridMesh};
+use super::sphere::{create_sphere_pipeline, SphereInstance, SphereMesh};
 use crate::camera::{Camera, CameraUniform};
 use crate::renderer::gui::GuiRenderer;
 
@@ -47,6 +48,8 @@ pub struct Renderer
   axes_pipeline: wgpu::RenderPipeline,
 
   debug: DebugMesh,
+  spheres: SphereMesh,
+  sphere_pipeline: wgpu::RenderPipeline,
 }
 
 //
@@ -93,6 +96,9 @@ impl Renderer
     let axes = AxesMesh::create(&device);
     let axes_pipeline = create_axes_pipeline(&device, &config, &camera_bgl);
 
+    let spheres = SphereMesh::create(&device, 64);
+    let sphere_pipeline = create_sphere_pipeline(&device, &config, &camera_bgl);
+
     let mut debug = DebugMesh::create(&device);
     debug.update(&queue, camera);
 
@@ -116,6 +122,8 @@ impl Renderer
       axes,
       axes_pipeline,
       debug,
+      spheres,
+      sphere_pipeline,
     }
   }
 
@@ -173,6 +181,8 @@ impl Renderer
       &self.axes_pipeline,
       &self.axes,
       &self.debug,
+      &self.sphere_pipeline,
+      &self.spheres,
     );
 
     // Step B: Record the GUI on top of the 3D scene
@@ -181,6 +191,11 @@ impl Renderer
 
     self.queue.submit(Some(encoder.finish()));
     frame.present();
+  }
+
+  pub fn update_spheres(&mut self, instances: &[SphereInstance], camera: &Camera)
+  {
+    self.spheres.update(&self.queue, instances, camera);
   }
 }
 
@@ -358,6 +373,8 @@ fn record_render_pass(
   axes_pipeline: &wgpu::RenderPipeline,
   axes: &AxesMesh,
   debug: &DebugMesh,
+  sphere_pipeline: &wgpu::RenderPipeline,
+  spheres: &SphereMesh,
 )
 {
   let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -389,6 +406,16 @@ fn record_render_pass(
   pass.set_vertex_buffer(0, cube.vertex_buffer.slice(..));
   pass.set_index_buffer(cube.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
   pass.draw_indexed(0..cube.index_count, 0, 0..1);
+
+  if spheres.instance_count > 0
+  {
+    pass.set_pipeline(sphere_pipeline);
+    pass.set_bind_group(0, camera_bg, &[]);
+    pass.set_vertex_buffer(0, spheres.vertex_buffer.slice(..));
+    pass.set_vertex_buffer(1, spheres.instance_buffer.slice(..));
+    pass.set_index_buffer(spheres.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+    pass.draw_indexed(0..spheres.index_count, 0, 0..spheres.instance_count);
+  }
 
   // 2. Opaque lines — axes and debug share the same pipeline and vertex layout
   pass.set_pipeline(axes_pipeline);

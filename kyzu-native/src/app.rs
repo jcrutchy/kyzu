@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use glam::DVec3;
 use winit::{
   application::ApplicationHandler,
   event::WindowEvent,
@@ -10,6 +11,7 @@ use winit::{
 use crate::camera::Camera;
 use crate::input::{apply_input_to_camera, InputState};
 use crate::renderer::Renderer;
+use crate::renderer::SphereInstance;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -37,6 +39,7 @@ struct KyzuApp
   renderer: Option<Renderer>,
   camera: Arc<Mutex<Camera>>,
   input: InputState,
+  spheres: Vec<SphereInstance>,
 }
 
 impl KyzuApp
@@ -48,6 +51,18 @@ impl KyzuApp
       renderer: None,
       camera: Arc::new(Mutex::new(Camera::new(16.0 / 9.0))),
       input: InputState::new(),
+      spheres: vec![
+        SphereInstance {
+          center: DVec3::new(0.0, 9.371e7, 0.0),
+          radius: 6.371e6, // Earth-scale
+        },
+        SphereInstance {
+          //center: DVec3::new(1.496e11, 0.0, 0.0), // 1 AU along X
+          //radius: 6.957e8, // Sun-scale
+          center: DVec3::new(9.371e7, 9.371e6, 9.371e3),
+          radius: 6.371e6, // Earth-scale
+        },
+      ],
     }
   }
 
@@ -116,6 +131,7 @@ impl KyzuApp
       {
         apply_input_to_camera(&self.input, &mut cam);
         renderer.update_camera(&cam);
+        renderer.update_spheres(&self.spheres, &cam);
       }
     }
 
