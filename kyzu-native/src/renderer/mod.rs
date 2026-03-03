@@ -1,12 +1,7 @@
-mod axes;
-mod core;
-mod cube;
-mod debug;
-mod depth;
-mod grid;
-mod gui;
-mod sphere;
+pub mod depth;
+pub mod gui;
+pub mod kernel;
+pub mod module;
+pub mod shared;
 
-pub use core::Renderer;
-
-pub use sphere::SphereInstance;
+pub mod modules;
