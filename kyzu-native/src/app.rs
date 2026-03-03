@@ -3,7 +3,7 @@ use std::sync::Arc;
 use glam::DVec3;
 use winit::{
   application::ApplicationHandler,
-  event::WindowEvent,
+  event::{ElementState, WindowEvent},
   event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
   window::{Window, WindowId},
 };
@@ -64,7 +64,7 @@ impl KyzuApp
 
     // Register render modules in draw order
     kernel.add_module::<crate::renderer::modules::sphere::SphereModule>();
-    //kernel.add_module::<crate::renderer::modules::axes::AxesModule>();
+    kernel.add_module::<crate::renderer::modules::axes::AxesModule>();
     kernel.add_module::<crate::renderer::modules::debug::DebugModule>();
     kernel.add_module::<crate::renderer::modules::grid::GridModule>();
 
@@ -205,19 +205,34 @@ impl ApplicationHandler for KyzuApp
   fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent)
   {
     let is_our_window = self.window.as_ref().map_or(false, |w| w.id() == window_id);
-
     if !is_our_window
     {
       return;
     }
 
+    // Always track cursor position regardless of egui
+    self.input.track_cursor(&event);
+
+    // Pass event to egui
     if let Some(kernel) = &mut self.kernel
     {
-      let response = kernel.gui.state.on_window_event(self.window.as_ref().unwrap(), &event);
+      let _ = kernel.gui.state.on_window_event(self.window.as_ref().unwrap(), &event);
+    }
 
-      if response.consumed
+    // Only block input if cursor is actually over an egui element
+    let egui_wants_input =
+      self.kernel.as_ref().map_or(false, |k| k.gui.context.is_pointer_over_area());
+
+    if egui_wants_input
+    {
+      match &event
       {
-        return;
+        // Block presses and scroll when over egui, but never block releases
+        // — otherwise button state gets stuck when releasing over a panel
+        WindowEvent::MouseInput { state: ElementState::Pressed, .. }
+        | WindowEvent::MouseWheel { .. } => return,
+        _ =>
+        {}
       }
     }
 
@@ -229,12 +244,10 @@ impl ApplicationHandler for KyzuApp
       {
         event_loop.exit();
       }
-
       WindowEvent::Resized(size) =>
       {
         self.on_resize(size.width, size.height);
       }
-
       _ =>
       {}
     }

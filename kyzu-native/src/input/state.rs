@@ -31,25 +31,29 @@ impl InputState
     }
   }
 
+  /// Always called, even when egui consumes the event.
+  /// Keeps mouse position up to date so dx/dy are never stale.
+  pub fn track_cursor(&mut self, event: &WindowEvent)
+  {
+    if let WindowEvent::CursorMoved { position, .. } = event
+    {
+      let x = position.x as f32;
+      let y = position.y as f32;
+      self.mouse_dx = x - self.mouse_x;
+      self.mouse_dy = y - self.mouse_y;
+      self.mouse_x = x;
+      self.mouse_y = y;
+    }
+  }
+
+  /// Only called when egui has not consumed the event.
   pub fn handle_event(&mut self, event: &WindowEvent)
   {
     match event
     {
-      WindowEvent::CursorMoved { position, .. } =>
-      {
-        let x = position.x as f32;
-        let y = position.y as f32;
-
-        self.mouse_dx = x - self.mouse_x;
-        self.mouse_dy = y - self.mouse_y;
-        self.mouse_x = x;
-        self.mouse_y = y;
-      }
-
       WindowEvent::MouseInput { state, button, .. } =>
       {
         let pressed = *state == ElementState::Pressed;
-
         match button
         {
           MouseButton::Left => self.left_held = pressed,

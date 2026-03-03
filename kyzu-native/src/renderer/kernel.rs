@@ -92,6 +92,8 @@ impl Kernel
       camera_gpu,
       surface_format: config.format,
       depth_format: wgpu::TextureFormat::Depth32Float,
+      screen_width: config.width,
+      screen_height: config.height,
     };
 
     Self {
@@ -134,6 +136,9 @@ impl Kernel
     self.surface.configure(&self.device, &self.config);
     self.depth = DepthResources::create(&self.device, &self.config);
 
+    self.shared.screen_width = width;
+    self.shared.screen_height = height;
+
     self.camera.set_aspect(width as f32 / height as f32);
     let matrices = self.camera.compute_matrices();
     self.shared.camera_gpu.upload(&self.queue, &matrices);
@@ -162,7 +167,7 @@ impl Kernel
 
     // Clear pass — must run before any module encodes
     {
-      let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+      let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Clear Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
           view: &color_view,

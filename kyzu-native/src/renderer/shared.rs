@@ -81,6 +81,8 @@ pub struct SharedState
   pub camera_gpu: CameraGpu,
   pub surface_format: TextureFormat,
   pub depth_format: TextureFormat,
+  pub screen_width: u32,
+  pub screen_height: u32,
 }
 
 /// The GPU targets available for a given frame.

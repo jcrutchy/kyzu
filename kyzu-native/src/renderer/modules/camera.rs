@@ -15,7 +15,6 @@ const ELEVATION_MIN: f64 = 0.01;
 const ELEVATION_MAX: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
 
 const ORBIT_SENSITIVITY: f64 = 0.005;
-const PAN_SENSITIVITY: f64 = 0.002;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -58,17 +57,17 @@ impl CameraModule
   /// Apply input and compute new matrices into shared state.
   pub fn update(&mut self, input: &InputState, shared: &mut SharedState)
   {
-    self.apply_input(input);
+    self.apply_input(input, shared.screen_width, shared.screen_height);
     shared.camera = self.compute_matrices();
   }
 
   /// Process input and mutate camera state.
   /// Call this before update().
-  pub fn apply_input(&mut self, input: &InputState)
+  pub fn apply_input(&mut self, input: &InputState, screen_width: u32, screen_height: u32)
   {
     self.apply_orbit(input);
-    self.apply_pan(input);
-    self.apply_zoom(input);
+    self.apply_pan(input, screen_width, screen_height);
+    self.apply_zoom(input, screen_width, screen_height);
   }
 
   /// Compute fresh CameraMatrices from current state.
@@ -163,30 +162,42 @@ impl CameraModule
       .clamp(ELEVATION_MIN, ELEVATION_MAX);
   }
 
-  fn apply_pan(&mut self, input: &InputState)
+  fn apply_pan(&mut self, input: &InputState, screen_width: u32, screen_height: u32)
   {
     if !input.middle_held || (input.mouse_dx == 0.0 && input.mouse_dy == 0.0)
     {
       return;
     }
 
-    let scale = self.radius * PAN_SENSITIVITY;
-    let eye = self.eye_position();
+    // Unproject current and previous mouse position onto z=0 plane,
+    // then move target by the difference — grid sticks to cursor exactly
+    let inv_vp = glam::Mat4::from_cols_array_2d(&self.compute_matrices().inv_view_proj);
 
-    // Right vector lies in the XY plane — correct for pan
-    let right = compute_right(eye, self.target);
+    let prev_world = unproject_to_ground(
+      input.mouse_x - input.mouse_dx,
+      input.mouse_y - input.mouse_dy,
+      screen_width,
+      screen_height,
+      inv_vp,
+      self.eye_position(),
+    );
 
-    // Use world XY forward instead of view-tilted up, so vertical
-    // pan never moves the target out of the ground plane
-    let fwd_flat = DVec3::new(-(eye.x - self.target.x), -(eye.y - self.target.y), 0.0).normalize();
+    let curr_world = unproject_to_ground(
+      input.mouse_x,
+      input.mouse_y,
+      screen_width,
+      screen_height,
+      inv_vp,
+      self.eye_position(),
+    );
 
-    let dx = -input.mouse_dx as f64 * scale;
-    let dy = input.mouse_dy as f64 * scale;
-
-    self.target += right * dx + fwd_flat * dy;
+    if let (Some(prev), Some(curr)) = (prev_world, curr_world)
+    {
+      self.target += prev - curr;
+    }
   }
 
-  fn apply_zoom(&mut self, input: &InputState)
+  fn apply_zoom(&mut self, input: &InputState, screen_width: u32, screen_height: u32)
   {
     if input.scroll == 0.0
     {
@@ -194,7 +205,24 @@ impl CameraModule
     }
 
     let factor = (1.1_f64).powf(-input.scroll as f64);
+
+    // Unproject cursor onto ground plane before zoom
+    let inv_vp = glam::Mat4::from_cols_array_2d(&self.compute_matrices().inv_view_proj);
+    let eye = self.eye_position();
+
+    let cursor_world =
+      unproject_to_ground(input.mouse_x, input.mouse_y, screen_width, screen_height, inv_vp, eye);
+
     self.radius = (self.radius * factor).clamp(RADIUS_MIN, RADIUS_MAX);
+
+    // If cursor intersects ground plane, shift target so that point stays fixed
+    if let Some(cursor) = cursor_world
+    {
+      let prev_target = self.target;
+      // Blend target toward cursor point proportional to zoom factor
+      let t = 1.0 - factor.recip();
+      self.target = prev_target + (cursor - prev_target) * t;
+    }
   }
 }
 
@@ -204,14 +232,41 @@ impl CameraModule
 // ──────────────────────────────────────────────────────────────
 //
 
-fn compute_right(eye: DVec3, target: DVec3) -> DVec3
+fn unproject_to_ground(
+  screen_x: f32,
+  screen_y: f32,
+  screen_width: u32,
+  screen_height: u32,
+  inv_vp: glam::Mat4,
+  eye: DVec3,
+) -> Option<DVec3>
 {
-  let fwd = (target - eye).normalize();
-  fwd.cross(DVec3::Z).normalize()
-}
+  let ndc_x = (screen_x / screen_width as f32) * 2.0 - 1.0;
+  let ndc_y = -(screen_y / screen_height as f32) * 2.0 + 1.0;
 
-fn compute_up(eye: DVec3, target: DVec3, right: DVec3) -> DVec3
-{
-  let fwd = (target - eye).normalize();
-  right.cross(fwd).normalize()
+  let near_h = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+  let far_h = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+
+  // Stay in camera-relative f32 space for the ray direction
+  let near_rel = glam::Vec3::from(near_h.truncate() / near_h.w);
+  let far_rel = glam::Vec3::from(far_h.truncate() / far_h.w);
+
+  // Convert ray to f64 camera-relative, then add eye for world space
+  let near_world = eye + DVec3::new(near_rel.x as f64, near_rel.y as f64, near_rel.z as f64);
+  let far_world = eye + DVec3::new(far_rel.x as f64, far_rel.y as f64, far_rel.z as f64);
+
+  // Intersect with z=0 plane in world space
+  let dir = far_world - near_world;
+  if dir.z.abs() < 1e-10
+  {
+    return None;
+  }
+
+  let t = -near_world.z / dir.z;
+  if t < 0.0
+  {
+    return None;
+  }
+
+  Some(near_world + dir * t)
 }
