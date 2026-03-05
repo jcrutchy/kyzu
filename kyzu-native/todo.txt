@@ -1,0 +1,1 @@
+* when zooming right in further away from the origin, the grid lines get thicker - should stay thin regardless of how far away from the origin you are

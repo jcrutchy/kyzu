@@ -9,7 +9,7 @@ use crate::renderer::shared::{CameraMatrices, SharedState};
 // ──────────────────────────────────────────────────────────────
 //
 
-const RADIUS_MIN: f64 = 0.002;
+const RADIUS_MIN: f64 = 0.01;
 const RADIUS_MAX: f64 = 9_000_000_000_000.0;
 const ELEVATION_MIN: f64 = 0.01;
 const ELEVATION_MAX: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
