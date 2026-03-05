@@ -17,26 +17,17 @@ use crate::renderer::shared::{CameraGpu, CameraMatrices, FrameTargets, SharedSta
 
 pub struct Kernel
 {
-  // GPU infrastructure
   pub device: wgpu::Device,
   pub queue: wgpu::Queue,
-  pub surface: wgpu::Surface<'static>,
-  pub config: wgpu::SurfaceConfiguration,
   pub adapter_info: wgpu::AdapterInfo,
-
-  // Frame resources
   depth: DepthResources,
-
-  // Shared state passed to every module each frame
   pub shared: SharedState,
-
-  // Registered render modules — called in order each frame
   pub modules: Vec<Box<dyn RenderModule>>,
-
-  // GUI is a fixed post-pass, not a registered module
   pub gui: GuiRenderer,
-
   pub camera: CameraModule,
+  pub config: wgpu::SurfaceConfiguration,
+  // surface last — drops first, before device and window
+  pub surface: wgpu::Surface<'static>,
 }
 
 //

@@ -57,10 +57,11 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VsOut {
     return out;
 }
 
-fn unproject(ndc_xy : vec2<f32>, ndc_z : f32) -> vec3<f32> {
+fn unproject_world(ndc_xy : vec2<f32>, ndc_z : f32) -> vec3<f32> {
     let clip  = vec4<f32>(ndc_xy, ndc_z, 1.0);
     let world = grid.inv_view_proj * clip;
-    return world.xyz / world.w;
+    let cam_rel = world.xyz / world.w;
+    return cam_rel + grid.eye_pos;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -71,31 +72,28 @@ struct FsOut { @location(0) color : vec4<f32> };
 
 @fragment
 fn fs_main(in : VsOut) -> FsOut {
-    let pos_near = unproject(in.ndc_xy, 0.0);
-    let pos_far  = unproject(in.ndc_xy, 1.0);
+    let pos_near = unproject_world(in.ndc_xy, 0.0);
+    let pos_far  = unproject_world(in.ndc_xy, 1.0);
 
-    // Ground plane is at world z=0, which in camera-relative space is z = -eye_pos.z
-    let ground_z = -grid.eye_pos.z;
-    let t = (ground_z - pos_near.z) / (pos_far.z - pos_near.z);
+    // Now both are in true world space, so z=0 intersection is straightforward
+    let t = (0.0 - pos_near.z) / (pos_far.z - pos_near.z);
 
-    if t <= 0.0 || t > 1e9 { discard; }
+    if t <= 0.0 || t > 1.0 { discard; }
 
-    // world_pos is camera-relative
     let world_pos = pos_near + t * (pos_far - pos_near);
 
     let view_dir     = normalize(pos_far - pos_near);
     let horizon_fade = smoothstep(0.0, 0.1, abs(view_dir.z));
 
-    // Distance fade — eye is at camera-relative origin so no subtraction needed
-    let dist      = length(world_pos.xy);
+    // Distance fade — now measured from eye in world space
+    let dist      = length(world_pos.xy - grid.eye_pos.xy);
     let dist_fade = 1.0 - smoothstep(grid.fade_near, grid.fade_far, dist);
 
     let total_fade = dist_fade * horizon_fade;
     if total_fade <= 0.0 { discard; }
 
-    // Absolute world XY — add eye back so line pattern is in true world space,
-    // not camera-relative space (otherwise the grid never scrolls when panning)
-    let abs_xy = world_pos.xy + grid.eye_pos.xy;
+    // abs_xy is already world space now, no need to add eye_pos back
+    let abs_xy = world_pos.xy;
 
     let s0 = grid.lod_scale;
     let s1 = grid.lod_scale * 10.0;

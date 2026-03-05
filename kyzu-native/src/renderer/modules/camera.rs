@@ -9,8 +9,8 @@ use crate::renderer::shared::{CameraMatrices, SharedState};
 // ──────────────────────────────────────────────────────────────
 //
 
-const RADIUS_MIN: f64 = 0.0001;
-const RADIUS_MAX: f64 = 1_000_000_000_000.0;
+const RADIUS_MIN: f64 = 0.002;
+const RADIUS_MAX: f64 = 9_000_000_000_000.0;
 const ELEVATION_MIN: f64 = 0.01;
 const ELEVATION_MAX: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
 
@@ -136,8 +136,9 @@ impl CameraModule
 
   fn build_projection(&self) -> glam::Mat4
   {
-    let znear = ((self.radius * 0.001) as f32).max(0.0001);
-    let zfar = ((self.radius * 100.0) as f32).max(10000.0);
+    let znear = ((self.radius * 0.01) as f32).max(0.001);
+    let zfar = ((self.radius * 1000.0) as f32).max(1000.0);
+
     glam::Mat4::perspective_rh(self.fovy as f32, self.aspect, znear, zfar)
   }
 }
@@ -205,23 +206,26 @@ impl CameraModule
     }
 
     let factor = (1.1_f64).powf(-input.scroll as f64);
+    let old_radius = self.radius;
+    let new_radius = (self.radius * factor).clamp(RADIUS_MIN, RADIUS_MAX);
 
-    // Unproject cursor onto ground plane before zoom
+    if new_radius == old_radius
+    {
+      return;
+    }
+
+    let actual_factor = new_radius / old_radius;
+
     let inv_vp = glam::Mat4::from_cols_array_2d(&self.compute_matrices().inv_view_proj);
     let eye = self.eye_position();
 
-    let cursor_world =
-      unproject_to_ground(input.mouse_x, input.mouse_y, screen_width, screen_height, inv_vp, eye);
+    self.radius = new_radius;
 
-    self.radius = (self.radius * factor).clamp(RADIUS_MIN, RADIUS_MAX);
-
-    // If cursor intersects ground plane, shift target so that point stays fixed
-    if let Some(cursor) = cursor_world
+    if let Some(p) =
+      unproject_to_ground(input.mouse_x, input.mouse_y, screen_width, screen_height, inv_vp, eye)
     {
-      let prev_target = self.target;
-      // Blend target toward cursor point proportional to zoom factor
-      let t = 1.0 - factor.recip();
-      self.target = prev_target + (cursor - prev_target) * t;
+      self.target.x += (p.x - self.target.x) * (1.0 - actual_factor);
+      self.target.y += (p.y - self.target.y) * (1.0 - actual_factor);
     }
   }
 }
@@ -255,12 +259,16 @@ fn unproject_to_ground(
   let near_world = eye + DVec3::new(near_rel.x as f64, near_rel.y as f64, near_rel.z as f64);
   let far_world = eye + DVec3::new(far_rel.x as f64, far_rel.y as f64, far_rel.z as f64);
 
-  // Intersect with z=0 plane in world space
   let dir = far_world - near_world;
+
   if dir.z.abs() < 1e-10
   {
     return None;
   }
+  if !dir.is_finite()
+  {
+    return None;
+  } // catches NaN/inf from near-zero radius
 
   let t = -near_world.z / dir.z;
   if t < 0.0
@@ -268,5 +276,11 @@ fn unproject_to_ground(
     return None;
   }
 
-  Some(near_world + dir * t)
+  let result = near_world + dir * t;
+  if !result.is_finite()
+  {
+    return None;
+  } // final safety check
+
+  Some(result)
 }

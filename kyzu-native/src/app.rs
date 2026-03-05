@@ -182,7 +182,7 @@ impl KyzuApp
         ui.add_space(8.0);
 
         ui.heading("Grid System");
-        ui.label(format!("LOD Scale: {:.1}", kernel.shared.camera.lod_scale));
+        ui.label(format!("LOD Scale: {:.3}", kernel.shared.camera.lod_scale));
         ui.label(format!("LOD Fade:  {:.3}", kernel.shared.camera.lod_fade));
       });
   }
