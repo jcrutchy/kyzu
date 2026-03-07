@@ -169,9 +169,9 @@ impl KyzuApp
         ui.add_space(8.0);
 
         ui.heading("Camera");
-        ui.monospace(format!("Radius:    {:.4}", cam.radius));
+        ui.monospace(format!("Radius:    {:.3e}", cam.radius));
         ui.monospace(format!(
-          "Target:    {:.2}, {:.2}, {:.2}",
+          "Target:    {:.3e}, {:.3e}, {:.3e}",
           cam.target.x, cam.target.y, cam.target.z
         ));
         ui.monospace(format!("Azimuth:   {:.1}°", cam.azimuth.to_degrees()));

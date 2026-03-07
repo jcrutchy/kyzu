@@ -11,17 +11,21 @@ use crate::renderer::shared::{FrameTargets, SharedState};
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GridUniform
 {
-  view_proj: [[f32; 4]; 4],     // 64 bytes (Offset 0)
-  inv_view_proj: [[f32; 4]; 4], // 64 bytes (Offset 64)
-  eye_pos: [f32; 3],            // 12 bytes (Offset 128)
-  fade_near: f32,               //  4 bytes (Offset 140)
-  fade_far: f32,                //  4 bytes (Offset 144)
-  lod_scale: f32,               //  4 bytes (Offset 148)
-  lod_fade: f32,                //  4 bytes (Offset 152)
-  _pad: f32,                    //  4 bytes (Offset 156)
+  view_proj: [[f32; 4]; 4],     // 64 bytes  (Offset   0)
+  inv_view_proj: [[f32; 4]; 4], // 64 bytes  (Offset  64)
+  eye_pos: [f32; 3],            // 12 bytes  (Offset 128)
+  fade_near: f32,               //  4 bytes  (Offset 140)
+  fade_far: f32,                //  4 bytes  (Offset 144)
+  lod_scale: f32,               //  4 bytes  (Offset 148)
+  lod_fade: f32,                //  4 bytes  (Offset 152)
+  _pad: f32,                    //  4 bytes  (Offset 156)
+  eye_mod_s0: [f32; 2],         //  8 bytes  (Offset 160)
+  eye_mod_s1: [f32; 2],         //  8 bytes  (Offset 168)
+  eye_mod_s2: [f32; 2],         //  8 bytes  (Offset 176)
+  _pad2: [f32; 2],              //  8 bytes  (Offset 184)
 }
 
-const _: () = assert!(std::mem::size_of::<GridUniform>() == 160);
+const _: () = assert!(std::mem::size_of::<GridUniform>() == 192);
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -117,16 +121,27 @@ impl RenderModule for GridModule
 // ──────────────────────────────────────────────────────────────
 //   Uniform builder
 //
-//   This function used to live on GridUniform as from_camera(),
-//   taking a &Camera. Now it takes &SharedState and reads the
-//   matrices that the camera module already computed. The LOD
-//   logic moves here since it only concerns this module.
+//   eye_mod_sN = eye_pos % sN, computed in f64 so the result is
+//   always a small, precise value in [0, sN). The shader adds
+//   this to the camera-relative hit position to recover the
+//   correct world-grid phase without ever using large f32 coords.
 // ──────────────────────────────────────────────────────────────
 //
 
 fn build_uniform(shared: &SharedState) -> GridUniform
 {
   let cam = &shared.camera;
+
+  let s0 = cam.lod_scale as f64;
+  let s1 = s0 * 10.0;
+  let s2 = s0 * 100.0;
+
+  let eye_x = cam.eye_world[0] as f64;
+  let eye_y = cam.eye_world[1] as f64;
+
+  let eye_mod_s0 = [eye_x.rem_euclid(s0) as f32, eye_y.rem_euclid(s0) as f32];
+  let eye_mod_s1 = [eye_x.rem_euclid(s1) as f32, eye_y.rem_euclid(s1) as f32];
+  let eye_mod_s2 = [eye_x.rem_euclid(s2) as f32, eye_y.rem_euclid(s2) as f32];
 
   GridUniform {
     view_proj: cam.view_proj,
@@ -137,6 +152,10 @@ fn build_uniform(shared: &SharedState) -> GridUniform
     lod_scale: cam.lod_scale,
     lod_fade: cam.lod_fade,
     _pad: 0.0,
+    eye_mod_s0,
+    eye_mod_s1,
+    eye_mod_s2,
+    _pad2: [0.0; 2],
   }
 }
 

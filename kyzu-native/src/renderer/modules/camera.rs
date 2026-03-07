@@ -9,8 +9,8 @@ use crate::renderer::shared::{CameraMatrices, SharedState};
 // ──────────────────────────────────────────────────────────────
 //
 
-const RADIUS_MIN: f64 = 0.01;
-const RADIUS_MAX: f64 = 9_000_000_000_000.0;
+const RADIUS_MIN: f64 = 0.1;
+const RADIUS_MAX: f64 = 1.0e12;
 const ELEVATION_MIN: f64 = 0.01;
 const ELEVATION_MAX: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
 
@@ -62,7 +62,6 @@ impl CameraModule
   }
 
   /// Process input and mutate camera state.
-  /// Call this before update().
   pub fn apply_input(&mut self, input: &InputState, screen_width: u32, screen_height: u32)
   {
     self.apply_orbit(input);
@@ -170,9 +169,8 @@ impl CameraModule
       return;
     }
 
-    // Unproject current and previous mouse position onto z=0 plane,
-    // then move target by the difference — grid sticks to cursor exactly
     let inv_vp = glam::Mat4::from_cols_array_2d(&self.compute_matrices().inv_view_proj);
+    let eye = self.eye_position();
 
     let prev_world = unproject_to_ground(
       input.mouse_x - input.mouse_dx,
@@ -180,21 +178,16 @@ impl CameraModule
       screen_width,
       screen_height,
       inv_vp,
-      self.eye_position(),
+      eye,
     );
 
-    let curr_world = unproject_to_ground(
-      input.mouse_x,
-      input.mouse_y,
-      screen_width,
-      screen_height,
-      inv_vp,
-      self.eye_position(),
-    );
+    let curr_world =
+      unproject_to_ground(input.mouse_x, input.mouse_y, screen_width, screen_height, inv_vp, eye);
 
     if let (Some(prev), Some(curr)) = (prev_world, curr_world)
     {
       self.target += prev - curr;
+      self.target.z = 0.0;
     }
   }
 
@@ -215,7 +208,6 @@ impl CameraModule
     }
 
     let actual_factor = new_radius / old_radius;
-
     let inv_vp = glam::Mat4::from_cols_array_2d(&self.compute_matrices().inv_view_proj);
     let eye = self.eye_position();
 
@@ -226,6 +218,7 @@ impl CameraModule
     {
       self.target.x += (p.x - self.target.x) * (1.0 - actual_factor);
       self.target.y += (p.y - self.target.y) * (1.0 - actual_factor);
+      self.target.z = 0.0;
     }
   }
 }
@@ -233,6 +226,11 @@ impl CameraModule
 //
 // ──────────────────────────────────────────────────────────────
 //   Geometry helpers
+//
+//   Ray-plane intersection done entirely in f64 to avoid
+//   catastrophic cancellation when eye.z is large. The f32 matrix
+//   outputs are promoted to f64 before any subtraction that would
+//   otherwise lose precision.
 // ──────────────────────────────────────────────────────────────
 //
 
@@ -251,36 +249,41 @@ fn unproject_to_ground(
   let near_h = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
   let far_h = inv_vp * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
 
-  // Stay in camera-relative f32 space for the ray direction
-  let near_rel = glam::Vec3::from(near_h.truncate() / near_h.w);
-  let far_rel = glam::Vec3::from(far_h.truncate() / far_h.w);
+  // Camera-relative ray endpoints, still f32
+  let near_rel = near_h.truncate() / near_h.w;
+  let far_rel = far_h.truncate() / far_h.w;
 
-  // Convert ray to f64 camera-relative, then add eye for world space
-  let near_world = eye + DVec3::new(near_rel.x as f64, near_rel.y as f64, near_rel.z as f64);
-  let far_world = eye + DVec3::new(far_rel.x as f64, far_rel.y as f64, far_rel.z as f64);
+  // Promote z to f64 before subtracting eye.z — both values can be
+  // ~1e7 in magnitude, and subtracting them in f32 causes catastrophic
+  // cancellation that makes t wildly imprecise.
+  let near_z = near_rel.z as f64;
+  let far_z = far_rel.z as f64;
+  let dir_z = far_z - near_z;
 
-  let dir = far_world - near_world;
-
-  if dir.z.abs() < 1e-10
+  if dir_z.abs() < 1e-10
   {
     return None;
   }
-  if !dir.is_finite()
-  {
-    return None;
-  } // catches NaN/inf from near-zero radius
 
-  let t = -near_world.z / dir.z;
+  // World z=0 is at camera-relative z = -eye.z
+  let t = (-eye.z - near_z) / dir_z;
+
   if t < 0.0
   {
     return None;
   }
 
-  let result = near_world + dir * t;
+  // Interpolate x/y in f64 — t is precise now so keep it that way
+  let hit_x = near_rel.x as f64 + (far_rel.x - near_rel.x) as f64 * t;
+  let hit_y = near_rel.y as f64 + (far_rel.y - near_rel.y) as f64 * t;
+
+  // z is exactly 0 by construction — no need to compute it
+  let result = DVec3::new(eye.x + hit_x, eye.y + hit_y, 0.0);
+
   if !result.is_finite()
   {
     return None;
-  } // final safety check
+  }
 
   Some(result)
 }
