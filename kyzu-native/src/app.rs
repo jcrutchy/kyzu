@@ -63,6 +63,7 @@ impl KyzuApp
     kernel.camera.set_aspect(size.width as f32 / size.height as f32);
 
     // Register render modules in draw order
+    kernel.add_module::<crate::renderer::modules::terrain::TerrainModule>();
     kernel.add_module::<crate::renderer::modules::sphere::SphereModule>();
     kernel.add_module::<crate::renderer::modules::debug::DebugModule>();
     kernel.add_module::<crate::renderer::modules::grid::GridModule>();
@@ -125,12 +126,8 @@ impl KyzuApp
     };
 
     let full_output = {
-      let kernel = match &self.kernel
-      {
-        Some(k) => k,
-        None => return,
-      };
-      kernel.gui.context.run(raw_input, |ctx| {
+      let ctx = self.kernel.as_ref().unwrap().gui.context.clone();
+      ctx.run(raw_input, |ctx| {
         self.run_ui(ctx);
       })
     };
@@ -144,7 +141,7 @@ impl KyzuApp
     self.input.end_frame();
   }
 
-  fn run_ui(&self, ctx: &egui::Context)
+  fn run_ui(&mut self, ctx: &egui::Context)
   {
     let kernel = match &self.kernel
     {
@@ -184,6 +181,45 @@ impl KyzuApp
         ui.label(format!("LOD Scale: {:.3}", kernel.shared.camera.lod_scale));
         ui.label(format!("LOD Fade:  {:.3}", kernel.shared.camera.lod_fade));
       });
+
+    // Terrain controls
+    use crate::renderer::modules::terrain::TerrainModule;
+    let kernel = match &mut self.kernel
+    {
+      Some(k) => k,
+      None => return,
+    };
+
+    if let Some(terrain) =
+      kernel.modules.iter_mut().find_map(|m| m.as_any_mut().downcast_mut::<TerrainModule>())
+    {
+      egui::Window::new("🏔 Terrain")
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
+        .resizable(false)
+        .collapsible(true)
+        .show(ctx, |ui| {
+          ui.heading("Noise");
+          ui.add(
+            egui::Slider::new(&mut terrain.config.noise_scale, 10.0..=2000.0)
+              .text("Scale")
+              .logarithmic(true),
+          );
+          ui.add(
+            egui::Slider::new(&mut terrain.config.amplitude, 1.0..=500.0)
+              .text("Amplitude")
+              .logarithmic(true),
+          );
+          ui.add(egui::Slider::new(&mut terrain.config.octaves, 1..=8).text("Octaves"));
+          ui.add(egui::Slider::new(&mut terrain.config.persistence, 0.1..=0.9).text("Persistence"));
+          ui.add(egui::Slider::new(&mut terrain.config.lacunarity, 1.2..=4.0).text("Lacunarity"));
+          ui.add(egui::Slider::new(&mut terrain.config.seed_offset, 0.0..=1000.0).text("Seed"));
+          ui.add_space(6.0);
+          ui.separator();
+          ui.add_space(6.0);
+          ui.heading("Display");
+          ui.checkbox(&mut terrain.config.wireframe, "Wireframe");
+        });
+    }
   }
 }
 
