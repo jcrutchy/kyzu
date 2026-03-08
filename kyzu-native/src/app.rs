@@ -193,7 +193,7 @@ impl KyzuApp
     if let Some(terrain) =
       kernel.modules.iter_mut().find_map(|m| m.as_any_mut().downcast_mut::<TerrainModule>())
     {
-      egui::Window::new("🏔 Terrain")
+      egui::Window::new("Terrain")
         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
         .resizable(false)
         .collapsible(true)

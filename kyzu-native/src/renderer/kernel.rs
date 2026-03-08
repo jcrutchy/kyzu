@@ -17,7 +17,7 @@ use crate::renderer::shared::{CameraGpu, CameraMatrices, FrameTargets, SharedSta
 
 pub struct Kernel
 {
-  pub device: wgpu::Device,
+  pub device: Arc<wgpu::Device>,
   pub queue: wgpu::Queue,
   pub adapter_info: wgpu::AdapterInfo,
   depth: DepthResources,
@@ -69,6 +69,7 @@ impl Kernel
       })
       .await
       .expect("Failed to create device");
+    let device = Arc::new(device);
 
     let config = configure_surface(&surface, &adapter, &device);
     let aspect = config.width as f32 / config.height as f32;

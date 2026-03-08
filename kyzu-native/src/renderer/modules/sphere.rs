@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use glam::DVec3;
 use wgpu::util::DeviceExt;
 
@@ -62,7 +64,7 @@ pub struct SphereModule
 
 impl RenderModule for SphereModule
 {
-  fn init(device: &wgpu::Device, _queue: &wgpu::Queue, shared: &SharedState) -> Self
+  fn init(device: &Arc<wgpu::Device>, _queue: &wgpu::Queue, shared: &SharedState) -> Self
   {
     let (vertices, indices) = build_uv_sphere(32, 16);
 

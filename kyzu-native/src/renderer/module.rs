@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use crate::renderer::shared::{FrameTargets, SharedState};
 
@@ -6,7 +7,7 @@ pub trait RenderModule
 {
   /// Called once at startup after the kernel is initialised.
   /// Use this to create pipelines, buffers, and bind groups.
-  fn init(device: &wgpu::Device, queue: &wgpu::Queue, shared: &SharedState) -> Self
+  fn init(device: &Arc<wgpu::Device>, queue: &wgpu::Queue, shared: &SharedState) -> Self
   where
     Self: Sized;
 

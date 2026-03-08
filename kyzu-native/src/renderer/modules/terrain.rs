@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use glam::DVec3;
 use wgpu::util::DeviceExt;
 
@@ -5,27 +7,20 @@ use crate::renderer::module::RenderModule;
 use crate::renderer::shared::{FrameTargets, SharedState};
 
 // ──────────────────────────────────────────────────────────────
-//   Public terrain configuration (set by app, read each frame)
+//   Public terrain configuration
 // ──────────────────────────────────────────────────────────────
 
 pub struct TerrainConfig
 {
-  /// World-space size of a single chunk (units)
-  pub chunk_size: f64,
-  /// Number of quads along each axis per chunk
-  pub chunk_resolution: u32,
-  /// Grid of chunks: (cols, rows) centred on world origin
-  pub grid_dims: (u32, u32),
-
-  // Noise parameters — uploaded to GPU every frame
+  // Noise parameters — user-editable via egui
   pub noise_scale: f32,
   pub amplitude: f32,
   pub octaves: u32,
   pub persistence: f32,
   pub lacunarity: f32,
   pub seed_offset: f32,
-
   pub wireframe: bool,
+  pub grid_dims: (u32, u32),
 }
 
 impl Default for TerrainConfig
@@ -33,9 +28,6 @@ impl Default for TerrainConfig
   fn default() -> Self
   {
     Self {
-      chunk_size: 200.0,
-      chunk_resolution: 64,
-      grid_dims: (5, 5),
       noise_scale: 300.0,
       amplitude: 80.0,
       octaves: 6,
@@ -43,12 +35,46 @@ impl Default for TerrainConfig
       lacunarity: 2.0,
       seed_offset: 0.0,
       wireframe: false,
+      grid_dims: (7, 7),
     }
   }
 }
 
 // ──────────────────────────────────────────────────────────────
-//   GPU uniform — must match terrain.wgsl TerrainUniform layout
+//   LOD tier
+//
+//   chunk_size snaps to powers of two, driven by camera radius.
+//   LOD transitions always land on clean doublings, and every
+//   chunk_size is an exact multiple of all smaller chunk_sizes.
+//   Because chunk origins are always multiples of chunk_size in
+//   world space, a rebuilt grid samples the same world_xy coords
+//   as the previous tier — no terrain pop on LOD change.
+//
+//   fade_far = max(radius * 15, 80) — matches CameraModule.
+//   chunk_size = largest power-of-two ≤ fade_far / CHUNKS_PER_SIDE.
+// ──────────────────────────────────────────────────────────────
+
+/// How many chunk-widths we want visible per side of centre.
+const CHUNKS_PER_SIDE: f64 = 3.0;
+
+fn chunk_size_for_radius(radius: f64) -> f64
+{
+  let fade_far = (radius * 15.0).max(80.0);
+  let ideal = fade_far / CHUNKS_PER_SIDE;
+  let exp = ideal.log2().floor() as i32;
+  (2.0_f64).powi(exp).max(1.0)
+}
+
+/// Snap a world coordinate down to the nearest multiple of chunk_size.
+/// All chunk origins use this so they land on consistent world positions
+/// across LOD tiers (power-of-two sizes guarantee alignment).
+fn snap_to_grid(v: f64, chunk_size: f64) -> f64
+{
+  (v / chunk_size).floor() * chunk_size
+}
+
+// ──────────────────────────────────────────────────────────────
+//   GPU uniform
 // ──────────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -69,20 +95,25 @@ const _: () = assert!(std::mem::size_of::<TerrainUniform>() == 32);
 
 // ──────────────────────────────────────────────────────────────
 //   Vertex layout
-//   [pos_rel: xyz(f32), world_xy: xy(f32), bary: xyz(f32)]
 // ──────────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex
 {
-  pos_rel: [f32; 3],  // camera-relative flat XY position, Z=0
+  pos_rel: [f32; 3],  // camera-relative XY, Z=0 (shader displaces Z)
   world_xy: [f32; 2], // absolute world XY for noise sampling
   bary: [f32; 3],     // barycentric coordinate for wireframe
 }
 
 // ──────────────────────────────────────────────────────────────
-//   Per-chunk GPU resources
+//   Chunk
+//
+//   Each chunk owns its GPU buffers and tracks its current
+//   position in chunk-grid space (integer coords, not world units).
+//   When streaming, a chunk's grid_coord is reassigned to the new
+//   leading-edge position and its vertex buffer is re-uploaded.
+//   No GPU allocations happen after init.
 // ──────────────────────────────────────────────────────────────
 
 struct Chunk
@@ -90,8 +121,24 @@ struct Chunk
   vertex_buffer: wgpu::Buffer,
   index_buffer: wgpu::Buffer,
   index_count: u32,
-  /// World-space origin (bottom-left corner of chunk)
-  world_origin: DVec3,
+  grid_coord: (i64, i64),
+  /// World-space size of this chunk — stored per-chunk so it stays
+  /// valid across LOD rebuilds without needing the module's chunk_size.
+  chunk_size: f64,
+}
+
+impl Chunk
+{
+  fn world_origin(&self) -> DVec3
+  {
+    // Origins are always world-snapped multiples of chunk_size —
+    // computed here rather than stored so they're always consistent.
+    DVec3::new(
+      snap_to_grid(self.grid_coord.0 as f64 * self.chunk_size, self.chunk_size),
+      snap_to_grid(self.grid_coord.1 as f64 * self.chunk_size, self.chunk_size),
+      0.0,
+    )
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -100,20 +147,30 @@ struct Chunk
 
 pub struct TerrainModule
 {
+  device: Arc<wgpu::Device>,
   chunks: Vec<Chunk>,
   terrain_uniform_buffer: wgpu::Buffer,
   terrain_bind_group: wgpu::BindGroup,
   pipeline: wgpu::RenderPipeline,
   pub config: TerrainConfig,
+  /// Chunk-grid coord the grid was last centred on.
+  last_center: (i64, i64),
+  /// The chunk_size used when the current chunk pool was allocated.
+  /// When radius drifts far enough from this, we rebuild.
+  active_chunk_size: f64,
+  /// Camera radius at last frame — used to detect LOD tier changes.
+  last_radius: f64,
 }
 
 impl RenderModule for TerrainModule
 {
-  fn init(device: &wgpu::Device, _queue: &wgpu::Queue, shared: &SharedState) -> Self
+  fn init(device: &Arc<wgpu::Device>, _queue: &wgpu::Queue, shared: &SharedState) -> Self
   {
+    let device_arc = Arc::clone(device);
     let config = TerrainConfig::default();
+    let initial_radius = shared.camera.radius as f64;
+    let chunk_size = chunk_size_for_radius(initial_radius);
 
-    // Terrain uniform buffer + bind group
     let terrain_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
       label: Some("Terrain Uniform Buffer"),
       size: std::mem::size_of::<TerrainUniform>() as u64,
@@ -146,15 +203,29 @@ impl RenderModule for TerrainModule
 
     let pipeline = create_pipeline(device, shared, &terrain_bgl);
 
-    // Build chunks
-    let chunks = build_chunks(device, &config);
+    let center = (0i64, 0i64);
+    let chunks = allocate_chunks(device, &config, center, chunk_size);
 
-    Self { chunks, terrain_uniform_buffer, terrain_bind_group, pipeline, config }
+    Self {
+      device: device_arc,
+      chunks,
+      terrain_uniform_buffer,
+      terrain_bind_group,
+      pipeline,
+      config,
+      last_center: center,
+      active_chunk_size: chunk_size,
+      last_radius: initial_radius,
+    }
   }
 
   fn update(&mut self, queue: &wgpu::Queue, shared: &SharedState)
   {
-    // Upload terrain uniform
+    let radius = shared.camera.radius as f64;
+    let desired_chunk_size = chunk_size_for_radius(radius);
+
+    // noise_scale is always sent as-is — no scaling. The shader samples
+    // the same world_xy regardless of zoom so terrain is always consistent.
     let uniform = TerrainUniform {
       noise_scale: self.config.noise_scale,
       amplitude: self.config.amplitude,
@@ -167,19 +238,48 @@ impl RenderModule for TerrainModule
     };
     queue.write_buffer(&self.terrain_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
-    // Rebuild chunks if grid config has changed
-    // (For now we just re-upload vertex buffers with updated camera-relative positions.
-    //  Chunk world_origin is fixed; only pos_rel changes as eye moves.)
     let eye = DVec3::new(
       shared.camera.eye_world[0] as f64,
       shared.camera.eye_world[1] as f64,
       shared.camera.eye_world[2] as f64,
     );
 
-    for chunk in &mut self.chunks
+    let target = DVec3::new(shared.camera.target[0] as f64, shared.camera.target[1] as f64, 0.0);
+
+    let ratio = desired_chunk_size / self.active_chunk_size;
+    if ratio >= 2.0 || ratio <= 0.5
     {
-      update_chunk_vertices(queue, chunk, eye, &self.config);
+      let center = world_to_chunk_coord(target.x, target.y, desired_chunk_size);
+      self.chunks = allocate_chunks(&self.device, &self.config, center, desired_chunk_size);
+      self.active_chunk_size = desired_chunk_size;
+      self.last_center = center;
+      for i in 0..self.chunks.len()
+      {
+        let origin = self.chunks[i].world_origin();
+        upload_chunk_vertices(queue, &self.chunks[i], origin, eye, &self.config);
+      }
+      self.last_radius = radius;
+      return;
     }
+
+    // Same LOD tier — stream and refresh positions
+    let camera_chunk = world_to_chunk_coord(target.x, target.y, self.active_chunk_size);
+
+    if camera_chunk != self.last_center
+    {
+      self.stream_chunks(queue, camera_chunk, eye);
+      self.last_center = camera_chunk;
+    }
+    else
+    {
+      for i in 0..self.chunks.len()
+      {
+        let origin = self.chunks[i].world_origin();
+        upload_chunk_vertices(queue, &self.chunks[i], origin, eye, &self.config);
+      }
+    }
+
+    self.last_radius = radius;
   }
 
   fn encode(&self, encoder: &mut wgpu::CommandEncoder, targets: &FrameTargets, shared: &SharedState)
@@ -220,31 +320,89 @@ impl RenderModule for TerrainModule
 }
 
 // ──────────────────────────────────────────────────────────────
-//   Chunk geometry builders
+//   Streaming
 // ──────────────────────────────────────────────────────────────
 
-/// Build all chunks for the initial configuration.
-fn build_chunks(device: &wgpu::Device, config: &TerrainConfig) -> Vec<Chunk>
+impl TerrainModule
+{
+  fn stream_chunks(&mut self, queue: &wgpu::Queue, new_center: (i64, i64), eye: DVec3)
+  {
+    let (cols, rows) = self.config.grid_dims;
+    let desired = grid_coords(new_center, cols, rows);
+
+    let mut needs_fill: Vec<(i64, i64)> = desired
+      .iter()
+      .filter(|&&coord| !self.chunks.iter().any(|c| c.grid_coord == coord))
+      .copied()
+      .collect();
+
+    for chunk in &mut self.chunks
+    {
+      if desired.contains(&chunk.grid_coord)
+      {
+        let origin = chunk.world_origin();
+        upload_chunk_vertices(queue, chunk, origin, eye, &self.config);
+      }
+      else if let Some(new_coord) = needs_fill.pop()
+      {
+        chunk.grid_coord = new_coord;
+        let origin = chunk.world_origin();
+        upload_chunk_vertices(queue, chunk, origin, eye, &self.config);
+      }
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+//   Coordinate helpers
+// ──────────────────────────────────────────────────────────────
+
+/// Which chunk-grid cell does this world position fall in?
+fn world_to_chunk_coord(wx: f64, wy: f64, chunk_size: f64) -> (i64, i64)
+{
+  ((wx / chunk_size).floor() as i64, (wy / chunk_size).floor() as i64)
+}
+
+/// All grid coords in a (cols × rows) window centred on `center`.
+fn grid_coords(center: (i64, i64), cols: u32, rows: u32) -> Vec<(i64, i64)>
+{
+  let half_col = (cols / 2) as i64;
+  let half_row = (rows / 2) as i64;
+  let mut coords = Vec::with_capacity((cols * rows) as usize);
+  for row in -half_row..=half_row
+  {
+    for col in -half_col..=half_col
+    {
+      coords.push((center.0 + col, center.1 + row));
+    }
+  }
+  coords
+}
+
+// ──────────────────────────────────────────────────────────────
+//   Chunk allocation (init only — no GPU allocs after this)
+// ──────────────────────────────────────────────────────────────
+
+fn allocate_chunks(
+  device: &wgpu::Device,
+  config: &TerrainConfig,
+  center: (i64, i64),
+  chunk_size: f64,
+) -> Vec<Chunk>
 {
   let (cols, rows) = config.grid_dims;
-  let size = config.chunk_size;
-
-  // Centre the grid on world origin
-  let total_w = cols as f64 * size;
-  let total_h = rows as f64 * size;
-  let offset_x = -total_w * 0.5;
-  let offset_y = -total_h * 0.5;
-
-  let mut chunks = Vec::with_capacity((cols * rows) as usize);
-
-  for row in 0..rows
-  {
-    for col in 0..cols
-    {
-      let origin = DVec3::new(offset_x + col as f64 * size, offset_y + row as f64 * size, 0.0);
-
-      // Use DVec3::ZERO as initial eye (will be updated first frame via update())
-      let (vertices, indices) = build_chunk_geometry(origin, DVec3::ZERO, config);
+  grid_coords(center, cols, rows)
+    .into_iter()
+    .map(|coord| {
+      // Snap origin to world-space multiples of chunk_size.
+      // This is the key invariant: origins are always consistent
+      // across LOD tiers because chunk_sizes are powers of two.
+      let origin = DVec3::new(
+        snap_to_grid(coord.0 as f64 * chunk_size, chunk_size),
+        snap_to_grid(coord.1 as f64 * chunk_size, chunk_size),
+        0.0,
+      );
+      let (vertices, indices) = build_chunk_geometry(origin, DVec3::ZERO, config, chunk_size);
 
       let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Terrain Chunk VB"),
@@ -258,79 +416,64 @@ fn build_chunks(device: &wgpu::Device, config: &TerrainConfig) -> Vec<Chunk>
         usage: wgpu::BufferUsages::INDEX,
       });
 
-      chunks.push(Chunk {
+      Chunk {
         vertex_buffer: vb,
         index_buffer: ib,
         index_count: indices.len() as u32,
-        world_origin: origin,
-      });
-    }
-  }
-
-  chunks
+        grid_coord: coord,
+        chunk_size,
+      }
+    })
+    .collect()
 }
 
-/// Re-upload vertex data with updated camera-relative positions.
-/// The index buffer never changes so we only touch the vertex buffer.
-fn update_chunk_vertices(queue: &wgpu::Queue, chunk: &Chunk, eye: DVec3, config: &TerrainConfig)
+// ──────────────────────────────────────────────────────────────
+//   Vertex upload
+// ──────────────────────────────────────────────────────────────
+
+fn upload_chunk_vertices(
+  queue: &wgpu::Queue,
+  chunk: &Chunk,
+  world_origin: DVec3,
+  eye: DVec3,
+  _config: &TerrainConfig,
+)
 {
-  let (vertices, _) = build_chunk_geometry(chunk.world_origin, eye, config);
+  let (vertices, _) = build_chunk_geometry(world_origin, eye, _config, chunk.chunk_size);
   queue.write_buffer(&chunk.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
 }
 
-/// Build flat (Z=0) vertex grid and triangle index list for one chunk.
-/// pos_rel is camera-relative; world_xy is absolute (used by noise in shader).
-/// Barycentric coords are assigned per triangle so every vertex in a triangle
-/// gets a unique barycentric axis — standard wireframe trick.
+// ──────────────────────────────────────────────────────────────
+//   Chunk geometry
+// ──────────────────────────────────────────────────────────────
+
 fn build_chunk_geometry(
   world_origin: DVec3,
   eye: DVec3,
-  config: &TerrainConfig,
+  _config: &TerrainConfig,
+  chunk_size: f64,
 ) -> (Vec<Vertex>, Vec<u32>)
 {
-  let res = config.chunk_resolution;
-  let size = config.chunk_size;
-  let step = size / res as f64;
+  let target_spacing = 4.0_f64; // world units per quad
+  let res = ((chunk_size / target_spacing) as u32).clamp(8, 128);
+  let step = chunk_size / res as f64;
 
-  let vert_count = (res + 1) * (res + 1);
-  let mut vertices: Vec<Vertex> = Vec::with_capacity(vert_count as usize);
-
+  // Build world XY grid (shared positions)
+  let mut grid: Vec<[f64; 2]> = Vec::with_capacity(((res + 1) * (res + 1)) as usize);
   for row in 0..=(res)
   {
     for col in 0..=(res)
     {
-      let wx = world_origin.x + col as f64 * step;
-      let wy = world_origin.y + row as f64 * step;
-
-      // Camera-relative XY flat position
-      let rx = (wx - eye.x) as f32;
-      let ry = (wy - eye.y) as f32;
-
-      vertices.push(Vertex {
-        pos_rel: [rx, ry, 0.0],
-        world_xy: [wx as f32, wy as f32],
-        bary: [0.0; 3], // filled per-triangle below
-      });
+      grid.push([world_origin.x + col as f64 * step, world_origin.y + row as f64 * step]);
     }
   }
 
-  // Build indices and assign barycentric per-triangle.
-  // Each quad = 2 triangles. We duplicate vertices per-triangle for bary coords.
-  // To keep things simple and match the allocated buffer size, we instead embed
-  // bary as a vertex attribute and assign it at build time using a separate pass.
-  // Since vertices are shared, we use a trick: bary is set based on vertex position
-  // within the quad so that within each triangle the three vertices differ.
-  //
-  // Standard approach: assign bary = (1,0,0), (0,1,0), (0,0,1) round-robin by
-  // vertex index within triangle. This requires un-sharing vertices — we do that
-  // below by building a flat (non-indexed) vertex list.
-
+  // Unshared flat vertex list — one unique vertex per triangle corner
+  // so each triangle gets its own barycentric assignment.
   let tri_count = res * res * 2;
   let mut flat_verts: Vec<Vertex> = Vec::with_capacity((tri_count * 3) as usize);
   let mut indices: Vec<u32> = Vec::with_capacity((tri_count * 3) as usize);
-
   let bary_cycle: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
   let mut idx = 0u32;
 
   for row in 0..res
@@ -342,26 +485,19 @@ fn build_chunk_geometry(
       let bl = ((row + 1) * (res + 1) + col) as usize;
       let br = bl + 1;
 
-      // Triangle 1: tl, bl, tr
-      let tri1 = [vertices[tl], vertices[bl], vertices[tr]];
-      for (i, v) in tri1.iter().enumerate()
+      for tri_verts in [[tl, bl, tr], [tr, bl, br]]
       {
-        let mut vert = *v;
-        vert.bary = bary_cycle[i];
-        flat_verts.push(vert);
-        indices.push(idx);
-        idx += 1;
-      }
-
-      // Triangle 2: tr, bl, br
-      let tri2 = [vertices[tr], vertices[bl], vertices[br]];
-      for (i, v) in tri2.iter().enumerate()
-      {
-        let mut vert = *v;
-        vert.bary = bary_cycle[i];
-        flat_verts.push(vert);
-        indices.push(idx);
-        idx += 1;
+        for (i, &gi) in tri_verts.iter().enumerate()
+        {
+          let [wx, wy] = grid[gi];
+          flat_verts.push(Vertex {
+            pos_rel: [(wx - eye.x) as f32, (wy - eye.y) as f32, 0.0],
+            world_xy: [wx as f32, wy as f32],
+            bary: bary_cycle[i],
+          });
+          indices.push(idx);
+          idx += 1;
+        }
       }
     }
   }

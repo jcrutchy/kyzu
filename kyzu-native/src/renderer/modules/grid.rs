@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::renderer::module::RenderModule;
 use crate::renderer::shared::{FrameTargets, SharedState};
 
@@ -42,7 +44,7 @@ pub struct GridModule
 
 impl RenderModule for GridModule
 {
-  fn init(device: &wgpu::Device, _queue: &wgpu::Queue, shared: &SharedState) -> Self
+  fn init(device: &Arc<wgpu::Device>, _queue: &wgpu::Queue, shared: &SharedState) -> Self
   {
     let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
       label: Some("Grid Uniform Buffer"),
