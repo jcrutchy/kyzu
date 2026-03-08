@@ -19,9 +19,10 @@ pub struct CameraMatrices
   pub _pad2: f32,
   pub radius: f32,
   pub _pad3: f32,
+  pub target_rel: [f32; 3], // target - eye, computed in f64 then cast
 }
 
-const _: () = assert!(std::mem::size_of::<CameraMatrices>() == 184);
+const _: () = assert!(std::mem::size_of::<CameraMatrices>() == 196);
 
 /// GPU-side camera resources, owned by the kernel.
 /// Modules access the camera via the bind group — they never
@@ -110,6 +111,7 @@ impl Default for CameraMatrices
       _pad2: 0.0,
       radius: 20.0,
       _pad3: 0.0,
+      target_rel: [0.0; 3],
     }
   }
 }

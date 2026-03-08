@@ -21,9 +21,6 @@ use crate::renderer::shared::{FrameTargets, SharedState};
 //
 
 const COL_TARGET: [f32; 3] = [1.0, 1.0, 1.0];
-const COL_PROJ: [f32; 3] = [1.0, 1.0, 0.2];
-const COL_CONNECT: [f32; 3] = [0.5, 0.5, 0.5];
-const Z_THRESHOLD: f32 = 0.001;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -66,24 +63,11 @@ impl RenderModule for DebugModule
 
   fn update(&mut self, queue: &wgpu::Queue, shared: &SharedState)
   {
-    // Reconstruct target and projection from shared camera state.
-    // The camera module writes eye_world into CameraMatrices — we
-    // need the target separately, so we add it below.
-    let target = shared.camera.target;
-    let proj = [target[0], target[1], 0.0];
+    let target_rel = shared.camera.target_rel;
+    let arm = (shared.camera.radius * 0.02).max(0.1) as f32;
 
-    let arm = (shared.camera.radius * 0.02).max(0.1);
-
-    let mut verts: Vec<Vertex> = Vec::with_capacity(MAX_VERTS as usize);
-
-    push_cross(&mut verts, target, COL_TARGET, arm);
-
-    if target[2].abs() > Z_THRESHOLD
-    {
-      push_cross(&mut verts, proj, COL_PROJ, arm);
-      verts.push(make_vertex(target, COL_CONNECT));
-      verts.push(make_vertex(proj, COL_CONNECT));
-    }
+    let mut verts: Vec<Vertex> = Vec::with_capacity(6);
+    push_cross(&mut verts, target_rel, COL_TARGET, arm);
 
     self.vertex_count = verts.len() as u32;
     queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
@@ -158,7 +142,7 @@ fn create_pipeline(device: &wgpu::Device, shared: &SharedState) -> wgpu::RenderP
 {
   let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
     label: Some("Debug Shader"),
-    source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/axes.wgsl").into()),
+    source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/debug.wgsl").into()),
   });
 
   let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

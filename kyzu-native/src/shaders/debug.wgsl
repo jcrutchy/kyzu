@@ -20,8 +20,7 @@ struct VsOut {
 @vertex
 fn vs_main(in : VsIn) -> VsOut {
     var out : VsOut;
-    let rel_pos = in.position - camera.eye_world;
-    out.pos    = camera.view_proj * vec4<f32>(rel_pos, 1.0);
+    out.pos    = camera.view_proj * vec4<f32>(in.position, 1.0);
     out.colour = in.colour;
     return out;
 }

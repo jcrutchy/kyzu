@@ -1,7 +1,2 @@
-* when zooming right in further away from the origin,
-the zoom-to-cursor gets unstable
-
-* debug vertical stick (target @ centre of window => projection to grid plane) not working
-
 * HUD overlay
 

@@ -81,6 +81,8 @@ impl CameraModule
     let lod_level = log_zoom.floor();
     let lod_fade = log_zoom - lod_level;
 
+    let target_rel = self.target - eye; // DVec3 subtraction, full f64
+
     CameraMatrices {
       view_proj: view_proj.to_cols_array_2d(),
       inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -94,6 +96,7 @@ impl CameraModule
       _pad2: 0.0,
       radius: self.radius as f32,
       _pad3: 0.0,
+      target_rel: [target_rel.x as f32, target_rel.y as f32, target_rel.z as f32],
     }
   }
 }

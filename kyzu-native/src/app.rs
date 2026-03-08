@@ -64,7 +64,6 @@ impl KyzuApp
 
     // Register render modules in draw order
     kernel.add_module::<crate::renderer::modules::sphere::SphereModule>();
-    kernel.add_module::<crate::renderer::modules::axes::AxesModule>();
     kernel.add_module::<crate::renderer::modules::debug::DebugModule>();
     kernel.add_module::<crate::renderer::modules::grid::GridModule>();
 
