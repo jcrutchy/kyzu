@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "kyzu-core",
-    "kyzu-native"
-]
+    "kyzu-native",
+    "solar-native"]
 
 resolver = "2"
