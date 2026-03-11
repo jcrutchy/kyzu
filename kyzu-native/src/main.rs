@@ -1,14 +1,14 @@
 mod app;
+pub mod config;
+pub mod earth;
 mod input;
+pub mod kzt;
 mod renderer;
+mod tiff_reader;
 
 fn main()
 {
-  // Initialise the logger so wgpu validation errors and warnings appear in the console.
-  // Set RUST_LOG=warn (default) or RUST_LOG=wgpu=debug for more verbose GPU output.
-
-  std::env::set_var("RUST_LOG", "info,wgpu_hal=off,naga=warn");
+  std::env::set_var("RUST_LOG", "info,wgpu_core=warn,wgpu_hal=warn,naga=warn");
   env_logger::init();
-
   app::run();
 }

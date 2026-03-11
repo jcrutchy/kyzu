@@ -1,2 +1,15 @@
 * HUD overlay
 
+
+greedy-meshed blocks - reduces vertex count by 60-90%
+binary greedy meshing
+smooth-shifted voxels
+
+keep data in simple 3d grid, but when generating mesh apply a vertex offset based on neighbouring voxels
+
+palette compression
+empty space - use run-length encoding (RLE)
+instead of u32 for every voxel, store u16 or u8 that points to a palette table
+
+send single buffer of commands to the gpu
+frustum culling (only show chunks that are visible)

@@ -28,3 +28,18 @@ env_logger = "0.11"
 egui = "0.33.3"
 egui-wgpu = "0.33.3"
 egui-winit = "0.33.3"
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+flate2 = "1"
+
+
+[[bin]]
+name = "kyzu-native"
+path = "src/main.rs"
+
+[[bin]]
+name = "kyzu-preprocess"
+path = "src/preprocess.rs"

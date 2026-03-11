@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use glam::DVec3;
 use winit::{
   application::ApplicationHandler,
   event::{ElementState, WindowEvent},
@@ -8,9 +7,10 @@ use winit::{
   window::{Window, WindowId},
 };
 
+use crate::config::KyzuConfig;
 use crate::input::InputState;
 use crate::renderer::kernel::Kernel;
-use crate::renderer::modules::sphere::SphereInstance;
+use crate::renderer::modules::earth_terrain::EarthTerrainModule;
 
 //
 // ──────────────────────────────────────────────────────────────
@@ -20,9 +20,13 @@ use crate::renderer::modules::sphere::SphereInstance;
 
 pub fn run()
 {
-  let event_loop = EventLoop::new().unwrap();
-  let mut app = KyzuApp::new();
+  let config = crate::config::load().unwrap_or_else(|e| {
+    eprintln!("Failed to load kyzu.json: {e}");
+    std::process::exit(1);
+  });
 
+  let event_loop = EventLoop::new().unwrap();
+  let mut app = KyzuApp::new(config);
   event_loop.run_app(&mut app).unwrap();
 }
 
@@ -37,13 +41,14 @@ struct KyzuApp
   window: Option<Arc<Window>>,
   kernel: Option<Kernel>,
   input: InputState,
+  config: KyzuConfig,
 }
 
 impl KyzuApp
 {
-  fn new() -> Self
+  fn new(config: KyzuConfig) -> Self
   {
-    Self { window: None, kernel: None, input: InputState::new() }
+    Self { window: None, kernel: None, input: InputState::new(), config }
   }
 
   fn init_window_and_kernel(&mut self, event_loop: &ActiveEventLoop)
@@ -62,23 +67,36 @@ impl KyzuApp
     let size = window.inner_size();
     kernel.camera.set_aspect(size.width as f32 / size.height as f32);
 
-    // Register render modules in draw order
-    kernel.add_module::<crate::renderer::modules::terrain::TerrainModule>();
-    kernel.add_module::<crate::renderer::modules::sphere::SphereModule>();
-    kernel.add_module::<crate::renderer::modules::debug::DebugModule>();
-    kernel.add_module::<crate::renderer::modules::grid::GridModule>();
+    // Initialise camera from config
+    // ENU origin is bbox centre, so camera target starts at ENU zero
+    kernel.camera.target = glam::DVec3::ZERO;
+    kernel.camera.radius = self.config.startup.camera.radius;
+    // Look down at a reasonable angle for a top-down map view
+    kernel.camera.elevation = std::f64::consts::FRAC_PI_4; // 45°
+    kernel.camera.azimuth = -std::f64::consts::FRAC_PI_4;
 
-    // Populate sphere instances
-    if let Some(module) = kernel
-      .modules
-      .iter_mut()
-      .find_map(|m| m.as_any_mut().downcast_mut::<crate::renderer::modules::sphere::SphereModule>())
+    // Load earth terrain — this is the slow step (heightmap decode)
+    // TODO: move to a background thread with a loading screen
+    log::info!("Loading terrain...");
+    match EarthTerrainModule::from_config(&kernel.device, &kernel.shared, &self.config)
     {
-      module.instances = vec![
-        SphereInstance { center: DVec3::new(0.0, 9.371e7, 0.0), radius: 6.371e6 },
-        SphereInstance { center: DVec3::new(9.371e7, 9.371e6, 9.371e3), radius: 6.371e6 },
-      ];
+      Ok(earth) =>
+      {
+        kernel.modules.push(Box::new(earth));
+        log::info!("Terrain loaded.");
+      }
+      Err(e) =>
+      {
+        eprintln!("Failed to load terrain: {e}");
+        std::process::exit(1);
+      }
     }
+
+    // Debug cross at camera target
+    kernel.add_module::<crate::renderer::modules::debug::DebugModule>();
+
+    // Sync camera matrices after setting radius/target
+    kernel.update_camera(&self.input);
 
     self.window = Some(window);
     self.kernel = Some(kernel);
@@ -90,12 +108,10 @@ impl KyzuApp
     {
       return;
     }
-
     if let Some(kernel) = &mut self.kernel
     {
       kernel.resize(width, height);
     }
-
     if let Some(window) = &self.window
     {
       window.request_redraw();
@@ -115,7 +131,6 @@ impl KyzuApp
       kernel.update_camera(&self.input);
     }
 
-    // Take egui input before the immutable borrow in run_ui
     let raw_input = {
       let kernel = match &mut self.kernel
       {
@@ -127,9 +142,7 @@ impl KyzuApp
 
     let full_output = {
       let ctx = self.kernel.as_ref().unwrap().gui.context.clone();
-      ctx.run(raw_input, |ctx| {
-        self.run_ui(ctx);
-      })
+      ctx.run(raw_input, |ctx| self.run_ui(ctx))
     };
 
     if let Some(kernel) = &mut self.kernel
@@ -151,12 +164,12 @@ impl KyzuApp
 
     let cam = &kernel.camera;
 
-    egui::Window::new("📊 Kyzu Telemetry")
+    egui::Window::new("📊 Kyzu")
       .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
       .resizable(false)
       .collapsible(true)
       .show(ctx, |ui| {
-        ui.heading("Hardware");
+        ui.heading("GPU");
         ui.label(format!("Device:  {}", kernel.adapter_info.name));
         ui.label(format!("Backend: {:?}", kernel.adapter_info.backend));
 
@@ -165,61 +178,24 @@ impl KyzuApp
         ui.add_space(8.0);
 
         ui.heading("Camera");
-        ui.monospace(format!("Radius:    {:.3e}", cam.radius));
+        ui.monospace(format!("Radius:    {:.3e} m", cam.radius));
         ui.monospace(format!(
-          "Target:    {:.3e}, {:.3e}, {:.3e}",
+          "Target:    {:.1}, {:.1}, {:.1}",
           cam.target.x, cam.target.y, cam.target.z
         ));
         ui.monospace(format!("Azimuth:   {:.1}°", cam.azimuth.to_degrees()));
         ui.monospace(format!("Elevation: {:.1}°", cam.elevation.to_degrees()));
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.heading("Grid System");
-        ui.label(format!("LOD Scale: {:.3}", kernel.shared.camera.lod_scale));
-        ui.label(format!("LOD Fade:  {:.3}", kernel.shared.camera.lod_fade));
+        // Show approximate lat/lon if we have an ENU origin
+        if let Some(earth) = kernel.modules.iter().find_map(|m| {
+          // Can't downcast immutably in a clean way here,
+          // so we just skip for now — lat/lon display is a nice-to-have
+          None::<&EarthTerrainModule>
+        })
+        {
+          ui.add_space(4.0);
+        }
       });
-
-    // Terrain controls
-    use crate::renderer::modules::terrain::TerrainModule;
-    let kernel = match &mut self.kernel
-    {
-      Some(k) => k,
-      None => return,
-    };
-
-    if let Some(terrain) =
-      kernel.modules.iter_mut().find_map(|m| m.as_any_mut().downcast_mut::<TerrainModule>())
-    {
-      egui::Window::new("Terrain")
-        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
-        .resizable(false)
-        .collapsible(true)
-        .show(ctx, |ui| {
-          ui.heading("Noise");
-          ui.add(
-            egui::Slider::new(&mut terrain.config.noise_scale, 10.0..=2000.0)
-              .text("Scale")
-              .logarithmic(true),
-          );
-          ui.add(
-            egui::Slider::new(&mut terrain.config.amplitude, 1.0..=500.0)
-              .text("Amplitude")
-              .logarithmic(true),
-          );
-          ui.add(egui::Slider::new(&mut terrain.config.octaves, 1..=8).text("Octaves"));
-          ui.add(egui::Slider::new(&mut terrain.config.persistence, 0.1..=0.9).text("Persistence"));
-          ui.add(egui::Slider::new(&mut terrain.config.lacunarity, 1.2..=4.0).text("Lacunarity"));
-          ui.add(egui::Slider::new(&mut terrain.config.seed_offset, 0.0..=1000.0).text("Seed"));
-          ui.add_space(6.0);
-          ui.separator();
-          ui.add_space(6.0);
-          ui.heading("Display");
-          ui.checkbox(&mut terrain.config.wireframe, "Wireframe");
-        });
-    }
   }
 }
 
@@ -263,7 +239,6 @@ impl ApplicationHandler for KyzuApp
       match &event
       {
         // Block presses and scroll when over egui, but never block releases
-        // — otherwise button state gets stuck when releasing over a panel
         WindowEvent::MouseInput { state: ElementState::Pressed, .. }
         | WindowEvent::MouseWheel { .. } => return,
         _ =>
