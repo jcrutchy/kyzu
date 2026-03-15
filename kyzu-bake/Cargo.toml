@@ -1,6 +1,16 @@
 [package]
-name = "kyzu-bake"
+name    = "kyzu-bake"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "kyzu-bake"
+path = "src/main.rs"
 
 [dependencies]
+kyzu-core  = { path = "../kyzu-core" }
+serde_json = "1"
+glam       = "0.29"
+noise      = "0.9"
+anyhow   = "1"
+bytemuck = { version = "1.20", features = ["derive"] }
