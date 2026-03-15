@@ -7,6 +7,7 @@ use kyzu_core::{BiomeEntry, HexLogic, TerrainVertex, WorldConfig};
 
 use crate::heightmap::HeightSampler;
 use crate::icosahedron;
+use crate::progress;
 
 // ──────────────────────────────────────────────────────────────
 //   Elevation encoding — metres + 11000 offset, stored as i16
@@ -161,7 +162,7 @@ pub fn bake(config: &WorldConfig, output_dir: &Path) -> anyhow::Result<()>
     let path = output_dir.join("biomes.json");
     let json = serde_json::to_string_pretty(&biomes)?;
     fs::write(&path, json)?;
-    println!("[DONE] Wrote biomes.json ({} biomes)", biomes.len());
+    progress::done("Wrote biomes.json");
   }
 
   // ── Write world.json ─────────────────────────────────────────
@@ -169,16 +170,20 @@ pub fn bake(config: &WorldConfig, output_dir: &Path) -> anyhow::Result<()>
     let path = output_dir.join("world.json");
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&path, json)?;
-    println!("[DONE] Wrote world.json");
+    progress::done("Wrote world.json");
   }
 
   // ── Bake each LOD level ──────────────────────────────────────
-  for &level in &config.baked_lod_levels
+  let total_levels = config.baked_lod_levels.len();
+  for (i, &level) in config.baked_lod_levels.iter().enumerate()
   {
-    bake_level(config, &sampler, output_dir, level)?;
+    let base_pct = (i * 90 / total_levels) as u32;
+    let next_pct = ((i + 1) * 90 / total_levels) as u32;
+    bake_level(config, &sampler, output_dir, level, base_pct, next_pct)?;
   }
 
-  println!("[DONE] Bake complete");
+  progress::progress(100, "Bake complete");
+  progress::done("Bake complete");
   Ok(())
 }
 
@@ -187,45 +192,50 @@ fn bake_level(
   sampler: &HeightSampler,
   output_dir: &Path,
   level: u32,
+  pct_start: u32,
+  pct_end: u32,
 ) -> anyhow::Result<()>
 {
-  println!("[WAIT] Baking LOD level {}...", level);
+  progress::wait(&format!("Baking LOD level {}...", level));
 
   let (vertices, faces) = icosahedron::build(level);
   let hex_ids = assign_hex_ids(&vertices, &faces);
-  let planet_r = config.planet_radius_km * 1000.0; // metres
+  let planet_r = config.planet_radius_km * 1000.0;
+  let total = vertices.len();
 
-  println!("[INFO] Level {}: {} vertices, {} faces", level, vertices.len(), faces.len());
+  progress::info(&format!("Level {}: {} vertices, {} faces", level, total, faces.len()));
 
-  // ── Build terrain vertices ────────────────────────────────────
-  let terrain_verts: Vec<TerrainVertex> = vertices
-    .iter()
-    .enumerate()
-    .map(|(i, &unit_pos)| {
-      let elevation = sampler.sample(unit_pos);
-      let world_pos = unit_pos * planet_r;
-      TerrainVertex {
-        position: [world_pos.x as f32, world_pos.y as f32, world_pos.z as f32],
-        hex_id: hex_ids[i],
-        elevation: encode_elevation(elevation),
-        biome_id: elevation_to_biome(elevation),
-        _pad: 0,
-      }
-    })
-    .collect();
+  // ── Build terrain vertices with progress reporting ────────────
+  let mut terrain_verts = Vec::with_capacity(total);
+  let report_every = (total / 20).max(1); // report ~20 times per level
+
+  for (i, &unit_pos) in vertices.iter().enumerate()
+  {
+    let elevation = sampler.sample(unit_pos);
+    let world_pos = unit_pos * planet_r;
+    terrain_verts.push(TerrainVertex {
+      position: [world_pos.x as f32, world_pos.y as f32, world_pos.z as f32],
+      hex_id: hex_ids[i],
+      elevation: encode_elevation(elevation),
+      biome_id: elevation_to_biome(elevation),
+      _pad: 0,
+    });
+
+    if i % report_every == 0
+    {
+      let local_pct = i as u32 * (pct_end - pct_start) / total as u32;
+      progress::progress(pct_start + local_pct, &format!("LOD {} vertices {}/{}", level, i, total));
+    }
+  }
 
   // ── Build hex logic array ─────────────────────────────────────
-  // One HexLogic entry per vertex (vertex IS the hex center)
   let hex_logic: Vec<HexLogic> = terrain_verts
     .iter()
-    .map(|v| {
-      let _elev_m = v.elevation as f64 - ELEVATION_OFFSET;
-      HexLogic {
-        biome_id: v.biome_id,
-        move_cost: elevation_to_move_cost(v.biome_id),
-        elevation: v.elevation,
-        _pad: 0,
-      }
+    .map(|v| HexLogic {
+      biome_id: v.biome_id,
+      move_cost: elevation_to_move_cost(v.biome_id),
+      elevation: v.elevation,
+      _pad: 0,
     })
     .collect();
 
@@ -236,7 +246,6 @@ fn bake_level(
     let mut writer = BufWriter::new(file);
     let mut bytes = 0usize;
 
-    // Header magic + metadata
     writer.write_all(&0x4B595A55u32.to_le_bytes())?;
     bytes += 4;
     writer.write_all(&level.to_le_bytes())?;
@@ -248,7 +257,6 @@ fn bake_level(
 
     bytes += pad_to_256(&mut writer, bytes)?;
 
-    // Vertex data
     for v in &terrain_verts
     {
       writer.write_all(bytemuck::bytes_of(v))?;
@@ -257,7 +265,6 @@ fn bake_level(
 
     bytes += pad_to_256(&mut writer, bytes)?;
 
-    // Face index data
     for face in &faces
     {
       for &idx in face.iter()
@@ -269,8 +276,7 @@ fn bake_level(
 
     pad_to_256(&mut writer, bytes)?;
     writer.flush()?;
-
-    println!("[DONE] Wrote terrain_l{}.bin ({} bytes)", level, bytes);
+    progress::done(&format!("Wrote terrain_l{}.bin ({} bytes)", level, bytes));
   }
 
   // ── Write hex_lN.bin ──────────────────────────────────────────
@@ -297,8 +303,7 @@ fn bake_level(
 
     pad_to_256(&mut writer, bytes)?;
     writer.flush()?;
-
-    println!("[DONE] Wrote hex_l{}.bin ({} bytes)", level, bytes);
+    progress::done(&format!("Wrote hex_l{}.bin ({} bytes)", level, bytes));
   }
 
   Ok(())

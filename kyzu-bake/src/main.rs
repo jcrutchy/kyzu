@@ -1,6 +1,7 @@
 mod bake;
 mod heightmap;
 mod icosahedron;
+mod progress;
 
 use std::path::Path;
 
@@ -8,7 +9,7 @@ use kyzu_core::{WorldConfig, WorldPreset};
 
 fn main()
 {
-  println!("[INFO] kyzu-bake starting");
+  progress::info("kyzu-bake starting");
 
   let config = WorldConfig {
     name: "Test World".to_string(),
@@ -25,7 +26,7 @@ fn main()
 
   if let Err(e) = bake::bake(&config, output_dir)
   {
-    eprintln!("[ERROR] Bake failed: {}", e);
+    progress::error(&format!("Bake failed: {}", e));
     std::process::exit(1);
   }
 
