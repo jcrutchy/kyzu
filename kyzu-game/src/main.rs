@@ -1,5 +1,7 @@
 mod app;
 mod input;
+mod loading;
+mod loading_screen;
 mod renderer;
 
 fn main()

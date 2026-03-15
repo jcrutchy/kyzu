@@ -18,7 +18,7 @@ fn main()
     grid_resolution_km: 150.0,
     planet_radius_km: 6371.0,
     subdivision_level: 8,
-    baked_lod_levels: vec![4, 6, 8],
+    baked_lod_levels: vec![4, 6, 8, 10], // add level 10
     bake_version: 1,
   };
 

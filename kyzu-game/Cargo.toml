@@ -16,6 +16,8 @@ egui-wgpu  = "0.33.3"
 egui-winit = "0.33.3"
 image      = "0.25"
 anyhow     = "1"
+memmap2 = "0.9"
+kyzu-core = { path = "../kyzu-core" }
 
 [[bin]]
 name = "kyzu-game"

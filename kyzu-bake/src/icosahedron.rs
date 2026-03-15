@@ -92,10 +92,10 @@ pub fn subdivide(vertices: &mut Vec<DVec3>, faces: &[[usize; 3]]) -> Vec<[usize;
     let bc = get_midpoint(b, c, vertices);
     let ca = get_midpoint(c, a, vertices);
 
-    new_faces.push([a, ab, ca]);
-    new_faces.push([b, bc, ab]);
-    new_faces.push([c, ca, bc]);
-    new_faces.push([ab, bc, ca]);
+    new_faces.push([a, ca, ab]); // was [a, ab, ca]
+    new_faces.push([b, ab, bc]); // was [b, bc, ab]
+    new_faces.push([c, bc, ca]); // was [c, ca, bc]
+    new_faces.push([ab, ca, bc]); // was [ab, bc, ca]
   }
 
   new_faces

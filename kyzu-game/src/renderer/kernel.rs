@@ -17,7 +17,7 @@ pub struct Kernel
   pub device: Arc<Device>,
   pub queue: Queue,
   pub config: SurfaceConfiguration,
-  pub adapter_info: AdapterInfo,
+  pub _adapter_info: AdapterInfo,
   pub depth: DepthResources,
   pub shared: SharedState,
   pub modules: Vec<Box<dyn RenderModule>>,
@@ -55,7 +55,7 @@ impl Kernel
     let (device, queue) = adapter
       .request_device(&DeviceDescriptor {
         label: Some("Solar Device"),
-        required_features: Features::empty(),
+        required_features: Features::POLYGON_MODE_LINE,
         required_limits: Limits::default(),
         memory_hints: MemoryHints::Performance,
         ..Default::default()
@@ -87,7 +87,7 @@ impl Kernel
       queue,
       surface,
       config,
-      adapter_info,
+      _adapter_info: adapter_info,
       depth,
       shared,
       modules: Vec::new(),

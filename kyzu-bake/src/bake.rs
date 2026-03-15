@@ -214,7 +214,7 @@ fn bake_level(
     let elevation = sampler.sample(unit_pos);
     let world_pos = unit_pos * planet_r;
     terrain_verts.push(TerrainVertex {
-      position: [world_pos.x as f32, world_pos.y as f32, world_pos.z as f32],
+      position: [unit_pos.x as f32, unit_pos.y as f32, unit_pos.z as f32], // unit sphere!
       hex_id: hex_ids[i],
       elevation: encode_elevation(elevation),
       biome_id: elevation_to_biome(elevation),

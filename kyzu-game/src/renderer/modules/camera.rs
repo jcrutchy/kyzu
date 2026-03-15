@@ -15,7 +15,7 @@ const ELEVATION_MIN: f64 = 0.01;
 const ELEVATION_MAX: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
 
 const ORBIT_SENSITIVITY: f64 = 0.005;
-const PAN_SENSITIVITY: f64 = 0.001;
+const _PAN_SENSITIVITY: f64 = 0.001;
 const ZOOM_SENSITIVITY: f64 = 0.1;
 
 // Sun position — fixed for now, ~1 AU along +X axis (metres)
