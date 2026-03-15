@@ -1,5 +1,5 @@
 [package]
-name    = "solar-native"
+name    = "kyzu-game"
 version = "0.1.0"
 edition = "2021"
 
@@ -18,5 +18,5 @@ image      = "0.25"
 anyhow     = "1"
 
 [[bin]]
-name = "solar-native"
+name = "kyzu-game"
 path = "src/main.rs"

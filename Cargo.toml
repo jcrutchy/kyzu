@@ -1,7 +1,4 @@
 [workspace]
-members = [
-    "kyzu-core",
-    "kyzu-native",
-    "solar-native"]
+members = ["kyzu-bake","kyzu-core","kyzu-game"]
 
 resolver = "2"
