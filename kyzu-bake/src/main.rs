@@ -1,54 +1,93 @@
-mod bake;
-mod heightmap;
-mod icosahedron;
-mod progress;
-
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 
-use kyzu_core::{WorldConfig, WorldPreset};
+use bytemuck::cast_slice;
+use glam::Vec3;
+use kyzu_core::{KyzuHeader, TerrainVertex, ICOSA_INDICES, ICOSA_VERTICES};
+use noise::{Fbm, NoiseFn, Perlin}; // New imports
 
-fn main()
+fn main() -> anyhow::Result<()>
 {
-  progress::info("kyzu-bake starting");
+  let world_dir = "C:\\dev\\kyzu_data\\worlds";
+  let file_path = "C:\\dev\\kyzu_data\\worlds\\terrain.bin";
+  let subdivision_level = 4; // Bumped to 4 for better noise resolution
 
-  let config = WorldConfig {
-    name: "Test World".to_string(),
-    seed: 12345,
-    preset: WorldPreset::Continents,
-    grid_resolution_km: 150.0,
-    planet_radius_km: 6371.0,
-    subdivision_level: 8,
-    baked_lod_levels: vec![4, 6, 8, 10], // add level 10
-    bake_version: 1,
-  };
-
-  let output_dir = Path::new(r"C:\dev\kyzu_data\worlds\test_continents");
-
-  if let Err(e) = bake::bake(&config, output_dir)
+  if !Path::new(world_dir).exists()
   {
-    progress::error(&format!("Bake failed: {}", e));
-    std::process::exit(1);
+    fs::create_dir_all(world_dir)?;
   }
 
-  let world_dir = Path::new(r"C:\dev\kyzu_data\worlds\test_continents");
-  verify_bin(&world_dir.join("terrain_l4.bin"));
-  verify_bin(&world_dir.join("terrain_l6.bin"));
-  verify_bin(&world_dir.join("terrain_l8.bin"));
-}
+  // 1. Initial icosahedron
+  let mut triangles: Vec<[Vec3; 3]> = ICOSA_INDICES
+    .iter()
+    .map(|&idx| {
+      [
+        ICOSA_VERTICES[idx[0] as usize],
+        ICOSA_VERTICES[idx[1] as usize],
+        ICOSA_VERTICES[idx[2] as usize],
+      ]
+    })
+    .collect();
 
-fn verify_bin(path: &Path)
-{
-  let bytes = std::fs::read(path).unwrap();
-  let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-  let level = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-  let verts = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-  let faces = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+  // 2. Subdivide
+  for _ in 0..subdivision_level
+  {
+    let mut next_gen = Vec::new();
+    for tri in triangles
+    {
+      let ab = (tri[0] + tri[1]).normalize();
+      let bc = (tri[1] + tri[2]).normalize();
+      let ca = (tri[2] + tri[0]).normalize();
+
+      next_gen.push([tri[0], ab, ca]);
+      next_gen.push([tri[1], bc, ab]);
+      next_gen.push([tri[2], ca, bc]);
+      next_gen.push([ab, bc, ca]);
+    }
+    triangles = next_gen;
+  }
+
+  // 3. Apply Noise Displacement
+  let fbm = Fbm::<Perlin>::new(42); // Seed 42
+  let mut vertices = Vec::new();
+  let bary_coords = [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+
+  for tri in triangles
+  {
+    for i in 0..3
+    {
+      let pos = tri[i];
+
+      // Sample noise using the 3D position
+      // fbm.get inputs are [f64; 3]
+      let val = fbm.get([pos.x as f64, pos.y as f64, pos.z as f64]) as f32;
+
+      // Displace the vertex.
+      // We keep a base radius of 1.0 and add a 15% max displacement for mountains.
+      let displacement = 1.0 + (val * 0.15);
+      let final_pos = pos * displacement;
+
+      vertices.push(TerrainVertex { pos: final_pos.to_array(), hex_id: 0, bary: bary_coords[i] });
+    }
+  }
+
+  let header = KyzuHeader {
+    magic: *b"KYZU",
+    version: 1,
+    subdivision_level: subdivision_level as u32,
+    vertex_count: vertices.len() as u32,
+    padding: [0; 1008],
+  };
+
+  let mut file = fs::File::create(file_path)?;
+  file.write_all(cast_slice(&[header]))?;
+  file.write_all(cast_slice(&vertices))?;
+
   println!(
-    "[INFO] {:?} magic={:#010x} level={} verts={} faces={}",
-    path.file_name().unwrap(),
-    magic,
-    level,
-    verts,
-    faces
+    "Baked Level {} world with {} vertices and Noise displacement.",
+    subdivision_level,
+    vertices.len()
   );
+  Ok(())
 }
