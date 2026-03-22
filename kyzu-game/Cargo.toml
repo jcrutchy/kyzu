@@ -1,24 +1,20 @@
 [package]
-name = "kyzu-game"
+name = "kyzu"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Foundations
 winit = "0.30"
-wgpu = "27.0"
-glam = { version = "0.29", features = ["bytemuck", "std"] }
-bytemuck = { version = "1.20", features = ["derive"] }
+wgpu = "29.0"
+glam = "0.32"
+bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
-log = "0.4"
-env_logger = "0.11"
-egui = "0.33.3"
-egui-wgpu = "0.33.3"
-egui-winit = "0.33.3"
-image = "0.25"
-anyhow = "1"
-memmap2 = "0.9"
-kyzu-core = { path = "../kyzu-core" }
 
-[[bin]]
-name = "kyzu-game"
-path = "src/main.rs"
+# Data & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9" # For point 5: Memory-mapped chunks
+
+# Error Handling (Optional but helpful)
+thiserror = "2.0" # Better for "Unit" style explicit errors than anyhow

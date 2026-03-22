@@ -1,0 +1,173 @@
+i've committed the previous code and pushed to github. then i deleted the rs files to start again... seems to me a habit with me on this project haha
+
+i wanna do baby steps, keep rs files very small/modular from the get go, keeping functions small (calling other small functions where possible). implement the bake and game engines with extensibility and flexibility in mind from the get go
+
+also, i'm not sure if possible in rust, but in php i can use namespaces and call functions like \namespace\some_funtion(), or in delphi i can call unit.some_function(). its useful to figure out where a function is defined (especially later when i build up hundreds of functions).
+
+allman braces, 2 sp indents, snake_case naming, no ternaries, no closures, delphi-like as much as possible
+
+i think i like the idea of just one crate. baking a world should be something that can be done from within the game menu, even though its not something done during a game
+
+i'm trying to think about the baby steps i wanna take that will help to reduce the likelihood of needing to start again in a week...
+
+i think at the end of the day i'd like to be able to progress without having to rewrite large chunks of code, which is why i'm preferring small bite-size files of modular code
+
+the idea is that i just keep adding features gradually, but this probably means that to begin with the baby steps will need to be pretty abstract framework style modules
+
+i'm wondering if relying on foundational dependencies like glam are probably worthwhile. i'm not a fan of dependencies, but i appreciate there needs to be a limit. i guess where i draw the line is at things that either interest me specifically (like websockets - not something for kyzu, yet anyway haha) or aspects that are unrelated to the aim of the project (the ability to compute a vector cross-product will never change regardless of what i decide to do with kyzu). i'm not very familiar with the rust library so i'll need some help determining what dependencies i should rely on
+
+i'd like to also use the latest versions of dependencies like wgpu, unless there is a clear reason for avoiding the latest, which would need to be evaluated
+
+i think i'm happy to use glam. i'm not averse to math, but it can be a drag. i think i'm happy to leave math to the serious math nerds
+
+the other dependency that i think i'm happy to rely on is a json library. i'm not sure what other serialization i'll need so maybe serde is overkill, but i definitely want to use json for defining configurations
+
+not sure about logging and error output. i generally like to have fine control over how errors, warnings, info etc are displayed and logged
+
+before we code i want to flesh out a plan for the file structure
+
+i'd like to develop a WBS that covers the project, so that i can plan and think about the baby steps in the larger context and make sure i fully understand the scope of what i'm trying to achieve. after i gain this understanding, the coding itself will just be following these steps like a recipe
+
+1. core/math (using glam)
+2. separation of data & logic
+3. logging & error/warn/info output messages (both in file and in app)
+4. all config read in from a json file under C:\dev\kyzu_data\
+5. chunk-based world bake, with as many rendered features to be memory mapped as possible
+6. dual-mode camera system, with free camera (targeted at self) for deep space mode and google earth style camera for world body mode (still need to be able to view around south/north poles though, which is where google earth style might fall a bit short), and transition configurable to either height-based unlock or key-press
+7. rendering of bodies at various LODs, with a baked texture map image for way way out, transitioning to a hex gridded (both hexes and triangle mesh memory mapped), with sub-grids (LODs) fading in
+8. rendering of orbits and body spinning axis lines (out of north/south poles)
+9. rendering of hex height variation
+10. rendering of terrain features (trees, waves on beaches, rain, rivers, etc)
+11. unit/buildings/paths, including pathfinding
+12. awesomesauce AI stuff
+13. who knows... :-)
+
+some ideas from gemini:
+- Instead of having the engines call each other directly, use a "Registry"
+- world 'chunk' format idea allowing the world to be expanded at any time (even mid-game)
+- Instead of importing everything at the top, to make clearer in code where functions are actually defined, call directly using something like crate::bake::processing::initialize_buffer();
+
+~~
+
+C:\dev\kyzu\
+├── Cargo.toml
+└── src\
+    ├── main.rs              ← Absolute entry point (bootstraps App)
+    ├── app.rs               ← Top-level App State & Event Loop logic
+    │
+    ├── core\                ← 1.0 Foundation (The "Kernel")
+    │   ├── mod.rs           
+    │   ├── math.rs          ← glam aliases, f64/f32 coordinate logic
+    │   ├── config.rs        ← JSON loader from C:\dev\kyzu_data\
+    │   ├── log.rs           ← Your custom Logger (File + Ring Buffer)
+    │   ├── error.rs         ← KyzuError Enum
+    │   └── types.rs         ← Shared enums, IDs, and unit definitions
+    │
+    ├── bake\                ← 5.0 The Generator (Disk Output)
+    │   ├── mod.rs           
+    │   ├── pipeline.rs      ← The main bake() orchestration
+    │   ├── icosahedron.rs   ← Sphere subdivision logic
+    │   ├── heightmap.rs     ← Noise sampling
+    │   ├── biome.rs         ← Climate/Feature assignment
+    │   └── chunk_writer.rs  ← Binary output for memory-mapping
+    │
+    ├── world\               ← 2.0 World Data (The "Model")
+    │   ├── mod.rs           
+    │   ├── body.rs          ← Celestial body descriptors (Planet/Moon)
+    │   ├── chunk_reader.rs  ← mmap interfaces for reading bake data
+    │   └── hex.rs           ← Hexagonal grid math & logic
+    │
+    ├── render\              ← 7.0 - 10.0 The Passive Pipeline
+    │   ├── mod.rs           
+    │   ├── kernel.rs        ← wgpu context, Device, Queue, Swapchain
+    │   ├── frame.rs         ← Clear passes and render-target management
+    │   ├── depth.rs         ← Depth buffer setup
+    │   ├── camera\          ← 6.0 Dual-mode Camera
+    │   │   ├── mod.rs
+    │   │   ├── space.rs     ← Free-moving orbital camera
+    │   │   ├── surface.rs   ← Google Earth / Pole-safe camera
+    │   │   └── transition.rs← Mode-switching logic
+    │   └── modules\         ← Individual render features (LODs)
+    │       ├── mod.rs       
+    │       ├── shared.rs    ← GPU-side shared uniforms (Time, Camera)
+    │       ├── terrain.rs   ← Hex/Triangle terrain renderer
+    │       ├── orbit.rs     ← Orbital lines & Axis poles
+    │       └── atmosphere.rs← Atmospheric/Weather overlays
+    │
+    ├── input\               ← Interaction Logic
+    │   ├── mod.rs           
+    │   ├── state.rs         ← Raw keyboard/mouse bitmasks
+    │   └── binding.rs       ← Mapping raw input to "Actions"
+    │
+    └── ui\                  ← 3.0 The Interface
+        ├── mod.rs           
+        ├── menu.rs          ← Main menu & Bake trigger
+        ├── overlay.rs       ← In-game HUD
+        └── log_panel.rs     ← The in-app ring buffer display
+
+
+
+WBS — full project scope
+Here's your WBS structured as phases that map to your numbered list, broken into concrete work items:
+Phase 0 — Foundation (do this first, it's your recipe card)
+
+0.1 Crate scaffold: main.rs, app.rs, module tree stubs
+0.2 Config system: AppConfig + WorldConfig loaded from JSON
+0.3 Logging system: file + in-memory ring buffer, severity levels
+0.4 Error type: KyzuError, anyhow integration
+0.5 wgpu kernel: device, queue, surface, depth, frame loop
+0.6 Input accumulation: raw mouse/keyboard state
+0.7: The Coordinate Strategy (Defining how we handle the scale from "Deep Space" to "Tiny Hex").
+
+Phase 1 — Bake pipeline
+
+1.1 Icosahedron subdivision
+1.2 Height sampling (noise presets)
+1.3 Biome assignment
+1.4 Chunk format spec + writer
+1.5 Progress reporting protocol
+1.6 Bake triggered from in-game menu
+
+Phase 2 — Camera system
+
+2.1 Space camera (free, self-targeted)
+2.2 Surface camera (spherical, pole-safe)
+2.3 Camera transition logic (height unlock or keypress)
+2.4 Zoom curve tuning
+
+Phase 3 — Body rendering
+
+3.1 Sphere mesh + UV + texture
+3.2 Baked texture LOD (far out)
+3.3 Triangle mesh LOD (close in, mmap)
+3.4 LOD transitions + fade
+3.5 Starfield (HYG catalogue)
+3.6 Orbit lines + axis poles
+
+Phase 4 — Hex grid overlay
+
+4.1 Hex geometry on sphere surface
+4.2 Sub-grid LODs fading in
+4.3 Hex height extrusion
+4.4 Elevation band visual scaling (your open design problem)
+
+Phase 5 — Terrain features
+
+5.1 Terrain shader (biome coloring)
+5.2 Tree/vegetation rendering
+5.3 Water/beach/wave effects
+5.4 Rivers
+5.5 Rain/weather overlay
+
+Phase 6 — Game logic
+
+6.1 Unit definitions + placement
+6.2 Building types
+6.3 Pathfinding (A* on hex graph)
+6.4 Turn/action system
+
+Phase 7 — AI + Victory
+
+7.1 AI decision loop
+7.2 Space race victory → second act unlock
+7.3 Moon/Mars colonisation phase
