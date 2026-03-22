@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -14,7 +16,7 @@ pub struct App
   pub logger: log::Logger,
   pub input: InputState,
   pub renderer: Option<Renderer>,
-  pub window: Option<Window>,
+  pub window: Option<Arc<Window>>,
 }
 
 impl ApplicationHandler for App
@@ -27,15 +29,17 @@ impl ApplicationHandler for App
         winit::dpi::LogicalSize::new(self.config.app.window_width, self.config.app.window_height),
       );
 
-      let window = event_loop.create_window(window_attributes).expect("Failed to create window");
+      // Wrap window in Arc for shared ownership
+      let window =
+        Arc::new(event_loop.create_window(window_attributes).expect("Failed to create window"));
 
-      // Initialize Renderer (WGPU handshake)
-      let renderer = pollster::block_on(Renderer::new(&window)).expect("Failed to init GPU");
+      // Renderer gets its own clone of the Arc
+      let renderer = pollster::block_on(Renderer::new(window.clone())).expect("Failed to init GPU");
 
       self.renderer = Some(renderer);
       self.window = Some(window);
 
-      self.logger.emit(log::LogLevel::Info, "Window and Renderer initialized.");
+      self.logger.emit(log::LogLevel::Info, "Window and Renderer initialized safely with Arc.");
     }
   }
 
@@ -53,7 +57,7 @@ impl ApplicationHandler for App
       {
         if let Some(r) = &mut self.renderer
         {
-          r.resize(new_size);
+          r.resize(Some(new_size));
         }
       }
 
@@ -63,8 +67,9 @@ impl ApplicationHandler for App
         {
           if let Err(e) = renderer.render()
           {
+            // Passing None uses internal window size query, avoiding borrow issues
             eprintln!("Render error: {}", e);
-            renderer.resize(renderer.size);
+            renderer.resize(None);
           }
         }
       }

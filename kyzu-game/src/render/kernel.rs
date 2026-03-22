@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
@@ -7,23 +9,22 @@ pub struct Renderer
   pub queue: wgpu::Queue,
   pub config: wgpu::SurfaceConfiguration,
   pub size: PhysicalSize<u32>,
+  pub window: Arc<Window>, // Renderer now keeps its own reference to the window
   pub surface: wgpu::Surface<'static>,
 }
 
 impl Renderer
 {
-  pub async fn new(window: &Window) -> Result<Self, crate::core::error::KyzuError>
+  pub async fn new(window: Arc<Window>) -> Result<Self, crate::core::error::KyzuError>
   {
     let size = window.inner_size();
     let instance = wgpu::Instance::default();
 
-    let surface = unsafe {
-      let s = instance
-        .create_surface(window)
-        .map_err(|e| crate::core::error::KyzuError::Gpu(e.to_string()))?;
-      std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(s)
-    };
+    let surface = instance
+      .create_surface(window.clone())
+      .map_err(|e| crate::core::error::KyzuError::Gpu(e.to_string()))?;
 
+    // FIX: Using map_err because request_adapter is returning a Result
     let adapter = instance
       .request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -33,7 +34,6 @@ impl Renderer
       .await
       .map_err(|_| crate::core::error::KyzuError::Gpu("No suitable GPU found".into()))?;
 
-    // FIX: request_device in v29 only takes the descriptor (trace is already inside it)
     let (device, queue) = adapter
       .request_device(&wgpu::DeviceDescriptor {
         label: Some("Kyzu Primary Device"),
@@ -62,23 +62,25 @@ impl Renderer
 
     surface.configure(&device, &config);
 
-    Ok(Self { device, queue, config, size, surface })
+    Ok(Self { device, queue, config, size, surface, window })
   }
 
-  pub fn resize(&mut self, new_size: PhysicalSize<u32>)
+  /// Resizes the surface. If new_size is None, it queries the window for its current size.
+  pub fn resize(&mut self, new_size: Option<PhysicalSize<u32>>)
   {
-    if new_size.width > 0 && new_size.height > 0
+    let size = new_size.unwrap_or(self.window.inner_size());
+
+    if size.width > 0 && size.height > 0
     {
-      self.size = new_size;
-      self.config.width = new_size.width;
-      self.config.height = new_size.height;
+      self.size = size;
+      self.config.width = size.width;
+      self.config.height = size.height;
       self.surface.configure(&self.device, &self.config);
     }
   }
 
   pub fn render(&mut self) -> Result<(), String>
   {
-    // FIX: Handling the CurrentSurfaceTexture enum correctly for v29
     let surface_texture = self.surface.get_current_texture();
 
     let output = match surface_texture
