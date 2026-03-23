@@ -1,30 +1,32 @@
 use std::sync::Arc;
 
-use winit::dpi::PhysicalSize;
 use winit::window::Window;
+
+use crate::render::camera::CameraSystem;
+use crate::render::module::{FrameTargets, RenderModule};
+use crate::render::shared::SharedState;
 
 pub struct Renderer
 {
+  pub instance: wgpu::Instance,
+  pub adapter: wgpu::Adapter,
   pub device: wgpu::Device,
   pub queue: wgpu::Queue,
   pub config: wgpu::SurfaceConfiguration,
-  pub size: PhysicalSize<u32>,
-  pub window: Arc<Window>, // Renderer now keeps its own reference to the window
+  pub shared: SharedState,
+  pub modules: Vec<Box<dyn RenderModule>>,
+  pub camera_system: CameraSystem,
   pub surface: wgpu::Surface<'static>,
 }
 
 impl Renderer
 {
-  pub async fn new(window: Arc<Window>) -> Result<Self, crate::core::error::KyzuError>
+  pub async fn new(window: Arc<Window>) -> anyhow::Result<Self>
   {
     let size = window.inner_size();
     let instance = wgpu::Instance::default();
+    let surface = instance.create_surface(window.clone())?;
 
-    let surface = instance
-      .create_surface(window.clone())
-      .map_err(|e| crate::core::error::KyzuError::Gpu(e.to_string()))?;
-
-    // FIX: Using map_err because request_adapter is returning a Result
     let adapter = instance
       .request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -32,89 +34,117 @@ impl Renderer
         force_fallback_adapter: false,
       })
       .await
-      .map_err(|_| crate::core::error::KyzuError::Gpu("No suitable GPU found".into()))?;
+      .map_err(|e| anyhow::anyhow!("No suitable GPU adapter found: {:?}", e))?;
 
     let (device, queue) = adapter
       .request_device(&wgpu::DeviceDescriptor {
-        label: Some("Kyzu Primary Device"),
+        label: Some("Kyzu Device"),
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
-        memory_hints: wgpu::MemoryHints::default(),
-        experimental_features: wgpu::ExperimentalFeatures::default(),
+        experimental_features: Default::default(),
         trace: wgpu::Trace::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
       })
-      .await
-      .map_err(|e| crate::core::error::KyzuError::Gpu(e.to_string()))?;
+      .await?;
 
-    let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats[0];
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0];
 
     let config = wgpu::SurfaceConfiguration {
       usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-      format,
+      format: swapchain_format,
       width: size.width,
       height: size.height,
       present_mode: wgpu::PresentMode::Fifo,
-      alpha_mode: caps.alpha_modes[0],
+      alpha_mode: swapchain_capabilities.alpha_modes[0],
       view_formats: vec![],
       desired_maximum_frame_latency: 2,
     };
 
     surface.configure(&device, &config);
 
-    Ok(Self { device, queue, config, size, surface, window })
+    let shared = SharedState::new(&device, config.width, config.height);
+
+    let camera_system = crate::render::camera::CameraSystem::new();
+
+    Ok(Self {
+      instance,
+      surface,
+      adapter,
+      device,
+      queue,
+      config,
+      shared,
+      modules: Vec::new(),
+      camera_system,
+    })
   }
 
-  /// Resizes the surface. If new_size is None, it queries the window for its current size.
-  pub fn resize(&mut self, new_size: Option<PhysicalSize<u32>>)
+  pub fn update(&mut self, input: &crate::input::state::InputState, dt: f32) -> anyhow::Result<()>
   {
-    let size = new_size.unwrap_or(self.window.inner_size());
+    self.camera_system.update(&mut self.shared, input, dt);
+    self.shared.camera_gpu.upload(&self.queue, &self.shared.camera);
 
-    if size.width > 0 && size.height > 0
+    for module in &mut self.modules
     {
-      self.size = size;
-      self.config.width = size.width;
-      self.config.height = size.height;
-      self.surface.configure(&self.device, &self.config);
+      module.update(&self.queue, &self.shared);
+    }
+
+    Ok(())
+  }
+
+  pub fn add_module(&mut self, module: impl RenderModule + 'static)
+  {
+    self.modules.push(Box::new(module));
+  }
+
+  pub fn resize(&mut self, new_size: Option<winit::dpi::PhysicalSize<u32>>)
+  {
+    if let Some(size) = new_size
+    {
+      if size.width > 0 && size.height > 0
+      {
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(&self.device, &self.config);
+        // Update shared depth texture etc here
+      }
     }
   }
 
-  pub fn render(&mut self) -> Result<(), String>
+  pub fn render(&mut self) -> anyhow::Result<()>
   {
-    let surface_texture = self.surface.get_current_texture();
-
-    let output = match surface_texture
+    let frame = match self.surface.get_current_texture()
     {
-      wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-      _ => return Err("Surface texture acquisition failed or outdated".into()),
+      Ok(frame) => frame,
+      Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) =>
+      {
+        self.resize(None);
+        return Ok(());
+      }
+      Err(wgpu::SurfaceError::Timeout) => return Err(anyhow::anyhow!("Surface timeout")),
+      Err(e) => return Err(anyhow::anyhow!("Surface error: {:?}", e)),
     };
 
-    let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-      label: Some("Primary Render Encoder"),
-    });
+    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = self
+      .device
+      .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
 
+    for module in &mut self.modules
     {
-      let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Main Clear Pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-          view: &view,
-          resolve_target: None,
-          ops: wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.02, b: 0.05, a: 1.0 }),
-            store: wgpu::StoreOp::Store,
-          },
-          depth_slice: None,
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-      });
+      module.update(&self.queue, &self.shared);
+    }
+
+    let targets = FrameTargets { surface_view: &view, depth_view: &self.shared.depth_view };
+
+    for module in &self.modules
+    {
+      module.encode(&mut encoder, &targets, &self.shared);
     }
 
     self.queue.submit(std::iter::once(encoder.finish()));
-    output.present();
+    frame.present();
 
     Ok(())
   }

@@ -1,13 +1,16 @@
-use winit::event::{ElementState, KeyEvent};
+use std::collections::HashSet;
+
+use glam::Vec2;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 pub struct InputState
 {
-  pub keys_down: [bool; 256], // Simple fixed-size array for KeyCodes
-  pub mouse_pos: crate::core::math::RenderVec2,
-  pub mouse_delta: crate::core::math::RenderVec2,
-  pub left_clicked: bool,
-  pub right_clicked: bool,
+  // We use a HashSet for keys so we don't have to worry about array bounds
+  pub keys_down: HashSet<KeyCode>,
+  pub mouse_pos: Vec2,
+  pub mouse_delta: Vec2,
+  pub mouse_buttons_down: HashSet<MouseButton>,
   pub scroll_delta: f32,
 }
 
@@ -16,41 +19,69 @@ impl InputState
   pub fn new() -> Self
   {
     Self {
-      keys_down: [false; 256],
-      mouse_pos: glam::vec2(0.0, 0.0),
-      mouse_delta: glam::vec2(0.0, 0.0),
-      left_clicked: false,
-      right_clicked: false,
+      keys_down: HashSet::new(),
+      mouse_pos: Vec2::ZERO,
+      mouse_delta: Vec2::ZERO,
+      mouse_buttons_down: HashSet::new(),
       scroll_delta: 0.0,
     }
   }
 
-  pub fn update_key(&mut self, event: &KeyEvent)
+  /// The core Phase 1.4 logic: Update state from winit events
+  pub fn process_event(&mut self, event: &WindowEvent)
   {
-    if let PhysicalKey::Code(code) = event.physical_key
+    match event
     {
-      let index = code as usize;
-      if index < 256
+      WindowEvent::KeyboardInput { event: key_event, .. } =>
       {
-        self.keys_down[index] = event.state == ElementState::Pressed;
+        if let PhysicalKey::Code(code) = key_event.physical_key
+        {
+          if key_event.state == ElementState::Pressed
+          {
+            self.keys_down.insert(code);
+          }
+          else
+          {
+            self.keys_down.remove(&code);
+          }
+        }
       }
+      WindowEvent::CursorMoved { position, .. } =>
+      {
+        let new_pos = Vec2::new(position.x as f32, position.y as f32);
+        self.mouse_delta = new_pos - self.mouse_pos;
+        self.mouse_pos = new_pos;
+      }
+      WindowEvent::MouseInput { state, button, .. } =>
+      {
+        if *state == ElementState::Pressed
+        {
+          self.mouse_buttons_down.insert(*button);
+        }
+        else
+        {
+          self.mouse_buttons_down.remove(button);
+        }
+      }
+      WindowEvent::MouseWheel { delta, .. } => match delta
+      {
+        MouseScrollDelta::LineDelta(_, y) => self.scroll_delta += y,
+        MouseScrollDelta::PixelDelta(pos) => self.scroll_delta += pos.y as f32 * 0.1,
+      },
+      _ =>
+      {}
     }
+  }
+
+  /// PILFERED IDEA: Reset relative values at the end of the frame
+  pub fn tick(&mut self)
+  {
+    self.mouse_delta = Vec2::ZERO;
+    self.scroll_delta = 0.0;
   }
 
   pub fn is_key_down(&self, code: KeyCode) -> bool
   {
-    let index = code as usize;
-    if index < 256
-    {
-      return self.keys_down[index];
-    }
-    false
-  }
-
-  // Called at the end of every frame to reset relative movements
-  pub fn tick(&mut self)
-  {
-    self.mouse_delta = glam::vec2(0.0, 0.0);
-    self.scroll_delta = 0.0;
+    self.keys_down.contains(&code)
   }
 }

@@ -1,15 +1,33 @@
-pub mod app;
-pub mod core;
-pub mod input;
-pub mod render;
+use kyzu::app::App;
+use kyzu::bake::BakeManager;
+use kyzu::core::config;
+use kyzu::core::log::Logger;
+use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main()
 {
-  // We call the app's run function directly.
-  // Any critical startup errors are caught here.
-  if let Err(e) = crate::app::run()
+  let config = match config::load()
   {
-    eprintln!("[FATAL] Application failed to start: {}", e);
-    std::process::exit(1);
+    Ok(c) => c,
+    Err(e) =>
+    {
+      eprintln!("[FATAL] Configuration Error: {}", e);
+      std::process::exit(1);
+    }
+  };
+
+  let logger = Logger::new(&config.app.log_filename);
+
+  let mut app = App::new(config, logger);
+
+  let mut bake_manager = BakeManager::new();
+  bake_manager.start_bake();
+
+  let event_loop = EventLoop::new().expect("Failed to create event loop");
+  event_loop.set_control_flow(ControlFlow::Poll);
+
+  if let Err(e) = event_loop.run_app(&mut app)
+  {
+    eprintln!("Application error: {}", e);
   }
 }

@@ -4,17 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Foundations
-winit = "0.30"
-wgpu = "29.0"
 glam = "0.32"
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
-
-# Data & Config
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-memmap2 = "0.9" # For point 5: Memory-mapped chunks
-
-# Error Handling (Optional but helpful)
-thiserror = "2.0" # Better for "Unit" style explicit errors than anyhow
+memmap2 = "0.9"
+thiserror = "2.0"
+wgpu = "=27.0.1"
+winit = "0.30"
+egui = { version = "0.33", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.33", default-features = false, features = ["clipboard"] }
+egui-wgpu = { version = "0.33", default-features = false }
+anyhow = "1.0.102"

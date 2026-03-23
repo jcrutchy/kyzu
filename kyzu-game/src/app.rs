@@ -1,22 +1,40 @@
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-use crate::core::config;
-use crate::core::log;
+use crate::core::config::KyzuConfig;
+use crate::core::log::{LogLevel, Logger};
+use crate::core::time::TimeState;
 use crate::input::state::InputState;
 use crate::render::kernel::Renderer;
+use crate::render::modules::solid::SolidModule;
 
 pub struct App
 {
-  pub config: config::KyzuConfig,
-  pub logger: log::Logger,
+  pub config: KyzuConfig,
+  pub logger: Logger,
   pub input: InputState,
-  pub renderer: Option<Renderer>,
+  pub time: TimeState,
   pub window: Option<Arc<Window>>,
+  pub renderer: Option<Renderer>,
+}
+
+impl App
+{
+  pub fn new(config: KyzuConfig, logger: Logger) -> Self
+  {
+    Self {
+      config,
+      logger,
+      input: InputState::new(),
+      time: TimeState::new(),
+      window: None,
+      renderer: None,
+    }
+  }
 }
 
 impl ApplicationHandler for App
@@ -29,68 +47,109 @@ impl ApplicationHandler for App
         winit::dpi::LogicalSize::new(self.config.app.window_width, self.config.app.window_height),
       );
 
-      // Wrap window in Arc for shared ownership
       let window =
         Arc::new(event_loop.create_window(window_attributes).expect("Failed to create window"));
 
-      // Renderer gets its own clone of the Arc
-      let renderer = pollster::block_on(Renderer::new(window.clone())).expect("Failed to init GPU");
+      let mut renderer = pollster::block_on(Renderer::new(window.clone()))
+        .expect("Failed to initialize GPU Renderer");
+
+      let solid_mod = SolidModule::new(&renderer.device, &renderer.shared);
+      renderer.add_module(solid_mod);
+
+      renderer.camera_system.update(&mut renderer.shared, &self.input, 0.016); // 16ms default for init
+      renderer.shared.camera_gpu.upload(&renderer.queue, &renderer.shared.camera);
 
       self.renderer = Some(renderer);
       self.window = Some(window);
 
-      self.logger.emit(log::LogLevel::Info, "Window and Renderer initialized safely with Arc.");
+      self.logger.emit(LogLevel::Info, "Kyzu Engine Initialized (Modular Architecture)");
     }
   }
 
   fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent)
   {
+    self.input.process_event(&event);
+
     match event
     {
       WindowEvent::CloseRequested =>
       {
-        self.logger.emit(log::LogLevel::Info, "Exit requested.");
+        self.logger.emit(LogLevel::Info, "Exit requested.");
+        self.renderer = None;
         event_loop.exit();
       }
 
-      WindowEvent::Resized(new_size) =>
+      WindowEvent::KeyboardInput {
+        event: KeyEvent { logical_key: key, state: ElementState::Pressed, .. },
+        ..
+      } =>
       {
-        if let Some(r) = &mut self.renderer
+        use winit::keyboard::{Key, NamedKey};
+
+        match key
         {
-          r.resize(Some(new_size));
+          // Handle Escape (Exit)
+          Key::Named(NamedKey::Escape) =>
+          {
+            self.logger.emit(LogLevel::Info, "Exit requested via Escape.");
+            self.renderer = None;
+            event_loop.exit();
+          }
+
+          // Handle Tab (Camera Toggle)
+          Key::Named(NamedKey::Tab) =>
+          {
+            if let Some(renderer) = &mut self.renderer
+            {
+              use crate::render::shared::CameraMode;
+              renderer.shared.mode = match renderer.shared.mode
+              {
+                CameraMode::Free => CameraMode::Orbital,
+                CameraMode::Orbital => CameraMode::Free,
+              };
+              self.logger.emit(LogLevel::Info, &format!("Camera Mode: {:?}", renderer.shared.mode));
+            }
+          }
+
+          _ => (),
+        }
+      }
+
+      WindowEvent::Resized(physical_size) =>
+      {
+        if let Some(renderer) = &mut self.renderer
+        {
+          renderer.resize(Some(physical_size));
         }
       }
 
       WindowEvent::RedrawRequested =>
       {
+        self.time.update();
+        let dt = self.time.delta_f32;
+
         if let Some(renderer) = &mut self.renderer
         {
+          if let Err(e) = renderer.update(&self.input, dt)
+          {
+            eprintln!("Update error: {:?}", e);
+          }
+
           if let Err(e) = renderer.render()
           {
-            // Passing None uses internal window size query, avoiding borrow issues
-            eprintln!("Render error: {}", e);
-            renderer.resize(None);
+            let err_str = format!("{:?}", e);
+            if !err_str.contains("reconfigured")
+            {
+              eprintln!("Render error: {}", err_str);
+            }
           }
         }
-      }
 
-      WindowEvent::KeyboardInput { event, .. } => self.input.update_key(&event),
+        self.input.tick();
 
-      WindowEvent::CursorMoved { position, .. } =>
-      {
-        let new_pos = glam::vec2(position.x as f32, position.y as f32);
-        self.input.mouse_delta = new_pos - self.input.mouse_pos;
-        self.input.mouse_pos = new_pos;
-      }
-
-      WindowEvent::MouseInput { state, button, .. } =>
-      {
-        let is_pressed = state == ElementState::Pressed;
-        match button
+        if let Some(window) = &self.window
         {
-          MouseButton::Left => self.input.left_clicked = is_pressed,
-          MouseButton::Right => self.input.right_clicked = is_pressed,
-          _ => (),
+          window.request_redraw();
         }
       }
 
@@ -104,20 +163,5 @@ impl ApplicationHandler for App
     {
       window.request_redraw();
     }
-    self.input.tick();
   }
-}
-
-pub fn run() -> Result<(), crate::core::error::KyzuError>
-{
-  let cfg = config::load().map_err(|e| crate::core::error::KyzuError::ConfigLoad(e))?;
-  let log_path = format!("{}{}", cfg.app.data_dir, cfg.app.log_filename);
-  let logger = log::Logger::new(&log_path);
-
-  let event_loop =
-    EventLoop::new().map_err(|e| crate::core::error::KyzuError::Window(e.to_string()))?;
-
-  let mut app = App { config: cfg, logger, input: InputState::new(), renderer: None, window: None };
-
-  event_loop.run_app(&mut app).map_err(|e| crate::core::error::KyzuError::Window(e.to_string()))
 }
