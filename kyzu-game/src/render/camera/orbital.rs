@@ -61,7 +61,7 @@ impl CameraController for OrbitalController
 
 impl OrbitalController
 {
-  pub fn handle_input(&mut self, input: &crate::input::state::InputState, dt: f32)
+  pub fn handle_input(&mut self, input: &crate::input::state::InputState, _dt: f32)
   {
     // 1. Rotation (Right Mouse Button Drag)
     // In Google Earth, dragging right moves your "view" left (rotating the globe)

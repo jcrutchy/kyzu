@@ -1,4 +1,7 @@
+use std::f32::consts::PI;
+
 use bytemuck::{Pod, Zeroable};
+use glam::Vec3;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -7,31 +10,64 @@ pub struct BakedVertex
   pub pos: [f32; 3],
   pub normal: [f32; 3],
   pub uv: [f32; 2],
+  pub height: f32, // Elevation in metres (from ETOPO)
+  pub hex_id: u32, // The ID of the hex cell this vertex belongs to
 }
 
-pub fn generate_icosahedron() -> (Vec<BakedVertex>, Vec<u16>)
+pub struct SphericalMapper;
+
+impl SphericalMapper
+{
+  /// Maps a unit vector to (u, v) [0, 1] for sampling TIFFs/Images
+  /// Assumes +Y is the North Pole
+  pub fn vector_to_uv(v: Vec3) -> [f32; 2]
+  {
+    // Latitude: -PI/2 to PI/2 (Y is vertical)
+    let lat = v.y.asin();
+    // Longitude: -PI to PI
+    let lon = v.z.atan2(v.x);
+
+    // Normalize to [0, 1] for TIFF sampling
+    // U = 0.5 at Lon 0, V = 0 at North Pole (+Y), V = 1 at South Pole (-Y)
+    let u = (lon + PI) / (2.0 * PI);
+    let v_coord = (PI / 2.0 - lat) / PI;
+
+    [u, v_coord]
+  }
+}
+
+pub fn get_base_icosahedron() -> (Vec<BakedVertex>, Vec<u16>)
 {
   let phi = (1.0 + 5.0f32.sqrt()) / 2.0;
-  let raw_verts: [[f32; 3]; 12] = [
-    [-1.0, phi, 0.0],
-    [1.0, phi, 0.0],
-    [-1.0, -phi, 0.0],
-    [1.0, -phi, 0.0],
-    [0.0, -1.0, phi],
-    [0.0, 1.0, phi],
-    [0.0, -1.0, -phi],
-    [0.0, 1.0, -phi],
-    [phi, 0.0, -1.0],
-    [phi, 0.0, 1.0],
-    [-phi, 0.0, -1.0],
-    [-phi, 0.0, 1.0],
+
+  // Seed vertices (normalized to radius 1.0)
+  let raw_verts: [Vec3; 12] = [
+    Vec3::new(-1.0, phi, 0.0).normalize(),
+    Vec3::new(1.0, phi, 0.0).normalize(),
+    Vec3::new(-1.0, -phi, 0.0).normalize(),
+    Vec3::new(1.0, -phi, 0.0).normalize(),
+    Vec3::new(0.0, -1.0, phi).normalize(),
+    Vec3::new(0.0, 1.0, phi).normalize(),
+    Vec3::new(0.0, -1.0, -phi).normalize(),
+    Vec3::new(0.0, 1.0, -phi).normalize(),
+    Vec3::new(phi, 0.0, -1.0).normalize(),
+    Vec3::new(phi, 0.0, 1.0).normalize(),
+    Vec3::new(-phi, 0.0, -1.0).normalize(),
+    Vec3::new(-phi, 0.0, 1.0).normalize(),
   ];
 
-  let mut vertices = Vec::new();
+  let mut vertices = Vec::with_capacity(12);
   for v in raw_verts
   {
-    let normal = glam::Vec3::from(v).normalize();
-    vertices.push(BakedVertex { pos: v, normal: normal.to_array(), uv: [0.0, 0.0] });
+    let uv = SphericalMapper::vector_to_uv(v);
+
+    vertices.push(BakedVertex {
+      pos: v.to_array(),
+      normal: v.to_array(),
+      uv,
+      height: 0.0, // This will be sampled from the TIFF later
+      hex_id: 0,
+    });
   }
 
   let indices = vec![
