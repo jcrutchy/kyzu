@@ -151,7 +151,14 @@ impl SolidModule
         buffers: &[wgpu::VertexBufferLayout {
           array_stride: vertex_size as u64,
           step_mode: wgpu::VertexStepMode::Vertex,
-          attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+          attributes: &wgpu::vertex_attr_array![
+            0 => Float32x3, // position
+            1 => Float32x3, // normal
+            2 => Float32x2, // uv
+            3 => Float32,   // height
+            4 => Uint32,    // hex_id
+            5 => Float32x3, // barycentric
+          ],
         }],
       },
       fragment: Some(wgpu::FragmentState {

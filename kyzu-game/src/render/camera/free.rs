@@ -10,7 +10,7 @@ pub struct FreeController
   pub position: DVec3,
   pub yaw: f32,
   pub pitch: f32,
-  pub speed_gear: i32, // 0 = stopped, 1..=8 = 10^(gear-1) m/s
+  pub speed_gear: i32, // gear multiplier: each Shift+scroll notch = 2x/0.5x WASD speed
   pub sensitivity: f32,
   pub fov: f32,
   pub z_near: f32,
@@ -34,25 +34,16 @@ impl Default for FreeController
   }
 }
 
-// Gear 0 = stopped. Gear N = 10^(N-1) m/s:
-//   1 =        10 m/s  (walking pace)
-//   2 =       100 m/s
-//   3 =     1,000 m/s  (~Mach 3)
-//   4 =    10,000 m/s  (low orbit)
-//   5 =   100,000 m/s
-//   6 = 1,000,000 m/s  (Earth-Moon in ~6 mins)
-//   7 =    10,000 km/s
-//   8 =   100,000 km/s (inner solar system in minutes)
-fn gear_to_speed(gear: i32) -> f64
+// Gear multiplier: 2^gear applied to the base distance-proportional speed.
+// Gear  0 = 1x   (base: 10% of distance per second)
+// Gear  1 = 2x
+// Gear  2 = 4x
+// Gear -1 = 0.5x (finer control close up)
+// Gear -2 = 0.25x
+// Range: -4 to +6 gives roughly 0.06x to 64x base speed
+fn gear_multiplier(gear: i32) -> f64
 {
-  if gear <= 0
-  {
-    0.0
-  }
-  else
-  {
-    10.0_f64.powi(gear - 1)
-  }
+  2.0_f64.powi(gear)
 }
 
 impl CameraController for FreeController
@@ -77,17 +68,21 @@ impl CameraController for FreeController
 
     // --- 3. HANDLE INPUT (Movement) ---
 
+    // Base speed: always proportional to distance from origin.
+    // At any distance, gear 0 WASD moves you at 10% of that distance per second.
+    // Scroll nudges you by 10% of distance per notch (same scale, feels consistent).
+    let dist = self.position.length().max(100.0);
+    let base_speed = dist * 0.1; // metres per second at gear 0
+
     // Scroll: instant positional nudge — 10% of distance from origin per notch.
-    // Works in both directions so you can back away from a planet while keeping
-    // it in view for spatial orientation.
     if input.scroll_delta != 0.0
     {
-      let dist = self.position.length().max(100.0); // clamp so nudge never collapses to zero
       let scroll_clamped = input.scroll_delta.clamp(-3.0, 3.0) as f64;
-      self.position += forward.as_dvec3() * dist * 0.1 * scroll_clamped;
+      self.position += forward.as_dvec3() * base_speed * scroll_clamped;
     }
 
-    // Shift+scroll: bump gear up/down for sustained WASD flight speed.
+    // Shift+scroll: adjust gear multiplier for WASD speed.
+    // Negative gears give finer control when close to a surface.
     if input.is_key_down(KeyCode::ShiftLeft) || input.is_key_down(KeyCode::ShiftRight)
     {
       if input.scroll_delta > 0.0
@@ -98,10 +93,11 @@ impl CameraController for FreeController
       {
         self.speed_gear -= 1;
       }
-      self.speed_gear = self.speed_gear.clamp(0, 8);
+      self.speed_gear = self.speed_gear.clamp(-4, 6);
     }
 
-    let speed = gear_to_speed(self.speed_gear);
+    // WASD: sustained flight at base speed * gear multiplier
+    let wasd_speed = base_speed * gear_multiplier(self.speed_gear);
 
     let mut move_dir = Vec3::ZERO;
     if input.is_key_down(KeyCode::KeyW)
@@ -124,7 +120,7 @@ impl CameraController for FreeController
     if move_dir.length_squared() > 0.0
     {
       let move_norm = move_dir.normalize();
-      self.position += move_norm.as_dvec3() * speed * (dt as f64);
+      self.position += move_norm.as_dvec3() * wasd_speed * (dt as f64);
     }
 
     // --- 4. FLOATING ORIGIN MATRICES ---

@@ -60,6 +60,7 @@ impl<'a> Subdivider<'a>
       uv,
       height,
       hex_id: 0,
+      barycentric: [0.0, 0.0, 0.0],
     });
 
     self.midpoint_cache.insert(key, new_idx);

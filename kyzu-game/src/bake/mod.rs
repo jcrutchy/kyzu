@@ -83,85 +83,74 @@ impl BakeManager
     logger.emit(LogLevel::Info, &format!("Baking Body: {}", body.name));
 
     let mut tiff_reader = None;
-    if body.use_real_data
+    if body.use_real_data && body.elevation_map_path.is_some()
     {
-      if let Some(filename) = &body.elevation_map_path
-      {
-        let tiff_path = self.source_assets.join(body.name.to_lowercase()).join(filename);
-
-        let reader_result = EtopoTiff::open(&tiff_path, logger);
-
-        // If it "bailed", log it as a Critical error before returning
-        match reader_result
-        {
-          Ok(reader) =>
-          {
-            tiff_reader = Some(reader);
-          }
-          Err(e) =>
-          {
-            let err_msg = format!("TIFF initialization failed for {}: {}", body.name, e);
-            logger.emit(LogLevel::Critical, &err_msg);
-            return Err(e); // Still return the error to stop the bake
-          }
-        }
-      }
+      let filename = body.elevation_map_path.as_ref().unwrap();
+      let tiff_path = self.source_assets.join(body.name.to_lowercase()).join(filename);
+      tiff_reader = Some(EtopoTiff::open(&tiff_path, logger)?);
     }
 
-    // 1. Base Geometry
-    let (vertices_raw, indices_raw) = geometry::get_base_icosahedron();
-    let mut vertices = vertices_raw;
-    let mut indices: Vec<u32> = indices_raw.into_iter().map(|i| i as u32).collect();
+    // 1. Initial Geometry
+    let (mut vertices, indices) = geometry::get_base_icosahedron();
+    let mut indices: Vec<u32> = indices.into_iter().map(|i| i as u32).collect();
 
-    // 2. Probing & Initial Sampling
-    if let Some(reader) = tiff_reader.as_mut()
-    {
-      logger.emit(LogLevel::Info, &format!("Probing TIFF: {:?}", reader.path));
-
-      // Initial 12 vertices sampling
-      for v in &mut vertices
-      {
-        let px =
-          (v.uv[0] * (reader.width as f32 - 1.0)).clamp(0.0, reader.width as f32 - 1.0) as usize;
-        let py =
-          (v.uv[1] * (reader.height as f32 - 1.0)).clamp(0.0, reader.height as f32 - 1.0) as usize;
-        v.height = reader.get_sample(px, py) as f32;
-      }
-    }
-
-    // 3. Subdivide
+    // 2. Subdivide (Indexed Mode - efficient for math)
     let mut subdivider = Subdivider::new(tiff_reader.as_mut());
-    let lod_level = 3;
-    logger.emit(LogLevel::Info, &format!("Baking: Subdividing to Level {}...", lod_level));
+    let lod_level = 3; // Start here, move to 7 or 8 once TIFF is cached
+
+    logger.emit(LogLevel::Info, &format!("Subdividing to Level {}...", lod_level));
 
     for _ in 0..lod_level
     {
-      let mut new_indices = Vec::new();
+      let mut next_indices = Vec::with_capacity(indices.len() * 4);
       for chunk in indices.chunks(3)
       {
-        let v1 = chunk[0];
-        let v2 = chunk[1];
-        let v3 = chunk[2];
+        let (v1, v2, v3) = (chunk[0], chunk[1], chunk[2]);
 
         let a = subdivider.get_midpoint(v1, v2, &mut vertices);
         let b = subdivider.get_midpoint(v2, v3, &mut vertices);
         let c = subdivider.get_midpoint(v3, v1, &mut vertices);
 
-        new_indices.extend_from_slice(&[v1, a, c]);
-        new_indices.extend_from_slice(&[v2, b, a]);
-        new_indices.extend_from_slice(&[v3, c, b]);
-        new_indices.extend_from_slice(&[a, b, c]);
+        next_indices.extend_from_slice(&[v1, a, c]);
+        next_indices.extend_from_slice(&[v2, b, a]);
+        next_indices.extend_from_slice(&[v3, c, b]);
+        next_indices.extend_from_slice(&[a, b, c]);
       }
-      indices = new_indices;
+      indices = next_indices;
     }
-    logger.emit(LogLevel::Info, &format!("Bake Complete: {} vertices.", vertices.len()));
 
-    // 4. Save to the world-specific baked folder
+    // 3. Unweld & Assign Barycentrics (Non-Indexed Mode)
+    // This allows for the "Kyzu" wireframe look by giving each triangle unique vertices.
+    logger.emit(LogLevel::Info, "Unwelding vertices for barycentric wireframes...");
+    let mut flat_vertices = Vec::with_capacity(indices.len());
+
+    for (i, &idx) in indices.iter().enumerate()
+    {
+      let mut v = vertices[idx as usize].clone();
+
+      // Assign [1,0,0], [0,1,0], or [0,0,1] based on the corner of the triangle
+      let corner = i % 3;
+      v.barycentric = match corner
+      {
+        0 => [1.0, 0.0, 0.0],
+        1 => [0.0, 1.0, 0.0],
+        _ => [0.0, 0.0, 1.0],
+      };
+
+      flat_vertices.push(v);
+    }
+
+    // 4. Save to Disk
     let file_name = format!("{}.bake", body.name.to_lowercase());
     let output_path = self.output_root.join(file_name);
 
-    self.save_bake_to_disk(output_path.to_str().unwrap(), &vertices, &indices)?;
-    logger.emit(LogLevel::Info, &format!("[DONE] Baked {} to {:?}", body.name, output_path));
+    // Note: We pass an empty slice for indices because the mesh is now non-indexed
+    self.save_bake_to_disk(output_path.to_str().unwrap(), &flat_vertices, &[])?;
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("[DONE] Baked {} ({} triangles)", body.name, flat_vertices.len() / 3),
+    );
 
     Ok(())
   }

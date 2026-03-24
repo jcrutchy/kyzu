@@ -16,6 +16,7 @@ pub struct BakedVertex
   pub uv: [f32; 2],
   pub height: f32, // Elevation in metres (from ETOPO)
   pub hex_id: u32, // The ID of the hex cell this vertex belongs to
+  pub barycentric: [f32; 3],
 }
 
 pub struct SphericalMapper;
@@ -71,6 +72,7 @@ pub fn get_base_icosahedron() -> (Vec<BakedVertex>, Vec<u16>)
       uv,
       height: 0.0, // This will be sampled from the TIFF later
       hex_id: 0,
+      barycentric: [0.0, 0.0, 0.0],
     });
   }
 
