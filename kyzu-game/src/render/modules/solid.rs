@@ -1,12 +1,12 @@
 use std::any::Any;
 use std::path::Path;
 
-use glam::{DVec3, Mat4};
+use glam::{DVec3, Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 use wgpu::{include_wgsl, BindGroup, Buffer, Queue};
 
 use crate::bake::geometry::BakedVertex;
-use crate::core::log::Logger;
+use crate::core::log::{LogLevel, Logger};
 use crate::render::module::{FrameTargets, RenderModule};
 use crate::render::shared::SharedState;
 
@@ -26,22 +26,72 @@ impl SolidModule
     device: &wgpu::Device,
     shared: &SharedState,
     mesh_path: &Path,
-    _logger: &mut Logger,
+    logger: &mut Logger,
   ) -> Self
   {
     let shader = device.create_shader_module(include_wgsl!("../shaders/solid.wgsl"));
 
     // 1. Load the mesh
     let bake_data = std::fs::read(mesh_path).expect("Failed to load baked mesh.");
+    logger.emit(
+      LogLevel::Info,
+      &format!("Loading bake file: {} ({} bytes)", mesh_path.display(), bake_data.len()),
+    );
+
+    // Vertices
     let v_count = u32::from_le_bytes(bake_data[0..4].try_into().unwrap()) as usize;
     let vertex_size = std::mem::size_of::<BakedVertex>();
-    let vertex_data_start = 8;
+    let vertex_data_start = 4;
     let vertex_data_end = vertex_data_start + (v_count * vertex_size);
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("Mesh Stats: {} vertices ({} bytes each)", v_count, vertex_size),
+    );
 
     let vertices: &[BakedVertex] =
       bytemuck::cast_slice(&bake_data[vertex_data_start..vertex_data_end]);
-    let indices: &[u32] = bytemuck::cast_slice(&bake_data[vertex_data_end..]);
-    let i_count = indices.len();
+
+    // Indices
+    let i_count_offset = vertex_data_end;
+
+    // SAFETY CHECK: Is there enough data left for an index count?
+    if i_count_offset + 4 > bake_data.len()
+    {
+      panic!(
+        "Bake file truncated! Expected index count at {}, but file ends at {}",
+        i_count_offset,
+        bake_data.len()
+      );
+    }
+
+    let i_count =
+      u32::from_le_bytes(bake_data[i_count_offset..i_count_offset + 4].try_into().unwrap())
+        as usize;
+    let index_data_start = i_count_offset + 4;
+    let index_data_end = index_data_start + (i_count * 4);
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("Mesh Stats: {} indices (offset: {})", i_count, i_count_offset),
+    );
+
+    // CRITICAL FIX: Ensure we aren't passing an empty slice to the GPU
+    if i_count == 0
+    {
+      panic!("Bake file contains 0 indices! The subdivision or save logic in 'cook_body' might be broken.");
+    }
+
+    if index_data_end > bake_data.len()
+    {
+      panic!(
+        "Bake file truncated! Expected index data up to {}, but file ends at {}",
+        index_data_end,
+        bake_data.len()
+      );
+    }
+
+    let indices: &[u32] = bytemuck::cast_slice(&bake_data[index_data_start..index_data_end]);
 
     // 2. GPU Buffers (Geometry)
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -56,7 +106,7 @@ impl SolidModule
       usage: wgpu::BufferUsages::INDEX,
     });
 
-    // 3. NEW: Model Matrix Buffer (Group 1)
+    // 3. Model Matrix Buffer (Group 1)
     let model_buffer = device.create_buffer(&wgpu::BufferDescriptor {
       label: Some("Solid Model Buffer"),
       size: 64, // 16 * f32
@@ -84,7 +134,7 @@ impl SolidModule
       entries: &[wgpu::BindGroupEntry { binding: 0, resource: model_buffer.as_entire_binding() }],
     });
 
-    // 4. Pipeline Layout (Group 0: Camera, Group 1: Model)
+    // 4. Pipeline Layout
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
       label: Some("Solid Pipeline Layout"),
       bind_group_layouts: &[&shared.camera_gpu.layout, &model_layout],
@@ -146,16 +196,16 @@ impl RenderModule for SolidModule
 {
   fn update(&mut self, queue: &Queue, shared: &SharedState)
   {
-    // Assume the Icosahedron is at World (0,0,0)
     let planet_pos_world = DVec3::ZERO;
-
-    // Calculate relative position (f64)
     let relative_pos = planet_pos_world - shared.eye_world;
+    let scale = 6_371_000.0_f32;
 
-    // Convert to f32 Model Matrix
-    let model_mat = Mat4::from_translation(relative_pos.as_vec3());
+    let model_mat = Mat4::from_scale_rotation_translation(
+      Vec3::splat(scale),
+      Quat::IDENTITY,
+      relative_pos.as_vec3(),
+    );
 
-    // Upload to GPU
     queue.write_buffer(&self.model_buffer, 0, bytemuck::cast_slice(&model_mat.to_cols_array()));
   }
 
@@ -185,7 +235,7 @@ impl RenderModule for SolidModule
 
     render_pass.set_pipeline(&self.pipeline);
     render_pass.set_bind_group(0, &shared.camera_gpu.bind_group, &[]);
-    render_pass.set_bind_group(1, &self.model_bind_group, &[]); // MODEL GROUP
+    render_pass.set_bind_group(1, &self.model_bind_group, &[]);
     render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
     render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 

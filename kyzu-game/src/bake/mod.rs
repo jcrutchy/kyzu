@@ -179,9 +179,13 @@ impl BakeManager
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
+    // Header: Vertex Count
     writer.write_all(&(vertices.len() as u32).to_le_bytes())?;
+    // Vertex Data
     writer.write_all(bytemuck::cast_slice(vertices))?;
+    // Index Count
     writer.write_all(&(indices.len() as u32).to_le_bytes())?;
+    // Index Data
     writer.write_all(bytemuck::cast_slice(indices))?;
 
     writer.flush()?;

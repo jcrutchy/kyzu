@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+use crate::input::state::InputState;
 use crate::render::camera::CameraSystem;
 use crate::render::module::{FrameTargets, RenderModule};
 use crate::render::shared::SharedState;
@@ -80,7 +81,7 @@ impl Renderer
     })
   }
 
-  pub fn update(&mut self, input: &crate::input::state::InputState, dt: f32) -> anyhow::Result<()>
+  pub fn update(&mut self, input: &mut InputState, dt: f32) -> anyhow::Result<()>
   {
     self.camera_system.update(&mut self.shared, input, dt);
     self.shared.camera_gpu.upload(&self.queue, &self.shared.camera);

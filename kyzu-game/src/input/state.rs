@@ -27,6 +27,13 @@ impl InputState
     }
   }
 
+  pub fn consume_mouse_delta(&mut self) -> glam::Vec2
+  {
+    let delta = self.mouse_delta;
+    self.mouse_delta = glam::Vec2::ZERO;
+    delta
+  }
+
   /// The core Phase 1.4 logic: Update state from winit events
   pub fn process_event(&mut self, event: &WindowEvent)
   {

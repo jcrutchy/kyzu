@@ -1,6 +1,7 @@
 use glam::DVec3;
 
 use super::CameraController;
+use crate::render::camera::InputState;
 
 pub struct OrbitalController
 {
@@ -21,11 +22,11 @@ impl Default for OrbitalController
     Self {
       lat: 0.0,
       lon: 0.0,
-      altitude: 10.0,
+      altitude: 15_000_000.0,
       target: glam::DVec3::ZERO,
       fov: 45.0,
-      z_near: 0.1,
-      z_far: 10000.0,
+      z_near: 1000.0,
+      z_far: 100_000_000.0,
       sensitivity: 0.005,
     }
   }
@@ -36,7 +37,7 @@ impl CameraController for OrbitalController
   fn update(
     &mut self,
     shared: &mut crate::render::shared::SharedState,
-    input: &crate::input::state::InputState,
+    input: &mut InputState,
     _dt: f32,
   )
   {
@@ -50,17 +51,16 @@ impl CameraController for OrbitalController
     if input.scroll_delta != 0.0
     {
       self.altitude -= (input.scroll_delta as f64) * self.altitude * 0.1;
-      self.altitude = self.altitude.clamp(2.0, 100000.0); // Allow space scale!
+      self.altitude = self.altitude.clamp(7_000_000.0, 100_000_000.0);
     }
 
     // 2. High Precision Math (f64)
     let lat_rad = self.lat.to_radians();
     let lon_rad = self.lon.to_radians();
-    let offset = DVec3::new(
-      self.altitude * lat_rad.cos() * lon_rad.sin(),
-      self.altitude * lat_rad.sin(),
-      self.altitude * lat_rad.cos() * lon_rad.cos(),
-    );
+    let x = self.altitude * lat_rad.cos() * lon_rad.sin();
+    let y = self.altitude * lat_rad.sin();
+    let z = self.altitude * lat_rad.cos() * lon_rad.cos();
+    let offset = DVec3::new(x, y, z);
 
     // Update the CPU "Source of Truth"
     shared.eye_world = self.target + offset;

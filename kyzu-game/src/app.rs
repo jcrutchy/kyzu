@@ -72,7 +72,7 @@ impl ApplicationHandler for App
       // TODO: Later, we will loop through self.config.world and add PlanetModules here
 
       // --- Finalize Renderer Setup ---
-      renderer.camera_system.update(&mut renderer.shared, &self.input, 0.016);
+      renderer.camera_system.update(&mut renderer.shared, &mut self.input, 0.016);
       renderer.shared.camera_gpu.upload(&renderer.queue, &renderer.shared.camera);
 
       self.renderer = Some(renderer);
@@ -150,7 +150,7 @@ impl ApplicationHandler for App
 
         if let Some(renderer) = &mut self.renderer
         {
-          if let Err(e) = renderer.update(&self.input, dt)
+          if let Err(e) = renderer.update(&mut self.input, dt)
           {
             eprintln!("Update error: {:?}", e);
           }

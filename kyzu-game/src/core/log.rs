@@ -76,4 +76,13 @@ impl Logger
       let _ = file.write_all(entry_text.as_bytes());
     }
   }
+
+  pub fn info(&mut self, msg: &str)
+  {
+    self.emit(LogLevel::Info, msg);
+  }
+  pub fn error(&mut self, msg: &str)
+  {
+    self.emit(LogLevel::Error, msg);
+  }
 }
