@@ -38,31 +38,42 @@ impl CameraController for FreeController
 {
   fn update(&mut self, shared: &mut SharedState, input: &mut InputState, dt: f32)
   {
+    // --- DEBUG: log every Free-mode frame ---
+    eprintln!("[FREE CAM frame]");
+    eprintln!("  position : {:?}", self.position);
+    eprintln!("  yaw={:.2}deg  pitch={:.2}deg", self.yaw.to_degrees(), self.pitch.to_degrees());
+    eprintln!(
+      "  right-drag: {}  scroll_delta: {:.3}",
+      input.mouse_buttons_down.contains(&winit::event::MouseButton::Right),
+      input.scroll_delta
+    );
+
     // --- 1. HANDLE INPUT (Rotation) ---
     if input.mouse_buttons_down.contains(&winit::event::MouseButton::Right)
     {
-      // Standardize sensitivity: 0.1 should be a comfortable speed
       let sensitivity_scale = 0.005;
-      let delta = input.mouse_delta; // Or use consume_mouse_delta() here instead
-
+      let delta = input.mouse_delta;
       self.yaw -= delta.x * self.sensitivity * sensitivity_scale;
       self.pitch -= delta.y * self.sensitivity * sensitivity_scale;
       self.pitch = self.pitch.clamp(-1.5, 1.5);
     }
 
-    // --- 2. HANDLE INPUT (Movement) ---
-    // Use the exact same Euler order as the hand-off (YXZ)
+    // --- 2. Build direction vectors (one rotation, used for both movement and view) ---
     let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
-
-    // Calculate direction vectors based on new rotation
     let forward = rotation * -Vec3::Z;
     let right = rotation * Vec3::X;
+    let up = rotation * Vec3::Y;
 
-    // Exponential Speed Adjustment (unchanged, as this part was working)
+    // --- 3. HANDLE INPUT (Movement) ---
     if input.scroll_delta != 0.0
     {
       let factor = if input.scroll_delta > 0.0 { 1.2 } else { 0.8 };
-      self.speed = (self.speed * factor).clamp(1.0, 10_000_000.0);
+      self.speed = (self.speed * factor).clamp(1.0, 100_000_000.0);
+
+      // Also directly move forward/back on scroll so it feels like zoom
+      let scroll_move =
+        forward.as_dvec3() * (self.speed as f64) * (input.scroll_delta as f64) * 0.05;
+      self.position += scroll_move;
     }
 
     let mut move_dir = Vec3::ZERO;
@@ -86,24 +97,20 @@ impl CameraController for FreeController
     if move_dir.length_squared() > 0.0
     {
       let move_norm = move_dir.normalize();
-      // Movement MUST be scaled by dt to be frame-rate independent
       self.position += move_norm.as_dvec3() * (self.speed as f64) * (dt as f64);
     }
 
-    // --- 3. FLOATING ORIGIN MATRICES ---
+    // --- 4. FLOATING ORIGIN MATRICES ---
     shared.eye_world = self.position;
 
-    // Create the rotation matrix
-    let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
-
-    // View Matrix: The inverse of the rotation (since we are at origin)
-    let view_rel = glam::Mat4::from_quat(rotation).inverse();
-
+    let view_rel = glam::Mat4::look_to_rh(Vec3::ZERO, forward, up);
     let aspect = shared.screen_width as f32 / shared.screen_height as f32;
     let proj = glam::Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
-
-    // Combine
     let view_proj = proj * view_rel;
+
+    // --- DEBUG: confirm matrices ---
+    eprintln!("  view_proj[3] (translation col): {:?}", view_proj.col(3));
+    eprintln!("  planet relative to eye: {:?}", (DVec3::ZERO - self.position).as_vec3());
 
     shared.camera.view_proj = view_proj.to_cols_array_2d();
     shared.camera.inv_view_proj = view_proj.inverse().to_cols_array_2d();

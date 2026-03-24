@@ -40,17 +40,40 @@ impl CameraSystem
         {
           self.free_controller.position = shared.eye_world;
 
-          // Calculate the look vector from eye to planet center
-          let forward = (self.orbital_controller.target - shared.eye_world).normalize();
+          let to_target = (self.orbital_controller.target - shared.eye_world).normalize();
 
-          // Convert Vector to Euler Angles (Pitch/Yaw)
-          // Pitch: Angle with the XZ plane
-          self.free_controller.pitch = forward.y.asin() as f32;
-          // Yaw: Angle on the XZ plane. In most RH systems, -Z is forward.
-          self.free_controller.yaw = f32::atan2(forward.x as f32, -forward.z as f32);
+          // Derive pitch and yaw that are consistent with from_euler(YXZ, yaw, pitch, 0) * -Z == to_target
+          // pitch = asin(to_target.y)  [elevation above XZ plane]
+          // yaw: after pitching, the remaining rotation is in XZ — use atan2 on the XZ projection
+          let pitch = (to_target.y as f32).asin();
+          let yaw = {
+            let xz_len = (to_target.x * to_target.x + to_target.z * to_target.z).sqrt() as f32;
+            if xz_len < 1e-6
+            {
+              // Looking straight up or down — yaw is degenerate, keep current
+              self.free_controller.yaw
+            }
+            else
+            {
+              // from_euler(YXZ, yaw, 0, 0) * -Z = (-sin(yaw), 0, -cos(yaw))
+              // so: sin(yaw) = -to_target.x / xz_len, cos(yaw) = -to_target.z / xz_len
+              f32::atan2(-to_target.x as f32, -to_target.z as f32)
+            }
+          };
 
-          // Match the speed to the scale of the view
-          self.free_controller.speed = (shared.eye_world.length() * 0.2) as f32;
+          self.free_controller.pitch = pitch;
+          self.free_controller.yaw = yaw;
+          self.free_controller.speed = (self.orbital_controller.altitude * 0.5) as f32;
+
+          // Verify the round-trip in debug
+          let rotation = glam::Quat::from_euler(glam::EulerRot::YXZ, yaw, pitch, 0.0);
+          let reconstructed_forward = rotation * -glam::Vec3::Z;
+          eprintln!("[CAM TRANSITION -> Free]");
+          eprintln!("  to_target          : {:?}", to_target);
+          eprintln!("  yaw={:.1}deg  pitch={:.1}deg", yaw.to_degrees(), pitch.to_degrees());
+          eprintln!("  reconstructed fwd  : {:?}", reconstructed_forward);
+          eprintln!("  dot(to_target, fwd): {:.6}", to_target.as_vec3().dot(reconstructed_forward));
+          // should be ~1.0
         }
         CameraMode::Orbital =>
         {
