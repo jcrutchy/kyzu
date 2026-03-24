@@ -25,8 +25,8 @@ impl Default for OrbitalController
       altitude: 15_000_000.0,
       target: glam::DVec3::ZERO,
       fov: 45.0,
-      z_near: 1000.0,
-      z_far: 100_000_000.0,
+      z_near: 100_000.0,
+      z_far: 1_000_000_000_000.0,
       sensitivity: 0.005,
     }
   }
