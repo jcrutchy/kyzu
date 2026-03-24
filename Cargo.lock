@@ -954,7 +954,6 @@ dependencies = [
  "egui-winit",
  "flate2",
  "glam",
- "log",
  "memmap2",
  "pollster",
  "serde",

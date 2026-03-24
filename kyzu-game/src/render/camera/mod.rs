@@ -3,6 +3,7 @@ use crate::render::shared::CameraMatrices;
 pub trait CameraController
 {
   fn update_matrices(&self, matrices: &mut CameraMatrices, aspect: f32);
+  fn get_eye_f64(&self) -> [f64; 3];
 }
 
 pub mod free;
@@ -38,11 +39,13 @@ impl CameraSystem
       {
         self.free_controller.handle_input(input, dt);
         self.free_controller.update_matrices(&mut shared.camera, aspect);
+        shared.eye_world_f64 = self.free_controller.get_eye_f64();
       }
       crate::render::shared::CameraMode::Orbital =>
       {
         self.orbital_controller.handle_input(input, dt);
         self.orbital_controller.update_matrices(&mut shared.camera, aspect);
+        shared.eye_world_f64 = self.orbital_controller.get_eye_f64();
       }
     }
   }

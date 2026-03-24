@@ -1,4 +1,4 @@
-use glam::{EulerRot, Mat4, Quat, Vec3};
+use glam::{DVec3, EulerRot, Mat4, Quat, Vec3};
 use winit::keyboard::KeyCode;
 
 use super::CameraController;
@@ -6,7 +6,7 @@ use crate::render::shared::CameraMatrices;
 
 pub struct FreeController
 {
-  pub position: Vec3,
+  pub position: DVec3,
   pub yaw: f32,
   pub pitch: f32,
   pub speed: f32,
@@ -21,7 +21,7 @@ impl Default for FreeController
   fn default() -> Self
   {
     Self {
-      position: Vec3::new(0.0, 0.0, 5.0),
+      position: glam::DVec3::new(0.0, 0.0, 5.0),
       yaw: -90.0f32.to_radians(), // Point toward the origin
       pitch: 0.0,
       speed: 5.0,
@@ -38,16 +38,20 @@ impl CameraController for FreeController
   fn update_matrices(&self, matrices: &mut CameraMatrices, aspect: f32)
   {
     let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
+    // Use DMat4 for the view calculation
+    let view = glam::DMat4::from_rotation_translation(rotation.as_dquat(), self.position).inverse();
     let proj = Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
 
-    // In Freecam, we move the world opposite to our position
-    let view = Mat4::from_rotation_translation(rotation, self.position).inverse();
-
-    let view_proj = proj * view;
+    // Cast back to f32 for the final Uniform Buffer
+    let view_proj = proj * view.as_mat4();
 
     matrices.view_proj = view_proj.to_cols_array_2d();
     matrices.inv_view_proj = view_proj.inverse().to_cols_array_2d();
-    matrices.eye_world = self.position.to_array();
+    matrices.eye_world = self.position.as_vec3().to_array(); // Cast for GPU
+  }
+  fn get_eye_f64(&self) -> [f64; 3]
+  {
+    self.position.to_array()
   }
 }
 
@@ -94,7 +98,7 @@ impl FreeController
 
     if move_dir.length_squared() > 0.0
     {
-      self.position += move_dir.normalize() * self.speed * dt;
+      self.position += move_dir.as_dvec3() * (self.speed as f64) * (dt as f64);
     }
   }
 }

@@ -131,11 +131,6 @@ impl Renderer
       .device
       .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
 
-    for module in &mut self.modules
-    {
-      module.update(&self.queue, &self.shared);
-    }
-
     let targets = FrameTargets { surface_view: &view, depth_view: &self.shared.depth_view };
 
     for module in &self.modules

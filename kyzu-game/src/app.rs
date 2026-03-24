@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
@@ -53,15 +54,34 @@ impl ApplicationHandler for App
       let mut renderer = pollster::block_on(Renderer::new(window.clone()))
         .expect("Failed to initialize GPU Renderer");
 
-      let solid_mod = SolidModule::new(&renderer.device, &renderer.shared);
-      renderer.add_module(solid_mod);
+      // --- Framework Logic: Add modules based on config ---
 
-      renderer.camera_system.update(&mut renderer.shared, &self.input, 0.016); // 16ms default for init
+      // Resolve the test mesh path: [data_dir] / [test_mesh]
+      let test_mesh_path =
+        PathBuf::from(&self.config.app.data_dir).join(&self.config.app.test_mesh);
+
+      // Only load the SolidModule if the file actually exists (our "Test Mode" check)
+      if test_mesh_path.exists()
+      {
+        let solid_mod =
+          SolidModule::new(&renderer.device, &renderer.shared, &test_mesh_path, &mut self.logger);
+        renderer.add_module(solid_mod);
+        self.logger.emit(LogLevel::Info, "Test SolidModule loaded.");
+      }
+
+      // TODO: Later, we will loop through self.config.world and add PlanetModules here
+
+      // --- Finalize Renderer Setup ---
+      renderer.camera_system.update(&mut renderer.shared, &self.input, 0.016);
       renderer.shared.camera_gpu.upload(&renderer.queue, &renderer.shared.camera);
 
       self.renderer = Some(renderer);
       self.window = Some(window);
-
+      if let Some(renderer) = &self.renderer
+      {
+        let mode_msg = format!("Initial Camera Mode: {:?}", renderer.shared.mode);
+        self.logger.emit(LogLevel::Info, &mode_msg);
+      }
       self.logger.emit(LogLevel::Info, "Kyzu Engine Initialized (Modular Architecture)");
     }
   }

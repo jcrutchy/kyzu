@@ -1,10 +1,11 @@
 use std::any::Any;
-use std::fs;
+use std::path::Path;
 
 use wgpu::util::DeviceExt;
-use wgpu::{include_wgsl, Device, Queue};
+use wgpu::{include_wgsl, Queue};
 
 use crate::bake::geometry::BakedVertex;
+use crate::core::log::{LogLevel, Logger};
 use crate::render::module::{FrameTargets, RenderModule};
 use crate::render::shared::SharedState;
 
@@ -18,36 +19,48 @@ pub struct SolidModule
 
 impl SolidModule
 {
-  pub fn new(device: &Device, shared: &SharedState) -> Self
+  pub fn new(
+    device: &wgpu::Device,
+    shared: &SharedState,
+    mesh_path: &Path,
+    logger: &mut Logger,
+  ) -> Self
   {
     let shader = device.create_shader_module(include_wgsl!("../shaders/solid.wgsl"));
 
-    // 1. Load the baked data from the assets folder
-    let bake_path = "assets/icosahedron.bake";
-    let bake_data = fs::read(bake_path)
-      .expect("Failed to load assets/icosahedron.bake. Ensure BakeManager runs in main.");
+    // 1. Load the small test icosahedron bake
+    let bake_data = std::fs::read(mesh_path).expect("Failed to load baked mesh from path.");
 
-    // 2. Extract counts from the 8-byte header
+    // 2. Extract counts (Header: 4 bytes v_count, 4 bytes i_count)
     let v_count = u32::from_le_bytes(bake_data[0..4].try_into().unwrap()) as usize;
-    let i_count = u32::from_le_bytes(bake_data[4..8].try_into().unwrap()) as usize;
-
-    // 3. Calculate offsets
     let vertex_size = std::mem::size_of::<BakedVertex>();
-    let vertex_data_start = 8;
+
+    let vertex_data_start = 8; // After the two u32 counts
     let vertex_data_end = vertex_data_start + (v_count * vertex_size);
 
+    // 3. Extract indices (Uint32 format)
     let vertices: &[BakedVertex] =
       bytemuck::cast_slice(&bake_data[vertex_data_start..vertex_data_end]);
-    let indices: &[u16] = bytemuck::cast_slice(&bake_data[vertex_data_end..]);
+    let indices: &[u32] = bytemuck::cast_slice(&bake_data[vertex_data_end..]);
+    let i_count = indices.len();
 
+    let msg = format!("Loaded {} vertices from bake.", vertices.len());
+    logger.emit(LogLevel::Debug, &msg);
+
+    if let Some(v) = vertices.get(0)
+    {
+      logger.emit(LogLevel::Debug, &format!("First Vertex Position: {:?}", v.pos));
+    }
+
+    // 4. Create GPU Buffers
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-      label: Some("Baked Vertex Buffer"),
+      label: Some("Solid Test Vertex Buffer"),
       contents: bytemuck::cast_slice(vertices),
       usage: wgpu::BufferUsages::VERTEX,
     });
 
     let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-      label: Some("Baked Index Buffer"),
+      label: Some("Solid Test Index Buffer"),
       contents: bytemuck::cast_slice(indices),
       usage: wgpu::BufferUsages::INDEX,
     });
@@ -66,10 +79,9 @@ impl SolidModule
         entry_point: Some("vs_main"),
         compilation_options: Default::default(),
         buffers: &[wgpu::VertexBufferLayout {
-          // Stride is the full BakedVertex (pos + normal + uv)
           array_stride: vertex_size as u64,
           step_mode: wgpu::VertexStepMode::Vertex,
-          // We only use attribute 0 (pos) for now to match your existing shader
+          // We only pass location 0 (pos) to this specific shader
           attributes: &wgpu::vertex_attr_array![0 => Float32x3],
         }],
       },
@@ -85,6 +97,7 @@ impl SolidModule
       }),
       primitive: wgpu::PrimitiveState {
         topology: wgpu::PrimitiveTopology::TriangleList,
+        cull_mode: Some(wgpu::Face::Back),
         ..Default::default()
       },
       depth_stencil: Some(wgpu::DepthStencilState {
@@ -133,9 +146,11 @@ impl RenderModule for SolidModule
 
     render_pass.set_pipeline(&self.pipeline);
     render_pass.set_bind_group(0, &shared.camera_gpu.bind_group, &[]);
-
     render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-    render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+
+    // Critical: Using Uint32 to match the BakeManager output
+    render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
     render_pass.draw_indexed(0..self.index_count, 0, 0..1);
   }
 

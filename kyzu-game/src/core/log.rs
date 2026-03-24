@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BUFFER_SIZE: usize = 100;
 
@@ -10,13 +11,14 @@ pub enum LogLevel
   Warning,
   Error,
   Critical,
+  Debug,
 }
 
 pub struct LogEntry
 {
   pub level: LogLevel,
   pub message: String,
-  pub timestamp: f64, // We can use std::time later
+  pub timestamp: SystemTime,
 }
 
 pub struct Logger
@@ -34,15 +36,27 @@ impl Logger
 
   pub fn emit(&mut self, level: LogLevel, message: &str)
   {
+    let now = SystemTime::now();
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_seconds = duration.as_secs();
+
+    // Basic math to get HH:MM:SS (UTC)
+    let seconds = total_seconds % 60;
+    let minutes = (total_seconds / 60) % 60;
+    let hours = (total_seconds / 3600) % 24;
+
+    let time_str = format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
+
     let prefix = match level
     {
       LogLevel::Info => "[INFO]",
       LogLevel::Warning => "[WARN]",
       LogLevel::Error => "[ERRO]",
       LogLevel::Critical => "[CRIT]",
+      LogLevel::Debug => "[DEBUG]",
     };
 
-    let entry_text = format!("{} {}\n", prefix, message);
+    let entry_text = format!("{} {} {}\n", time_str, prefix, message);
 
     // 1. Terminal Output
     print!("{}", entry_text);
@@ -52,11 +66,7 @@ impl Logger
     {
       self.buffer.pop_front();
     }
-    self.buffer.push_back(LogEntry {
-      level,
-      message: message.to_string(),
-      timestamp: 0.0, // Placeholder
-    });
+    self.buffer.push_back(LogEntry { level, message: message.to_string(), timestamp: now });
 
     // 3. File Output
     let file_result = OpenOptions::new().create(true).append(true).open(&self.file_path);

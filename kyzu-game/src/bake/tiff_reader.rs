@@ -19,6 +19,8 @@ use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 
+use crate::core::log::{LogLevel, Logger};
+
 const TAG_IMAGE_WIDTH: u16 = 256;
 const TAG_IMAGE_LENGTH: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
@@ -117,6 +119,7 @@ enum Layout
 
 struct TagValue
 {
+  #[allow(dead_code)]
   count: u64,
   values: Vec<u64>,
 }
@@ -131,14 +134,14 @@ pub struct EtopoTiff
   sample_format: SampleFormat,
   compression: Compression,
   layout: Layout,
-  path: std::path::PathBuf,
+  pub path: std::path::PathBuf,
   pub row_cache: HashMap<usize, Vec<i16>>,
   reader: BufReader<File>,
 }
 
 impl EtopoTiff
 {
-  pub fn open(path: &Path) -> anyhow::Result<Self>
+  pub fn open(path: &Path, logger: &mut Logger) -> anyhow::Result<Self>
   {
     let file = File::open(path)?;
     let mut r = BufReader::new(file);
@@ -198,12 +201,12 @@ impl EtopoTiff
       tags.insert(tag, val);
     }
 
-    // Log all tags found (helps diagnose new files)
     let mut tag_ids: Vec<u16> = tags.keys().copied().collect();
     tag_ids.sort();
-    println!("TIFF tags present: {:?}", tag_ids);
 
-    println!("--- ALL TIFF TAGS FOUND ---");
+    /*logger.emit(LogLevel::Info, &format!("TIFF tags present: {:?}", tag_ids));
+
+    logger.emit(LogLevel::Info, "--- ALL TIFF TAGS FOUND ---");
     let mut tag_ids: Vec<u16> = tags.keys().copied().collect();
     tag_ids.sort();
     for id in tag_ids
@@ -211,12 +214,11 @@ impl EtopoTiff
       if let Some(tag_val) = tags.get(&id)
       {
         let name = get_tag_name(id);
-        // Print the ID, Name, and the first value found
         let first_val = tag_val.values.first().copied().unwrap_or(0);
-        println!("Tag {:3}: {:25} | Value: {}", id, name, first_val);
+        logger.emit(LogLevel::Info, &format!("Tag {:3}: {:25} | Value: {}", id, name, first_val));
       }
     }
-    println!("---------------------------");
+    logger.emit(LogLevel::Info, "---------------------------");*/
 
     // Required fields
     let width = get_u64(&tags, TAG_IMAGE_WIDTH)? as usize;
@@ -246,7 +248,10 @@ impl EtopoTiff
       let tile_height = get_u64(&tags, TAG_TILE_LENGTH)? as usize;
       let offsets = get_values(&tags, TAG_TILE_OFFSETS)?;
       let byte_counts = get_values(&tags, TAG_TILE_BYTE_COUNTS)?;
-      log::info!("Layout: tiled {}x{}, {} tiles", tile_width, tile_height, offsets.len());
+      logger.emit(
+        LogLevel::Info,
+        &format!("Layout: tiled {}x{}, {} tiles", tile_width, tile_height, offsets.len()),
+      );
       Layout::Tiled { tile_width, tile_height, offsets, byte_counts }
     }
     else
@@ -254,30 +259,45 @@ impl EtopoTiff
       let rows_per_strip = get_u64(&tags, TAG_ROWS_PER_STRIP).unwrap_or(height as u64) as usize;
       let offsets = get_values(&tags, TAG_STRIP_OFFSETS)?;
       let byte_counts = get_values(&tags, TAG_STRIP_BYTE_COUNTS)?;
-      log::info!("Layout: stripped, {} strips of {} rows", offsets.len(), rows_per_strip);
+      logger.emit(
+        LogLevel::Info,
+        &format!("Layout: stripped, {} strips of {} rows", offsets.len(), rows_per_strip),
+      );
       Layout::Stripped { rows_per_strip, offsets, byte_counts }
     };
 
-    log::info!("TIFF: {}x{}, {:?}, {:?}", width, height, sample_format, compression);
+    logger.emit(
+      LogLevel::Info,
+      &format!("TIFF: {}x{}, {:?}, {:?}", width, height, sample_format, compression),
+    );
 
-    println!("--- TIFF DEBUG INFO ---");
-    println!("Path: {:?}", path);
-    println!("Dimensions: {} x {}", width, height);
-    println!("Endian: {}", if matches!(endian, Endian::Little) { "Little" } else { "Big" });
-    println!("Format: {:?}", sample_format);
-    println!("Compression: {:?}", compression);
+    logger.emit(LogLevel::Info, "--- TIFF DEBUG INFO ---");
+    logger.emit(LogLevel::Info, &format!("Path: {:?}", path));
+    logger.emit(LogLevel::Info, &format!("Dimensions: {} x {}", width, height));
+    logger.emit(
+      LogLevel::Info,
+      &format!("Endian: {}", if matches!(endian, Endian::Little) { "Little" } else { "Big" }),
+    );
+    logger.emit(LogLevel::Info, &format!("Format: {:?}", sample_format));
+    logger.emit(LogLevel::Info, &format!("Compression: {:?}", compression));
     match &layout
     {
       Layout::Stripped { rows_per_strip, offsets, .. } =>
       {
-        println!("Layout: Stripped ({} rows/strip, {} strips)", rows_per_strip, offsets.len());
+        logger.emit(
+          LogLevel::Info,
+          &format!("Layout: Stripped ({} rows/strip, {} strips)", rows_per_strip, offsets.len()),
+        );
       }
       Layout::Tiled { tile_width, tile_height, offsets, .. } =>
       {
-        println!("Layout: Tiled ({}x{}, {} tiles)", tile_width, tile_height, offsets.len());
+        logger.emit(
+          LogLevel::Info,
+          &format!("Layout: Tiled ({}x{}, {} tiles)", tile_width, tile_height, offsets.len()),
+        );
       }
     }
-    println!("-----------------------");
+    logger.emit(LogLevel::Info, "-----------------------");
 
     Ok(Self {
       width,
@@ -368,12 +388,6 @@ impl EtopoTiff
   }
 
   /*
-  Great call. This is one of those "magic" pieces of code that will look like total gibberish in six months if it isn't documented.
-
-  I've written this up as a succinct `README` or header block you can drop into `src/bake/tiff_reader.rs`. It explains exactly why we are shuffling bytes around so you don't accidentally "optimize" it away later.
-
-  ---
-
   ### Developer Note: The "Predictor 3" Interleave
   **File:** `src/bake/tiff_reader.rs`
   **Context:** Decoding ETOPO 2022 Floating Point GeoTIFFs
@@ -388,7 +402,6 @@ impl EtopoTiff
   > 1. **Horizontal Differencing:** Reconstruct the absolute value of each byte plane by applying a `wrapping_add` across the entire row.
   > 2. **Interleaving:** Reach into the four different "planes" and pull one byte from each to reassemble a valid `f32` bit-pattern.
   > 3. **Endianness:** Regardless of the TIFF being "II" or "MM", the Predictor 3 planes are always stored from Most Significant (B4) to Least Significant (B1). We map them back to the order expected by our `Endian` helper.
-
   */
 
   fn decode_tile_bytes(&self, data: &[u8]) -> Vec<i16>
@@ -496,33 +509,6 @@ impl EtopoTiff
     }
   }
 
-  /*fn decode_row(&self, raw: &[u8], row_idx: usize, row_width: usize) -> anyhow::Result<Vec<i16>>
-  {
-    match self.sample_format
-    {
-      SampleFormat::Int16 =>
-      {
-        let row_bytes = row_width * 2;
-        let start = row_idx * row_bytes;
-        let end = start + row_bytes;
-        anyhow::ensure!(end <= raw.len(), "Row exceeds data ({} > {})", end, raw.len());
-        Ok(raw[start..end].chunks_exact(2).map(|b| self.endian.i16([b[0], b[1]])).collect())
-      }
-      SampleFormat::Float32 =>
-      {
-        let row_bytes = row_width * 4;
-        let start = row_idx * row_bytes;
-        let end = start + row_bytes;
-        anyhow::ensure!(end <= raw.len(), "Row exceeds data ({} > {})", end, raw.len());
-        Ok(
-          raw[start..end]
-            .chunks_exact(4)
-            .map(|b| self.endian.f32([b[0], b[1], b[2], b[3]]).round() as i16)
-            .collect(),
-        )
-      }
-    }
-  }*/
   fn decode_row(&self, raw: &[u8], row_idx: usize, row_width: usize) -> anyhow::Result<Vec<i16>>
   {
     let samples: Vec<i16> = match self.sample_format
@@ -547,11 +533,7 @@ impl EtopoTiff
     // If we find that 32767, print the FIRST 4 BYTES of the raw row data
     if samples.iter().any(|&s| s == 32767)
     {
-      println!(
-        "CRITICAL: Row {} contains 32767. Raw data start: {:02X?}",
-        row_idx,
-        &raw[0..4.min(raw.len())]
-      );
+      //logger.emit(LogLevel::Critical, &format!("Row {} contains 32767. Raw data start: {:02X?}",row_idx,&raw[0..4.min(raw.len())]));
     }
     Ok(samples)
   }
@@ -698,6 +680,7 @@ fn get_values(tags: &std::collections::HashMap<u16, TagValue>, tag: u16)
 }
 
 // Add this helper to turn IDs into names
+#[allow(dead_code)]
 fn get_tag_name(id: u16) -> &'static str
 {
   match id

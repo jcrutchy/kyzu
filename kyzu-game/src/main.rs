@@ -6,6 +6,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main()
 {
+  // 1. Load Configuration
   let config = match config::load()
   {
     Ok(c) => c,
@@ -16,16 +17,17 @@ fn main()
     }
   };
 
-  let logger = Logger::new(&config.app.log_filename);
+  // 2. Setup Logging
+  let mut logger = Logger::new(&config.app.log_filename);
 
+  // 3. Initialize BakeManager with Config and Run Bake
+  let bake_manager = BakeManager::new(&config);
+  bake_manager.start_bake(&mut logger);
+
+  // 4. Create App
   let mut app = App::new(config, logger);
 
-  let mut bake_manager = BakeManager::new();
-  bake_manager.start_bake();
-
-  // EXIT HERE for now if you only want to test the baking logic
-  std::process::exit(0);
-
+  // 5. Start Event Loop
   let event_loop = EventLoop::new().expect("Failed to create event loop");
   event_loop.set_control_flow(ControlFlow::Poll);
 

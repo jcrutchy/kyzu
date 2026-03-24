@@ -95,6 +95,7 @@ pub struct SharedState
   pub screen_width: u32,
   pub screen_height: u32,
   pub target_body_pos: glam::Vec3,
+  pub eye_world_f64: [f64; 3],
 }
 
 impl SharedState
@@ -122,7 +123,7 @@ impl SharedState
     let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
 
     Self {
-      mode: CameraMode::Free,
+      mode: CameraMode::Orbital,
       camera,
       camera_gpu,
       surface_format,
@@ -131,6 +132,7 @@ impl SharedState
       screen_width: width,
       screen_height: height,
       target_body_pos: glam::Vec3::ZERO,
+      eye_world_f64: [0.0; 3],
     }
   }
 }
