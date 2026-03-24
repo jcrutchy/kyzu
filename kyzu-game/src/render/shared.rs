@@ -14,7 +14,7 @@ pub struct CameraMatrices
 {
   pub view_proj: [[f32; 4]; 4],
   pub inv_view_proj: [[f32; 4]; 4],
-  pub eye_world: [f32; 3],
+  pub eye_rel: [f32; 3],
   pub _pad: f32,
 }
 
@@ -25,7 +25,7 @@ impl Default for CameraMatrices
     Self {
       view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
       inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-      eye_world: [0.0; 3],
+      eye_rel: [0.0; 3],
       _pad: 0.0,
     }
   }
@@ -94,8 +94,8 @@ pub struct SharedState
   pub depth_view: TextureView,
   pub screen_width: u32,
   pub screen_height: u32,
-  pub target_body_pos: glam::Vec3,
-  pub eye_world_f64: [f64; 3],
+  pub target_body_pos: glam::DVec3,
+  pub eye_world: glam::DVec3,
 }
 
 impl SharedState
@@ -131,8 +131,8 @@ impl SharedState
       depth_view,
       screen_width: width,
       screen_height: height,
-      target_body_pos: glam::Vec3::ZERO,
-      eye_world_f64: [0.0; 3],
+      target_body_pos: glam::DVec3::ZERO,
+      eye_world: glam::DVec3::new(0.0, 0.0, 5.0), // Start 5m back in f64
     }
   }
 }

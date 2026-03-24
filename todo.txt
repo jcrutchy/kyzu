@@ -1,20 +1,11 @@
-### `TODO.md`
-
 ## 🔴 High Priority: Precision & Math
-* [ ] **The "Eye-Relative" Transition:** Update `SharedState` and `CameraGpu` to store `eye_world` as `f64`.
-    * *Why:* At Earth scale ($6.37 \times 10^6$ meters), `f32` jitter will cause vertices to "shake" as you move.
-    * *Fix:* Pass `f64` eye to GPU; subtract `f64` eye from `f64` world-pos *before* casting to `f32` for the Projection matrix.
-* [ ] **Vertex Radius Scaling:** Ensure `BakedVertex` (which is currently a unit sphere $[-1, 1]$) is correctly scaled by the body's radius in the shader or the `PlanetModule`.
-* [ ] **Orbital Controller Precision:** Move `lat`, `lon`, and `altitude` in `orbital.rs` from `f32` to `f64`.
+* [ ] **Vertex Radius Scaling:** Ensure `BakedVertex` (currently a unit sphere $[-1, 1]$) is correctly scaled by the body's radius.
+    * *Note:* Next step is to multiply `model_mat` by the planet's radius ($6,371,000.0$) in `SolidModule::update`.
+* [ ] Refactor Mesh Topology: Move from Indexed to Non-Indexed triangles in the BakeManager.
+* [ ] Add Barycentric Attributes: Include f32x3 edge-distance data in BakedVertex.
+    * *Note:* Why: Allows for high-performance, scale-invariant wireframes and "hex-grid" overlays without expensive fragment derivatives.
 
 ## 🟡 Medium Priority: Refactoring & Safety
 * [ ] **Logger Performance:** Move file I/O to a buffered approach or a background thread.
-    * *Current:* Opens/closes `kyzu.log` on every `emit`. Fine for bakes, but will stutter during 60fps frame logging.
-* [ ] **Bake Handshake:** Add a check in `App::resumed` to verify the `.bake` file exists and is "fresh" before the `RenderModule` tries to load it (prevents `expect` panics).
-
-## 🟢 Low Priority: Cleanup & Housekeeping
-* [ ] **Delete Orphaned Files:**
-    * [ ] `render/camera/transition.rs` (Old duplicate of `orbital.rs`).
-    * [ ] `render/geometry.rs` (Hardcoded icosahedron superseded by bake pipeline).
-* [ ] **UI Sync:** Verify `egui_wgpu` initialization in `ui/mod.rs` matches current crate version APIs (RendererOptions).
-* [ ] **Documentation:** Add doc comments to `BakedVertex` to clarify that `pos` is "Unit Sphere Space" and not "World Space."
+* [ ] **Bake Handshake:** Add a check in `App::resumed` to verify `.bake` files exist (prevents `expect` panics).
+* [ ] **Floating Origin Verification:** Run a "long-distance test." Set altitude to $150,000,000,000.0$ (1 AU) and ensure the icosahedron still renders smoothly when zoomed in.

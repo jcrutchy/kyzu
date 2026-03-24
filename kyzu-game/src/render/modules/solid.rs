@@ -1,20 +1,23 @@
 use std::any::Any;
 use std::path::Path;
 
+use glam::{DVec3, Mat4};
 use wgpu::util::DeviceExt;
-use wgpu::{include_wgsl, Queue};
+use wgpu::{include_wgsl, BindGroup, Buffer, Queue};
 
 use crate::bake::geometry::BakedVertex;
-use crate::core::log::{LogLevel, Logger};
+use crate::core::log::Logger;
 use crate::render::module::{FrameTargets, RenderModule};
 use crate::render::shared::SharedState;
 
 pub struct SolidModule
 {
   pipeline: wgpu::RenderPipeline,
-  vertex_buffer: wgpu::Buffer,
-  index_buffer: wgpu::Buffer,
+  vertex_buffer: Buffer,
+  index_buffer: Buffer,
   index_count: u32,
+  model_buffer: Buffer,
+  model_bind_group: BindGroup,
 }
 
 impl SolidModule
@@ -23,51 +26,68 @@ impl SolidModule
     device: &wgpu::Device,
     shared: &SharedState,
     mesh_path: &Path,
-    logger: &mut Logger,
+    _logger: &mut Logger,
   ) -> Self
   {
     let shader = device.create_shader_module(include_wgsl!("../shaders/solid.wgsl"));
 
-    // 1. Load the small test icosahedron bake
-    let bake_data = std::fs::read(mesh_path).expect("Failed to load baked mesh from path.");
-
-    // 2. Extract counts (Header: 4 bytes v_count, 4 bytes i_count)
+    // 1. Load the mesh
+    let bake_data = std::fs::read(mesh_path).expect("Failed to load baked mesh.");
     let v_count = u32::from_le_bytes(bake_data[0..4].try_into().unwrap()) as usize;
     let vertex_size = std::mem::size_of::<BakedVertex>();
-
-    let vertex_data_start = 8; // After the two u32 counts
+    let vertex_data_start = 8;
     let vertex_data_end = vertex_data_start + (v_count * vertex_size);
 
-    // 3. Extract indices (Uint32 format)
     let vertices: &[BakedVertex] =
       bytemuck::cast_slice(&bake_data[vertex_data_start..vertex_data_end]);
     let indices: &[u32] = bytemuck::cast_slice(&bake_data[vertex_data_end..]);
     let i_count = indices.len();
 
-    let msg = format!("Loaded {} vertices from bake.", vertices.len());
-    logger.emit(LogLevel::Debug, &msg);
-
-    if let Some(v) = vertices.get(0)
-    {
-      logger.emit(LogLevel::Debug, &format!("First Vertex Position: {:?}", v.pos));
-    }
-
-    // 4. Create GPU Buffers
+    // 2. GPU Buffers (Geometry)
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-      label: Some("Solid Test Vertex Buffer"),
+      label: Some("Solid Vertex Buffer"),
       contents: bytemuck::cast_slice(vertices),
       usage: wgpu::BufferUsages::VERTEX,
     });
 
     let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-      label: Some("Solid Test Index Buffer"),
+      label: Some("Solid Index Buffer"),
       contents: bytemuck::cast_slice(indices),
       usage: wgpu::BufferUsages::INDEX,
     });
 
+    // 3. NEW: Model Matrix Buffer (Group 1)
+    let model_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+      label: Some("Solid Model Buffer"),
+      size: 64, // 16 * f32
+      usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+
+    let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label: Some("Solid Model BGL"),
+      entries: &[wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      }],
+    });
+
+    let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label: Some("Solid Model BG"),
+      layout: &model_layout,
+      entries: &[wgpu::BindGroupEntry { binding: 0, resource: model_buffer.as_entire_binding() }],
+    });
+
+    // 4. Pipeline Layout (Group 0: Camera, Group 1: Model)
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
       label: Some("Solid Pipeline Layout"),
-      bind_group_layouts: &[&shared.camera_gpu.layout],
+      bind_group_layouts: &[&shared.camera_gpu.layout, &model_layout],
       push_constant_ranges: &[],
     });
 
@@ -81,7 +101,6 @@ impl SolidModule
         buffers: &[wgpu::VertexBufferLayout {
           array_stride: vertex_size as u64,
           step_mode: wgpu::VertexStepMode::Vertex,
-          // We only pass location 0 (pos) to this specific shader
           attributes: &wgpu::vertex_attr_array![0 => Float32x3],
         }],
       },
@@ -112,13 +131,33 @@ impl SolidModule
       cache: None,
     });
 
-    Self { pipeline, vertex_buffer, index_buffer, index_count: i_count as u32 }
+    Self {
+      pipeline,
+      vertex_buffer,
+      index_buffer,
+      index_count: i_count as u32,
+      model_buffer,
+      model_bind_group,
+    }
   }
 }
 
 impl RenderModule for SolidModule
 {
-  fn update(&mut self, _queue: &Queue, _shared: &SharedState) {}
+  fn update(&mut self, queue: &Queue, shared: &SharedState)
+  {
+    // Assume the Icosahedron is at World (0,0,0)
+    let planet_pos_world = DVec3::ZERO;
+
+    // Calculate relative position (f64)
+    let relative_pos = planet_pos_world - shared.eye_world;
+
+    // Convert to f32 Model Matrix
+    let model_mat = Mat4::from_translation(relative_pos.as_vec3());
+
+    // Upload to GPU
+    queue.write_buffer(&self.model_buffer, 0, bytemuck::cast_slice(&model_mat.to_cols_array()));
+  }
 
   fn encode(&self, encoder: &mut wgpu::CommandEncoder, targets: &FrameTargets, shared: &SharedState)
   {
@@ -146,9 +185,8 @@ impl RenderModule for SolidModule
 
     render_pass.set_pipeline(&self.pipeline);
     render_pass.set_bind_group(0, &shared.camera_gpu.bind_group, &[]);
+    render_pass.set_bind_group(1, &self.model_bind_group, &[]); // MODEL GROUP
     render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-
-    // Critical: Using Uint32 to match the BakeManager output
     render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
     render_pass.draw_indexed(0..self.index_count, 0, 0..1);

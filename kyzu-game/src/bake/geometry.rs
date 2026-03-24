@@ -7,8 +7,12 @@ use glam::Vec3;
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct BakedVertex
 {
+  /// Position in Unit Sphere Space (normalized vector from center).
+  /// To get World Space coordinates, multiply this by the planet's radius.
   pub pos: [f32; 3],
+  /// Normalized surface normal.
   pub normal: [f32; 3],
+  /// UV coordinates for texture mapping (0.0 to 1.0).
   pub uv: [f32; 2],
   pub height: f32, // Elevation in metres (from ETOPO)
   pub hex_id: u32, // The ID of the hex cell this vertex belongs to

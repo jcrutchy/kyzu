@@ -1,8 +1,9 @@
-use glam::{DVec3, EulerRot, Mat4, Quat, Vec3};
+use glam::{DVec3, EulerRot, Quat, Vec3};
 use winit::keyboard::KeyCode;
 
 use super::CameraController;
-use crate::render::shared::CameraMatrices;
+use crate::input::state::InputState;
+use crate::render::shared::SharedState;
 
 pub struct FreeController
 {
@@ -35,38 +36,14 @@ impl Default for FreeController
 
 impl CameraController for FreeController
 {
-  fn update_matrices(&self, matrices: &mut CameraMatrices, aspect: f32)
+  fn update(&mut self, shared: &mut SharedState, input: &InputState, dt: f32)
   {
-    let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
-    // Use DMat4 for the view calculation
-    let view = glam::DMat4::from_rotation_translation(rotation.as_dquat(), self.position).inverse();
-    let proj = Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
-
-    // Cast back to f32 for the final Uniform Buffer
-    let view_proj = proj * view.as_mat4();
-
-    matrices.view_proj = view_proj.to_cols_array_2d();
-    matrices.inv_view_proj = view_proj.inverse().to_cols_array_2d();
-    matrices.eye_world = self.position.as_vec3().to_array(); // Cast for GPU
-  }
-  fn get_eye_f64(&self) -> [f64; 3]
-  {
-    self.position.to_array()
-  }
-}
-
-impl FreeController
-{
-  pub fn handle_input(&mut self, input: &crate::input::state::InputState, dt: f32)
-  {
-    // 1. Rotation: Use the delta from your InputState
-    // We multiply by a small factor because raw pixel deltas are large
+    // --- 1. HANDLE INPUT (Rotation) ---
     self.yaw -= input.mouse_delta.x * self.sensitivity * 0.1;
     self.pitch -= input.mouse_delta.y * self.sensitivity * 0.1;
-
     self.pitch = self.pitch.clamp(-1.5, 1.5);
 
-    // 2. Movement
+    // --- 2. HANDLE INPUT (Movement) ---
     let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
     let forward = rotation * -Vec3::Z;
     let right = rotation * Vec3::X;
@@ -89,16 +66,36 @@ impl FreeController
       move_dir -= right;
     }
 
-    // 3. Speed Boost with Scroll
-    // In space, you often need to change speed scales
+    // Speed Adjustment
     if input.scroll_delta != 0.0
     {
       self.speed = (self.speed + input.scroll_delta).max(0.1);
     }
 
+    // Apply movement to the HIGH-PRECISION position
     if move_dir.length_squared() > 0.0
     {
-      self.position += move_dir.as_dvec3() * (self.speed as f64) * (dt as f64);
+      // We normalize so diagonal movement isn't faster
+      let move_norm = move_dir.normalize();
+      self.position += move_norm.as_dvec3() * (self.speed as f64) * (dt as f64);
     }
+
+    // --- 3. FLOATING ORIGIN MATRICES ---
+
+    // Update the CPU "Source of Truth"
+    shared.eye_world = self.position;
+
+    // In Floating Origin, the view matrix for a Free camera
+    // has NO translation (we are at 0,0,0), only the inverse rotation!
+    let view_rel = glam::DMat4::from_quat(rotation.as_dquat()).inverse();
+
+    let aspect = shared.screen_width as f32 / shared.screen_height as f32;
+    let proj = glam::Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
+
+    let view_proj = proj * view_rel.as_mat4();
+
+    shared.camera.view_proj = view_proj.to_cols_array_2d();
+    shared.camera.inv_view_proj = view_proj.inverse().to_cols_array_2d(); // Good for raycasting!
+    shared.camera.eye_rel = [0.0, 0.0, 0.0];
   }
 }
