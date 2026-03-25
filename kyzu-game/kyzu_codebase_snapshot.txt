@@ -1,0 +1,3271 @@
+﻿--- PROJECT STRUCTURE ---
+@{Path=.\src}
+@{Path=.\Cargo.toml}
+@{Path=.\engine.log}
+@{Path=.\kyzu_codebase_snapshot.txt}
+@{Path=.\snapshot_codebase.bat}
+@{Path=.\snapshot_codebase.ps1}
+@{Path=.\src\bake}
+@{Path=.\src\core}
+@{Path=.\src\input}
+@{Path=.\src\render}
+@{Path=.\src\ui}
+@{Path=.\src\world}
+@{Path=.\src\app.rs}
+@{Path=.\src\lib.rs}
+@{Path=.\src\main.rs}
+@{Path=.\src\bake\biome.rs}
+@{Path=.\src\bake\chunk_writer.rs}
+@{Path=.\src\bake\geometry.rs}
+@{Path=.\src\bake\heightmap.rs}
+@{Path=.\src\bake\icosahedron.rs}
+@{Path=.\src\bake\mod.rs}
+@{Path=.\src\bake\pipeline.rs}
+@{Path=.\src\bake\registry.rs}
+@{Path=.\src\bake\subdivider.rs}
+@{Path=.\src\bake\tiff_reader.rs}
+@{Path=.\src\core\config.rs}
+@{Path=.\src\core\error.rs}
+@{Path=.\src\core\log.rs}
+@{Path=.\src\core\math.rs}
+@{Path=.\src\core\mod.rs}
+@{Path=.\src\core\time.rs}
+@{Path=.\src\core\types.rs}
+@{Path=.\src\input\binding.rs}
+@{Path=.\src\input\mod.rs}
+@{Path=.\src\input\state.rs}
+@{Path=.\src\render\camera}
+@{Path=.\src\render\modules}
+@{Path=.\src\render\shaders}
+@{Path=.\src\render\depth.rs}
+@{Path=.\src\render\frame.rs}
+@{Path=.\src\render\kernel.rs}
+@{Path=.\src\render\mod.rs}
+@{Path=.\src\render\module.rs}
+@{Path=.\src\render\shared.rs}
+@{Path=.\src\render\camera\free.rs}
+@{Path=.\src\render\camera\mod.rs}
+@{Path=.\src\render\camera\orbital.rs}
+@{Path=.\src\render\modules\atmosphere.rs}
+@{Path=.\src\render\modules\mod.rs}
+@{Path=.\src\render\modules\orbit.rs}
+@{Path=.\src\render\modules\solid.rs}
+@{Path=.\src\render\modules\terrain.rs}
+@{Path=.\src\render\shaders\solid.wgsl}
+@{Path=.\src\ui\log_panel.rs}
+@{Path=.\src\ui\menu.rs}
+@{Path=.\src\ui\mod.rs}
+@{Path=.\src\ui\overlay.rs}
+@{Path=.\src\world\body.rs}
+@{Path=.\src\world\chunk_reader.rs}
+@{Path=.\src\world\hex.rs}
+@{Path=.\src\world\manifest_loader.rs}
+@{Path=.\src\world\mod.rs}
+@{Path=.\src\world\registry.rs}
+
+--- FILE: ./Cargo.toml ---
+[package]
+name = "kyzu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = { version = "0.32", features = ["serde"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+thiserror = "2.0"
+wgpu = "=27.0.1"
+winit = "0.30"
+egui = { version = "0.33", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.33", default-features = false, features = ["clipboard"] }
+egui-wgpu = { version = "0.33", default-features = false }
+anyhow = "1.0.102"
+flate2 = "1"
+bincode = "1.3"
+
+--- FILE: .\src\app.rs ---
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event_loop::ActiveEventLoop;
+use winit::window::{Window, WindowId};
+
+use crate::core::config::KyzuConfig;
+use crate::core::log::{LogLevel, Logger};
+use crate::core::time::TimeState;
+use crate::input::state::InputState;
+use crate::render::kernel::Renderer;
+use crate::render::modules::solid::SolidModule;
+use crate::world::body;
+
+pub struct App
+{
+  pub config: KyzuConfig,
+  pub logger: Logger,
+  pub input: InputState,
+  pub time: TimeState,
+  pub window: Option<Arc<Window>>,
+  pub renderer: Option<Renderer>,
+  pub pending_manifests: Vec<body::BodyManifest>,
+}
+
+impl App
+{
+  pub fn new(
+      config: KyzuConfig,
+      logger: Logger,
+      manifests: Vec<crate::world::body::BodyManifest>,
+  ) -> Self
+  {
+      Self {
+          config,
+          logger,
+          input: InputState::new(),
+          time: TimeState::new(),
+          window: None,
+          renderer: None,
+          pending_manifests: manifests,
+      }
+  }
+}
+
+impl ApplicationHandler for App
+{
+  fn resumed(&mut self, event_loop: &ActiveEventLoop)
+  {
+    if self.window.is_none()
+    {
+      let window_attributes = Window::default_attributes().with_title("Kyzu").with_inner_size(
+        winit::dpi::LogicalSize::new(self.config.app.window_width, self.config.app.window_height),
+      );
+
+      let window =
+        Arc::new(event_loop.create_window(window_attributes).expect("Failed to create window"));
+
+      let mut renderer = pollster::block_on(Renderer::new(window.clone()))
+        .expect("Failed to initialize GPU Renderer");
+
+      // --- Framework Logic: Add modules based on config ---
+
+      // Resolve the test mesh path: [data_dir] / [test_mesh]
+      let test_mesh_path =
+        PathBuf::from(&self.config.app.data_dir).join(&self.config.app.test_mesh);
+
+      let manifests = std::mem::take(&mut self.pending_manifests);
+      for manifest in manifests
+      {
+          let name = manifest.name.clone();
+          let kind = format!("{:?}", manifest.kind);
+          renderer.shared.body_registry.spawn(manifest, false);
+          self.logger.emit(LogLevel::Info, &format!("Spawned body: {} ({})", name, kind));
+      }
+
+      // Only load the SolidModule if the file actually exists (our "Test Mode" check)
+      if test_mesh_path.exists()
+      {
+        let solid_mod =
+          SolidModule::new(&renderer.device, &renderer.shared, &test_mesh_path, &mut self.logger);
+        renderer.add_module(solid_mod);
+        self.logger.emit(LogLevel::Info, "Test SolidModule loaded.");
+      }
+
+      // TODO: Later, we will loop through self.config.world and add PlanetModules here
+
+      // --- Finalize Renderer Setup ---
+      renderer.camera_system.update(&mut renderer.shared, &mut self.input, 0.016);
+      renderer.shared.camera_gpu.upload(&renderer.queue, &renderer.shared.camera);
+
+      self.renderer = Some(renderer);
+      self.window = Some(window);
+      if let Some(renderer) = &self.renderer
+      {
+        let mode_msg = format!("Initial Camera Mode: {:?}", renderer.shared.mode);
+        self.logger.emit(LogLevel::Info, &mode_msg);
+      }
+      self.logger.emit(LogLevel::Info, "Kyzu Engine Initialized (Modular Architecture)");
+    }
+  }
+
+  fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent)
+  {
+    self.input.process_event(&event);
+
+    match event
+    {
+      WindowEvent::CloseRequested =>
+      {
+        self.logger.emit(LogLevel::Info, "Exit requested.");
+        self.renderer = None;
+        event_loop.exit();
+      }
+
+      WindowEvent::KeyboardInput {
+        event: KeyEvent { logical_key: key, state: ElementState::Pressed, .. },
+        ..
+      } =>
+      {
+        use winit::keyboard::{Key, NamedKey};
+
+        match key
+        {
+          // Handle Escape (Exit)
+          Key::Named(NamedKey::Escape) =>
+          {
+            self.logger.emit(LogLevel::Info, "Exit requested via Escape.");
+            self.renderer = None;
+            event_loop.exit();
+          }
+
+          // Handle Tab (Camera Toggle)
+          Key::Named(NamedKey::Tab) =>
+          {
+            if let Some(renderer) = &mut self.renderer
+            {
+              use crate::render::shared::CameraMode;
+              renderer.shared.mode = match renderer.shared.mode
+              {
+                CameraMode::Free => CameraMode::Orbital,
+                CameraMode::Orbital => CameraMode::Free,
+              };
+              self.logger.emit(LogLevel::Info, &format!("Camera Mode: {:?}", renderer.shared.mode));
+            }
+          }
+
+          _ => (),
+        }
+      }
+
+      WindowEvent::Resized(physical_size) =>
+      {
+        if let Some(renderer) = &mut self.renderer
+        {
+          renderer.resize(Some(physical_size));
+        }
+      }
+
+      WindowEvent::RedrawRequested =>
+      {
+        self.time.update();
+        let dt = self.time.delta_f32;
+
+        if let Some(renderer) = &mut self.renderer
+        {
+          if let Err(e) = renderer.update(&mut self.input, dt)
+          {
+            eprintln!("Update error: {:?}", e);
+          }
+
+          if let Err(e) = renderer.render()
+          {
+            let err_str = format!("{:?}", e);
+            if !err_str.contains("reconfigured")
+            {
+              eprintln!("Render error: {}", err_str);
+            }
+          }
+        }
+
+        self.input.tick();
+
+        if let Some(window) = &self.window
+        {
+          window.request_redraw();
+        }
+      }
+
+      _ => (),
+    }
+  }
+
+  fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop)
+  {
+    if let Some(window) = &self.window
+    {
+      window.request_redraw();
+    }
+  }
+}
+
+--- FILE: .\src\lib.rs ---
+pub mod app;
+pub mod bake;
+pub mod core;
+pub mod input;
+pub mod render;
+pub mod ui;
+pub mod world;
+
+--- FILE: .\src\main.rs ---
+use kyzu::app::App;
+use kyzu::bake::BakeManager;
+use kyzu::core::config;
+use kyzu::core::log::{LogLevel, Logger};
+use kyzu::world::manifest_loader::load_all_manifests;
+use winit::event_loop::{ControlFlow, EventLoop};
+
+fn main()
+{
+  let args: Vec<String> = std::env::args().collect();
+
+  // 1. Load configuration
+  let config = match config::load()
+  {
+    Ok(c) => c,
+    Err(e) =>
+    {
+      eprintln!("[FATAL] Configuration Error: {}", e);
+      std::process::exit(1);
+    }
+  };
+
+  let mut logger = Logger::new(&config.app.log_filename);
+
+  // 2. Run bake if requested
+  let bake_manager = BakeManager::new(&config);
+  if args.contains(&"--bake".to_string())
+  {
+    logger.emit(LogLevel::Info, "Baking sol_system world data...");
+    bake_manager.start_bake(&mut logger);
+  }
+
+  // 3. Load manifests from disk â€” always, regardless of --bake.
+  //    The bake is an offline step; we expect manifests to already exist.
+  //    Individual load failures are logged and skipped; game still starts.
+  let manifests = match load_all_manifests(&bake_manager.output_root, &mut logger)
+  {
+    Ok(m) => m,
+    Err(e) =>
+    {
+      logger.emit(LogLevel::Error, &format!("Manifest load failed: {}", e));
+      Vec::new()
+    }
+  };
+
+  // 4. Create app â€” manifests are moved into SharedState when the renderer
+  //    initialises inside resumed().
+  let mut app = App::new(config, logger, manifests);
+
+  // 5. Run event loop
+  let event_loop = EventLoop::new().expect("Failed to create event loop");
+  event_loop.set_control_flow(ControlFlow::Poll);
+
+  if let Err(e) = event_loop.run_app(&mut app)
+  {
+    app.logger.emit(LogLevel::Info, &format!("Application error: {}", e));
+  }
+}
+
+--- FILE: .\src\bake\biome.rs ---
+
+--- FILE: .\src\bake\chunk_writer.rs ---
+
+--- FILE: .\src\bake\geometry.rs ---
+use std::f32::consts::PI;
+
+use bytemuck::{Pod, Zeroable};
+use glam::Vec3;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BakedVertex
+{
+  /// Position in Unit Sphere Space (normalized vector from center).
+  /// To get World Space coordinates, multiply this by the planet's radius.
+  pub pos: [f32; 3],
+  /// Normalized surface normal.
+  pub normal: [f32; 3],
+  /// UV coordinates for texture mapping (0.0 to 1.0).
+  pub uv: [f32; 2],
+  pub height: f32, // Elevation in metres (from ETOPO)
+  pub hex_id: u32, // The ID of the hex cell this vertex belongs to
+  pub barycentric: [f32; 3],
+}
+
+pub struct SphericalMapper;
+
+impl SphericalMapper
+{
+  /// Maps a unit vector to (u, v) [0, 1] for sampling TIFFs/Images
+  /// Assumes +Y is the North Pole
+  pub fn vector_to_uv(v: Vec3) -> [f32; 2]
+  {
+    // Latitude: -PI/2 to PI/2 (Y is vertical)
+    let lat = v.y.asin();
+    // Longitude: -PI to PI
+    let lon = v.z.atan2(v.x);
+
+    // Normalize to [0, 1] for TIFF sampling
+    // U = 0.5 at Lon 0, V = 0 at North Pole (+Y), V = 1 at South Pole (-Y)
+    let u = (lon + PI) / (2.0 * PI);
+    let v_coord = (PI / 2.0 - lat) / PI;
+
+    [u, v_coord]
+  }
+}
+
+pub fn get_base_icosahedron() -> (Vec<BakedVertex>, Vec<u16>)
+{
+  let phi = (1.0 + 5.0f32.sqrt()) / 2.0;
+
+  // Seed vertices (normalized to radius 1.0)
+  let raw_verts: [Vec3; 12] = [
+    Vec3::new(-1.0, phi, 0.0).normalize(),
+    Vec3::new(1.0, phi, 0.0).normalize(),
+    Vec3::new(-1.0, -phi, 0.0).normalize(),
+    Vec3::new(1.0, -phi, 0.0).normalize(),
+    Vec3::new(0.0, -1.0, phi).normalize(),
+    Vec3::new(0.0, 1.0, phi).normalize(),
+    Vec3::new(0.0, -1.0, -phi).normalize(),
+    Vec3::new(0.0, 1.0, -phi).normalize(),
+    Vec3::new(phi, 0.0, -1.0).normalize(),
+    Vec3::new(phi, 0.0, 1.0).normalize(),
+    Vec3::new(-phi, 0.0, -1.0).normalize(),
+    Vec3::new(-phi, 0.0, 1.0).normalize(),
+  ];
+
+  let mut vertices = Vec::with_capacity(12);
+  for v in raw_verts
+  {
+    let uv = SphericalMapper::vector_to_uv(v);
+
+    vertices.push(BakedVertex {
+      pos: v.to_array(),
+      normal: v.to_array(),
+      uv,
+      height: 0.0, // This will be sampled from the TIFF later
+      hex_id: 0,
+      barycentric: [0.0, 0.0, 0.0],
+    });
+  }
+
+  let indices = vec![
+    0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7, 1,
+    8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9, 8, 1,
+  ];
+
+  (vertices, indices)
+}
+
+--- FILE: .\src\bake\heightmap.rs ---
+
+--- FILE: .\src\bake\icosahedron.rs ---
+
+--- FILE: .\src\bake\mod.rs ---
+pub mod geometry;
+pub mod registry;
+pub mod subdivider;
+pub mod tiff_reader;
+
+use std::fs;
+use std::path::PathBuf;
+
+use crate::bake::registry::{load_bodies, BodyConfig};
+use crate::bake::subdivider::Subdivider;
+use crate::bake::tiff_reader::EtopoTiff;
+use crate::core::config::KyzuConfig;
+use crate::core::log::{LogLevel, Logger};
+use crate::world::body::BodyManifest;
+
+pub struct BakeManager
+{
+  /// Root data directory from AppConfig
+  pub data_dir: PathBuf,
+  /// Path to the specific world folder (e.g., .../worlds/sol_system/)
+  pub world_root: PathBuf,
+  /// Path to the baked output folder for the active world
+  pub output_root: PathBuf,
+  /// Path to global primitives (like the test icosahedron)
+  pub primitives_root: PathBuf,
+  /// Source assets path (remains relative to data_dir for now)
+  pub source_assets: PathBuf,
+}
+
+impl BakeManager
+{
+  pub fn new(config: &KyzuConfig) -> Self
+  {
+    let data_dir = PathBuf::from(&config.app.data_dir);
+
+    let world_root = data_dir.join(&config.app.worlds_subdir).join(&config.app.selected_world);
+
+    let output_root = world_root.join(&config.world.baked_subdir);
+    let source_assets = world_root.join(&config.world.assets_subdir);
+
+    // Derive primitives folder from the test_mesh path in config
+    let test_mesh_path = PathBuf::from(&config.app.test_mesh);
+    let primitives_root =
+      data_dir.join(test_mesh_path.parent().unwrap_or(&PathBuf::from("primitives")));
+
+    Self { data_dir, world_root, output_root, primitives_root, source_assets }
+  }
+
+  pub fn start_bake(&self, logger: &mut Logger)
+  {
+    logger.emit(LogLevel::Info, "Starting system-wide bake...");
+    let _ = fs::create_dir_all(&self.output_root);
+    let _ = fs::create_dir_all(&self.primitives_root);
+
+    if let Err(e) = self.cook_all(logger)
+    {
+      logger.emit(LogLevel::Error, &format!("Bake failed: {}", e));
+    }
+  }
+
+  fn cook_all(&self, logger: &mut Logger) -> anyhow::Result<()>
+  {
+    // 1. Bake the reference icosahedron to the primitives directory
+    let (v_raw, i_raw) = geometry::get_base_icosahedron();
+    let base_indices: Vec<u32> = i_raw.into_iter().map(|i| i as u32).collect();
+
+    let iso_path = self.primitives_root.join("icosahedron.bake");
+    self.save_bake_to_disk(iso_path.to_str().unwrap(), &v_raw, &base_indices)?;
+    logger.emit(LogLevel::Info, &format!("Baked Reference Icosahedron to {:?}", iso_path));
+
+    // 2. Load the bodies registry relative to the world root
+    let registry_path = self.world_root.join("bodies.json");
+    let registry = load_bodies(&registry_path)?;
+
+    for body in &registry.bodies
+    {
+      self.cook_body(body, logger)?;
+    }
+    Ok(())
+  }
+
+  fn cook_body(&self, body: &BodyConfig, logger: &mut Logger) -> anyhow::Result<()>
+  {
+    logger.emit(LogLevel::Info, &format!("Baking Body: {}", body.name));
+
+    let mut tiff_reader = None;
+    if body.use_real_data && body.elevation_map_path.is_some()
+    {
+      let filename = body.elevation_map_path.as_ref().unwrap();
+      let tiff_path = self.source_assets.join(body.name.to_lowercase()).join(filename);
+      tiff_reader = Some(EtopoTiff::open(&tiff_path, logger)?);
+    }
+
+    // 1. Initial Geometry
+    let (mut vertices, indices) = geometry::get_base_icosahedron();
+    let mut indices: Vec<u32> = indices.into_iter().map(|i| i as u32).collect();
+
+    // 2. Subdivide (Indexed Mode - efficient for math)
+    let mut subdivider = Subdivider::new(tiff_reader.as_mut());
+    let lod_level = 3; // Start here, move to 7 or 8 once TIFF is cached
+
+    logger.emit(LogLevel::Info, &format!("Subdividing to Level {}...", lod_level));
+
+    for _ in 0..lod_level
+    {
+      let mut next_indices = Vec::with_capacity(indices.len() * 4);
+      for chunk in indices.chunks(3)
+      {
+        let (v1, v2, v3) = (chunk[0], chunk[1], chunk[2]);
+
+        let a = subdivider.get_midpoint(v1, v2, &mut vertices);
+        let b = subdivider.get_midpoint(v2, v3, &mut vertices);
+        let c = subdivider.get_midpoint(v3, v1, &mut vertices);
+
+        next_indices.extend_from_slice(&[v1, a, c]);
+        next_indices.extend_from_slice(&[v2, b, a]);
+        next_indices.extend_from_slice(&[v3, c, b]);
+        next_indices.extend_from_slice(&[a, b, c]);
+      }
+      indices = next_indices;
+    }
+
+    // 3. Unweld & Assign Barycentrics (Non-Indexed Mode)
+    // This allows for the "Kyzu" wireframe look by giving each triangle unique vertices.
+    logger.emit(LogLevel::Info, "Unwelding vertices for barycentric wireframes...");
+    let mut flat_vertices = Vec::with_capacity(indices.len());
+
+    for (i, &idx) in indices.iter().enumerate()
+    {
+      let mut v = vertices[idx as usize].clone();
+
+      // Assign [1,0,0], [0,1,0], or [0,0,1] based on the corner of the triangle
+      let corner = i % 3;
+      v.barycentric = match corner
+      {
+        0 => [1.0, 0.0, 0.0],
+        1 => [0.0, 1.0, 0.0],
+        _ => [0.0, 0.0, 1.0],
+      };
+
+      flat_vertices.push(v);
+    }
+
+    // 4. Save to Disk
+    let file_name = format!("{}.bake", body.name.to_lowercase());
+    let output_path = self.output_root.join(file_name);
+
+    // Note: We pass an empty slice for indices because the mesh is now non-indexed
+    self.save_bake_to_disk(output_path.to_str().unwrap(), &flat_vertices, &[])?;
+
+    self.write_manifest(body, logger)?;
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("[DONE] Baked {} ({} triangles)", body.name, flat_vertices.len() / 3),
+    );
+
+    Ok(())
+  }
+
+  fn save_bake_to_disk(
+    &self,
+    path: &str,
+    vertices: &[geometry::BakedVertex],
+    indices: &[u32],
+  ) -> anyhow::Result<()>
+  {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Header: Vertex Count
+    writer.write_all(&(vertices.len() as u32).to_le_bytes())?;
+    // Vertex Data
+    writer.write_all(bytemuck::cast_slice(vertices))?;
+    // Index Count
+    writer.write_all(&(indices.len() as u32).to_le_bytes())?;
+    // Index Data
+    writer.write_all(bytemuck::cast_slice(indices))?;
+
+    writer.flush()?;
+    Ok(())
+  }
+
+  fn write_manifest(&self, body: &BodyConfig, logger: &mut Logger) -> anyhow::Result<()>
+  {
+      let manifest = BodyManifest::from_config(body);
+
+      let path = self.output_root.join(format!("{}.manifest", body.name.to_lowercase()));
+
+      let bytes = bincode::serialize(&manifest)
+          .map_err(|e| anyhow::anyhow!("Failed to serialise manifest for {}: {}", body.name, e))?;
+
+      std::fs::write(&path, &bytes)?;
+
+      logger.emit(
+          LogLevel::Info,
+          &format!(
+              "Wrote manifest: {} ({:?}, radius {:.0}km, lod_max {})",
+              path.display(),
+              manifest.kind,
+              manifest.radius_m / 1000.0,
+              manifest.lod_max,
+          ),
+      );
+
+      Ok(())
+  }
+}
+
+--- FILE: .\src\bake\pipeline.rs ---
+use std::fs;
+use std::io::Write;
+use crate::bake::geometry;
+use crate::bake::EngineConfig;
+
+pub fn run_core_bake(config: EngineConfig) -> std::io::Result<()> 
+{
+  // Ensure directories exist
+  fs::create_dir_all(&config.asset_path)?;
+  fs::create_dir_all(&config.data_path)?;
+
+  // 1. Generate the base icosahedron
+  let (vertices, indices) = geometry::generate_icosahedron();
+
+  // 2. Prepare the file path (universal asset)
+  let mut path = std::path::PathBuf::from(config.asset_path);
+  path.push("icosahedron.bake");
+
+  // 3. Write binary data
+  let mut file = fs::File::create(path)?;
+  
+  // Header: vertex count, index count
+  file.write_all(bytemuck::bytes_of(&(vertices.len() as u32)))?;
+  file.write_all(bytemuck::bytes_of(&(indices.len() as u32)))?;
+  
+  // Data
+  file.write_all(bytemuck::cast_slice(&vertices))?;
+  file.write_all(bytemuck::cast_slice(&indices))?;
+
+  println!("Bake Pipeline: Icosahedron saved to assets/");
+  Ok(())
+}
+
+--- FILE: .\src\bake\registry.rs ---
+use std::fs;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyConfig
+{
+  pub name: String,
+  #[serde(default)] pub parent: Option<String>,
+  pub radius_km: f32,
+  pub orbit_radius_km: f32,
+  #[serde(default)] pub orbital_eccentricity: f32,
+  #[serde(default)] pub orbital_inclination_deg: f32,
+  #[serde(default)] pub start_angle_rad: f32,
+  #[serde(default)] pub axial_tilt_deg: f32,
+  pub rotation_period_hours: f32,
+  pub color: [f32; 4],
+  pub lod_max: u8,
+  pub target_res_km: f32,
+  pub is_star: bool,
+  #[serde(default)] pub has_atmosphere: bool,
+  #[serde(default)] pub use_real_data: bool,
+  #[serde(default)] pub elevation_map_path: Option<String>,
+  #[serde(default)] pub land_cover_map_path: Option<String>,
+  #[serde(default)] pub climate_data_path: Option<String>,
+  #[serde(default)] pub water_mask_path: Option<String>,
+  #[serde(default)] pub calc_slopes: bool,
+  #[serde(default)] pub calc_flow_directions: bool,
+  #[serde(default)] pub generate_roughness: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyRegistry
+{
+  pub bodies: Vec<BodyConfig>,
+}
+
+pub fn load_bodies(path: &PathBuf) -> anyhow::Result<BodyRegistry>
+{
+  let content = fs::read_to_string(path)?;
+  let registry: BodyRegistry = serde_json::from_str(&content)?;
+  Ok(registry)
+}
+
+--- FILE: .\src\bake\subdivider.rs ---
+use std::collections::HashMap;
+
+use glam::Vec3;
+
+use crate::bake::geometry::{BakedVertex, SphericalMapper};
+use crate::bake::tiff_reader::EtopoTiff;
+
+pub struct Subdivider<'a>
+{
+  pub tiff: Option<&'a mut EtopoTiff>,
+  pub midpoint_cache: HashMap<(u32, u32), u32>,
+}
+
+impl<'a> Subdivider<'a>
+{
+  pub fn new(tiff: Option<&'a mut EtopoTiff>) -> Self
+  {
+    Self { tiff, midpoint_cache: HashMap::new() }
+  }
+
+  /// Finds or creates a midpoint between two vertices and samples elevation from the TIFF
+  pub fn get_midpoint(&mut self, v1_idx: u32, v2_idx: u32, vertices: &mut Vec<BakedVertex>) -> u32
+  {
+    // Ensure the key is consistent regardless of order (v1,v2 vs v2,v1)
+    let key = if v1_idx < v2_idx { (v1_idx, v2_idx) } else { (v2_idx, v1_idx) };
+
+    if let Some(&index) = self.midpoint_cache.get(&key)
+    {
+      return index;
+    }
+
+    // 1. Calculate 3D position on a unit sphere
+    let p1 = Vec3::from_array(vertices[v1_idx as usize].pos);
+    let p2 = Vec3::from_array(vertices[v2_idx as usize].pos);
+    let new_pos = (p1 + p2).normalize();
+
+    // 2. Map 3D vector to UV [0.0 - 1.0]
+    let uv = SphericalMapper::vector_to_uv(new_pos);
+    let mut height = 0.0;
+
+    // 3. Sample from TIFF using the reader's cache
+    if let Some(reader) = &mut self.tiff
+    {
+      // Convert UV to Pixel Coordinates with Clamping
+      let px = (uv[0] * (reader.width as f32 - 1.0)).clamp(0.0, reader.width as f32 - 1.0) as usize;
+      let py =
+        (uv[1] * (reader.height as f32 - 1.0)).clamp(0.0, reader.height as f32 - 1.0) as usize;
+
+      // Use the cached sampler
+      // Note: We treat -32768 (NOAA NoData) as 0.0m (Sea Level)
+      let raw_sample = reader.get_sample(px, py);
+      height = if raw_sample == -32768 { 0.0 } else { raw_sample as f32 };
+    }
+
+    // 4. Create and store the new vertex
+    let new_idx = vertices.len() as u32;
+    vertices.push(BakedVertex {
+      pos: new_pos.to_array(),
+      normal: new_pos.to_array(),
+      uv,
+      height,
+      hex_id: 0,
+      barycentric: [0.0, 0.0, 0.0],
+    });
+
+    self.midpoint_cache.insert(key, new_idx);
+    new_idx
+  }
+}
+
+--- FILE: .\src\bake\tiff_reader.rs ---
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//   Minimal GeoTIFF reader for ETOPO elevation data
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use flate2::read::ZlibDecoder;
+
+use crate::core::log::{LogLevel, Logger};
+
+const TAG_IMAGE_WIDTH: u16 = 256;
+const TAG_IMAGE_LENGTH: u16 = 257;
+const TAG_BITS_PER_SAMPLE: u16 = 258;
+const TAG_COMPRESSION: u16 = 259;
+const TAG_SAMPLE_FORMAT: u16 = 339;
+const TAG_ROWS_PER_STRIP: u16 = 278;
+const TAG_STRIP_OFFSETS: u16 = 273;
+const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TAG_TILE_WIDTH: u16 = 322;
+const TAG_TILE_LENGTH: u16 = 323;
+const TAG_TILE_OFFSETS: u16 = 324;
+const TAG_TILE_BYTE_COUNTS: u16 = 325;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Endian
+{
+  Little,
+  Big,
+}
+
+impl Endian
+{
+  fn u16(self, b: [u8; 2]) -> u16
+  {
+    match self
+    {
+      Self::Little => u16::from_le_bytes(b),
+      Self::Big => u16::from_be_bytes(b),
+    }
+  }
+  fn u32(self, b: [u8; 4]) -> u32
+  {
+    match self
+    {
+      Self::Little => u32::from_le_bytes(b),
+      Self::Big => u32::from_be_bytes(b),
+    }
+  }
+  fn u64(self, b: [u8; 8]) -> u64
+  {
+    match self
+    {
+      Self::Little => u64::from_le_bytes(b),
+      Self::Big => u64::from_be_bytes(b),
+    }
+  }
+  fn i16(self, b: [u8; 2]) -> i16
+  {
+    match self
+    {
+      Self::Little => i16::from_le_bytes(b),
+      Self::Big => i16::from_be_bytes(b),
+    }
+  }
+  fn f32(self, b: [u8; 4]) -> f32
+  {
+    f32::from_bits(match self
+    {
+      Self::Little => u32::from_le_bytes(b),
+      Self::Big => u32::from_be_bytes(b),
+    })
+  }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SampleFormat
+{
+  Int16,
+  Float32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Compression
+{
+  None,
+  Deflate,
+}
+
+enum Layout
+{
+  Stripped
+  {
+    rows_per_strip: usize, offsets: Vec<u64>, byte_counts: Vec<u64>
+  },
+  Tiled
+  {
+    tile_width: usize, tile_height: usize, offsets: Vec<u64>, byte_counts: Vec<u64>
+  },
+}
+
+struct TagValue
+{
+  #[allow(dead_code)]
+  count: u64,
+  values: Vec<u64>,
+}
+
+pub struct EtopoTiff
+{
+  pub width: usize,
+  pub height: usize,
+  endian: Endian,
+  sample_format: SampleFormat,
+  compression: Compression,
+  layout: Layout,
+  pub path: std::path::PathBuf,
+  pub row_cache: HashMap<usize, Vec<i16>>,
+  reader: BufReader<File>,
+}
+
+impl EtopoTiff
+{
+  pub fn open(path: &Path, logger: &mut Logger) -> anyhow::Result<Self>
+  {
+    let file = File::open(path)?;
+    let mut r = BufReader::new(file);
+
+    let mut hdr = [0u8; 4];
+    r.read_exact(&mut hdr)?;
+    let endian = match &hdr[0..2]
+    {
+      b"II" => Endian::Little,
+      b"MM" => Endian::Big,
+      _ => anyhow::bail!("Not a TIFF file"),
+    };
+    let version = endian.u16([hdr[2], hdr[3]]);
+    let (bigtiff, ifd_offset) = match version
+    {
+      42 =>
+      {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        (false, endian.u32(b) as u64)
+      }
+      43 =>
+      {
+        let mut b = [0u8; 12];
+        r.read_exact(&mut b)?;
+        (true, endian.u64([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]))
+      }
+      v => anyhow::bail!("Unsupported TIFF version {}", v),
+    };
+
+    r.seek(SeekFrom::Start(ifd_offset))?;
+    let entry_count = if bigtiff
+    {
+      let mut b = [0u8; 8];
+      r.read_exact(&mut b)?;
+      endian.u64(b) as usize
+    }
+    else
+    {
+      let mut b = [0u8; 2];
+      r.read_exact(&mut b)?;
+      endian.u16(b) as usize
+    };
+
+    let mut tags: HashMap<u16, TagValue> = HashMap::new();
+    for _ in 0..entry_count
+    {
+      let (tag, val) = if bigtiff
+      {
+        read_entry_bigtiff(&mut r, endian)?
+      }
+      else
+      {
+        read_entry_classic(&mut r, endian)?
+      };
+      tags.insert(tag, val);
+    }
+
+    let width = get_u64(&tags, TAG_IMAGE_WIDTH)? as usize;
+    let height = get_u64(&tags, TAG_IMAGE_LENGTH)? as usize;
+    let bits = get_u64(&tags, TAG_BITS_PER_SAMPLE).unwrap_or(16);
+    let fmt_code = get_u64(&tags, TAG_SAMPLE_FORMAT).unwrap_or(1);
+    let sample_format = match (bits, fmt_code)
+    {
+      (16, 1) | (16, 2) => SampleFormat::Int16,
+      (32, _) => SampleFormat::Float32,
+      _ => anyhow::bail!("Unsupported: {} bits, format code {}", bits, fmt_code),
+    };
+
+    let comp_code = get_u64(&tags, TAG_COMPRESSION).unwrap_or(1);
+    let compression = match comp_code
+    {
+      1 => Compression::None,
+      8 => Compression::Deflate,
+      c => anyhow::bail!("Unsupported compression: {}", c),
+    };
+
+    let layout = if tags.contains_key(&TAG_TILE_OFFSETS)
+    {
+      let tile_width = get_u64(&tags, TAG_TILE_WIDTH)? as usize;
+      let tile_height = get_u64(&tags, TAG_TILE_LENGTH)? as usize;
+      let offsets = get_values(&tags, TAG_TILE_OFFSETS)?;
+      let byte_counts = get_values(&tags, TAG_TILE_BYTE_COUNTS)?;
+      Layout::Tiled { tile_width, tile_height, offsets, byte_counts }
+    }
+    else
+    {
+      let rows_per_strip = get_u64(&tags, TAG_ROWS_PER_STRIP).unwrap_or(height as u64) as usize;
+      let offsets = get_values(&tags, TAG_STRIP_OFFSETS)?;
+      let byte_counts = get_values(&tags, TAG_STRIP_BYTE_COUNTS)?;
+      Layout::Stripped { rows_per_strip, offsets, byte_counts }
+    };
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("TIFF: {}x{}, {:?}, {:?}", width, height, sample_format, compression),
+    );
+
+    Ok(Self {
+      width,
+      height,
+      endian,
+      sample_format,
+      compression,
+      layout,
+      path: path.to_path_buf(),
+      row_cache: HashMap::new(),
+      reader: r,
+    })
+  }
+
+  pub fn get_sample(&mut self, x: usize, y: usize) -> i16
+  {
+    let x = x.min(self.width - 1);
+    let y = y.min(self.height - 1);
+
+    let (tile_index, tile_info) = match &self.layout
+    {
+      Layout::Stripped { .. } => (y, None),
+      Layout::Tiled { tile_width, tile_height, offsets, byte_counts } =>
+      {
+        let tiles_across = (self.width + tile_width - 1) / tile_width;
+        let tile_x = x / tile_width;
+        let tile_y = y / tile_height;
+        let idx = tile_y * tiles_across + tile_x;
+        (idx, Some((*tile_width, *tile_height, offsets[idx], byte_counts[idx])))
+      }
+    };
+
+    if !self.row_cache.contains_key(&tile_index)
+    {
+      if let Some((tw, th, offset, count)) = tile_info
+      {
+        // Tiled Logic
+        match self.decompress_internal(offset, count as usize)
+        {
+          Ok(compressed) =>
+          {
+            let samples = self.decode_tile_bytes(&compressed);
+            // Ensure the samples vector is actually the size we expect
+            if samples.len() >= tw * th
+            {
+              self.row_cache.insert(tile_index, samples);
+            }
+            else
+            {
+              // Insert a dummy to prevent re-trying a broken tile
+              self.row_cache.insert(tile_index, vec![0; tw * th]);
+            }
+          }
+          Err(_) =>
+          {
+            self.row_cache.insert(tile_index, vec![0; tw * th]);
+          }
+        }
+      }
+      else
+      {
+        // Stripped Logic
+        if let Ok(row_data) = self.read_row_internal(tile_index)
+        {
+          self.row_cache.insert(tile_index, row_data);
+        }
+        else
+        {
+          self.row_cache.insert(tile_index, vec![0; self.width]);
+        }
+      }
+    }
+
+    // Safe to unwrap because we just ensured it exists
+    let data = &self.row_cache[&tile_index];
+
+    if let Some((tw, _, _, _)) = tile_info
+    {
+      let local_x = x % tw;
+      let local_y = y % (data.len() / tw);
+      let idx = local_y * tw + local_x;
+      if idx < data.len()
+      {
+        data[idx]
+      }
+      else
+      {
+        0
+      }
+    }
+    else
+    {
+      if x < data.len()
+      {
+        data[x]
+      }
+      else
+      {
+        0
+      }
+    }
+  }
+
+  fn decode_tile_bytes(&self, data: &[u8]) -> Vec<i16>
+  {
+    let (tile_w, tile_h) = match self.layout
+    {
+      Layout::Tiled { tile_width, tile_height, .. } => (tile_width, tile_height),
+      _ => (self.width, 1),
+    };
+
+    let mut deshuffled = vec![0u8; data.len()];
+    for row_idx in 0..tile_h
+    {
+      let row_start = row_idx * tile_w * 4;
+      let row_end = row_start + (tile_w * 4);
+      if row_end > data.len()
+      {
+        break;
+      }
+
+      let mut row_bytes = data[row_start..row_end].to_vec();
+      for i in 1..tile_w * 4
+      {
+        row_bytes[i] = row_bytes[i].wrapping_add(row_bytes[i - 1]);
+      }
+
+      for i in 0..tile_w
+      {
+        deshuffled[row_start + i * 4 + 0] = row_bytes[i + tile_w * 3]; // B1
+        deshuffled[row_start + i * 4 + 1] = row_bytes[i + tile_w * 2]; // B2
+        deshuffled[row_start + i * 4 + 2] = row_bytes[i + tile_w * 1]; // B3
+        deshuffled[row_start + i * 4 + 3] = row_bytes[i + tile_w * 0]; // B4
+      }
+    }
+
+    deshuffled
+      .chunks_exact(4)
+      .map(|b| {
+        let f = self.endian.f32([b[0], b[1], b[2], b[3]]);
+        if !f.is_finite() || f < -12000.0 || f > 10000.0
+        {
+          0
+        }
+        else
+        {
+          f.round() as i16
+        }
+      })
+      .collect()
+  }
+
+  /// Internal read_row that uses the existing reader
+  fn read_row_internal(&mut self, row: usize) -> anyhow::Result<Vec<i16>>
+  {
+    match &self.layout
+    {
+      Layout::Stripped { rows_per_strip, offsets, byte_counts } =>
+      {
+        let strip_idx = row / rows_per_strip;
+        let row_in_strip = row % rows_per_strip;
+        let raw = self.decompress_internal(offsets[strip_idx], byte_counts[strip_idx] as usize)?;
+        self.decode_row_logic(&raw, row_in_strip, self.width)
+      }
+      Layout::Tiled { .. } => anyhow::bail!("Use get_sample for tiled layouts"),
+    }
+  }
+
+  fn decode_row_logic(
+    &self,
+    raw: &[u8],
+    row_idx: usize,
+    row_width: usize,
+  ) -> anyhow::Result<Vec<i16>>
+  {
+    let samples: Vec<i16> = match self.sample_format
+    {
+      SampleFormat::Int16 =>
+      {
+        let start = row_idx * (row_width * 2);
+        raw[start..start + (row_width * 2)]
+          .chunks_exact(2)
+          .map(|b| self.endian.i16([b[0], b[1]]))
+          .collect()
+      }
+      SampleFormat::Float32 =>
+      {
+        let start = row_idx * (row_width * 4);
+        raw[start..start + (row_width * 4)]
+          .chunks_exact(4)
+          .map(|b| self.endian.f32([b[0], b[1], b[2], b[3]]).round() as i16)
+          .collect()
+      }
+    };
+    Ok(samples)
+  }
+
+  fn decompress_internal(&mut self, offset: u64, byte_count: usize) -> anyhow::Result<Vec<u8>>
+  {
+    self.reader.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; byte_count];
+    self.reader.read_exact(&mut buf)?;
+
+    match self.compression
+    {
+      Compression::None => Ok(buf),
+      Compression::Deflate =>
+      {
+        let mut dec = ZlibDecoder::new(&buf[..]);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out)?;
+        Ok(out)
+      }
+    }
+  }
+}
+
+// â”€â”€ IFD helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+fn read_entry_classic<R: Read + Seek>(r: &mut R, e: Endian) -> anyhow::Result<(u16, TagValue)>
+{
+  let mut b = [0u8; 12];
+  r.read_exact(&mut b)?;
+  let tag = e.u16([b[0], b[1]]);
+  let ftype = e.u16([b[2], b[3]]);
+  let count = e.u32([b[4], b[5], b[6], b[7]]) as u64;
+  let total = count * tiff_type_size(ftype) as u64;
+  let values = if total <= 4
+  {
+    read_vals(&b[8..12], ftype, count, e)
+  }
+  else
+  {
+    let off = e.u32([b[8], b[9], b[10], b[11]]) as u64;
+    let pos = r.stream_position()?;
+    r.seek(SeekFrom::Start(off))?;
+    let mut buf = vec![0u8; total as usize];
+    r.read_exact(&mut buf)?;
+    r.seek(SeekFrom::Start(pos))?;
+    read_vals(&buf, ftype, count, e)
+  };
+  Ok((tag, TagValue { count, values }))
+}
+
+fn read_entry_bigtiff<R: Read + Seek>(r: &mut R, e: Endian) -> anyhow::Result<(u16, TagValue)>
+{
+  let mut b = [0u8; 20];
+  r.read_exact(&mut b)?;
+  let tag = e.u16([b[0], b[1]]);
+  let ftype = e.u16([b[2], b[3]]);
+  let count = e.u64([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]);
+  let total = count * tiff_type_size(ftype) as u64;
+  let values = if total <= 8
+  {
+    read_vals(&b[12..20], ftype, count, e)
+  }
+  else
+  {
+    let off = e.u64([b[12], b[13], b[14], b[15], b[16], b[17], b[18], b[19]]);
+    let pos = r.stream_position()?;
+    r.seek(SeekFrom::Start(off))?;
+    let mut buf = vec![0u8; total as usize];
+    r.read_exact(&mut buf)?;
+    r.seek(SeekFrom::Start(pos))?;
+    read_vals(&buf, ftype, count, e)
+  };
+  Ok((tag, TagValue { count, values }))
+}
+
+fn tiff_type_size(t: u16) -> usize
+{
+  match t
+  {
+    1 | 2 | 6 | 7 => 1,
+    3 | 8 => 2,
+    4 | 9 | 11 => 4,
+    5 | 10 | 12 => 8,
+    16 | 17 | 18 => 8,
+    _ => 4,
+  }
+}
+
+fn read_vals(buf: &[u8], ftype: u16, count: u64, e: Endian) -> Vec<u64>
+{
+  let sz = tiff_type_size(ftype);
+  (0..count as usize)
+    .filter_map(|i| {
+      let s = i * sz;
+      if s + sz > buf.len()
+      {
+        return None;
+      }
+      Some(match (ftype, sz)
+      {
+        (3, 2) | (8, 2) => e.u16([buf[s], buf[s + 1]]) as u64,
+        (4, 4) | (9, 4) | (11, 4) => e.u32([buf[s], buf[s + 1], buf[s + 2], buf[s + 3]]) as u64,
+        (16, 8) | (17, 8) | (18, 8) => e.u64([
+          buf[s],
+          buf[s + 1],
+          buf[s + 2],
+          buf[s + 3],
+          buf[s + 4],
+          buf[s + 5],
+          buf[s + 6],
+          buf[s + 7],
+        ]),
+        _ =>
+        {
+          let mut t = [0u8; 4];
+          let n = sz.min(4).min(buf.len() - s);
+          t[..n].copy_from_slice(&buf[s..s + n]);
+          e.u32(t) as u64
+        }
+      })
+    })
+    .collect()
+}
+
+fn get_u64(tags: &HashMap<u16, TagValue>, tag: u16) -> anyhow::Result<u64>
+{
+  tags
+    .get(&tag)
+    .ok_or_else(|| anyhow::anyhow!("Missing tag {}", tag))?
+    .values
+    .first()
+    .copied()
+    .ok_or_else(|| anyhow::anyhow!("Tag {} empty", tag))
+}
+
+fn get_values(tags: &HashMap<u16, TagValue>, tag: u16) -> anyhow::Result<Vec<u64>>
+{
+  Ok(tags.get(&tag).ok_or_else(|| anyhow::anyhow!("Missing tag {}", tag))?.values.clone())
+}
+
+--- FILE: .\src\core\config.rs ---
+use std::fs;
+
+use serde::{Deserialize, Serialize};
+
+// The only hardcoded bootstrap path allowed in the source
+const BOOTSTRAP_PATH: &str = "C:\\dev\\kyzu_data\\engine_config.json";
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppConfig
+{
+  pub data_dir: String,
+  pub worlds_subdir: String,
+  pub selected_world: String,
+  pub world_filename: String,
+  pub log_filename: String,
+  pub window_width: u32,
+  pub window_height: u32,
+  pub vsync_enabled: bool,
+  pub test_mesh: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorldConfig
+{
+  pub name: String,
+  pub bodies_registry: String,
+  pub assets_subdir: String,
+  pub baked_subdir: String,
+  pub seed: u64,
+  pub sea_level: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KyzuConfig
+{
+  pub app: AppConfig,
+  pub world: WorldConfig,
+}
+
+pub fn load() -> Result<KyzuConfig, String>
+{
+  // 1. Load Bootstrap App Config
+  let bootstrap_content =
+    fs::read_to_string(BOOTSTRAP_PATH).map_err(|e| format!("Could not read bootstrap: {}", e))?;
+
+  // We use a temporary struct or untyped JSON to get the App portion first
+  let full_json: serde_json::Value =
+    serde_json::from_str(&bootstrap_content).map_err(|e| format!("JSON Error: {}", e))?;
+
+  let app: AppConfig = serde_json::from_value(full_json["app"].clone())
+    .map_err(|e| format!("AppConfig missing: {}", e))?;
+
+  // 2. Construct the path to the world.json
+  // Logic: [data_dir] / [worlds_subdir] / [selected_world] / world.json
+  let world_path = std::path::PathBuf::from(&app.data_dir)
+    .join(&app.worlds_subdir)
+    .join(&app.selected_world)
+    .join(&app.world_filename);
+
+  // 3. Load the World Manifest
+  let world_content = fs::read_to_string(&world_path)
+    .map_err(|e| format!("Could not read world.json at {:?}: {}", world_path, e))?;
+
+  let world: WorldConfig =
+    serde_json::from_str(&world_content).map_err(|e| format!("World JSON Error: {}", e))?;
+
+  Ok(KyzuConfig { app, world })
+}
+
+--- FILE: .\src\core\error.rs ---
+#[derive(Debug)]
+pub enum KyzuError
+{
+  ConfigLoad(String),
+  IO(String),
+  Gpu(String),
+  Window(String),
+  Bake(String),
+}
+
+impl std::fmt::Display for KyzuError
+{
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+  {
+    match self
+    {
+      KyzuError::ConfigLoad(msg) => write!(f, "Configuration Error: {}", msg),
+      KyzuError::IO(msg) => write!(f, "I/O Error: {}", msg),
+      KyzuError::Gpu(msg) => write!(f, "GPU Error: {}", msg),
+      KyzuError::Window(msg) => write!(f, "Windowing Error: {}", msg),
+      KyzuError::Bake(msg) => write!(f, "Bake Engine Error: {}", msg),
+    }
+  }
+}
+
+// This allows us to use '?' easily
+impl std::error::Error for KyzuError {}
+
+--- FILE: .\src\core\log.rs ---
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_BUFFER_SIZE: usize = 100;
+
+pub enum LogLevel
+{
+  Info,
+  Warning,
+  Error,
+  Critical,
+  Debug,
+}
+
+pub struct LogEntry
+{
+  pub level: LogLevel,
+  pub message: String,
+  pub timestamp: SystemTime,
+}
+
+pub struct Logger
+{
+  pub file_path: String,
+  pub buffer: VecDeque<LogEntry>,
+}
+
+impl Logger
+{
+  pub fn new(path: &str) -> Self
+  {
+    Self { file_path: path.to_string(), buffer: VecDeque::with_capacity(MAX_BUFFER_SIZE) }
+  }
+
+  pub fn emit(&mut self, level: LogLevel, message: &str)
+  {
+    let now = SystemTime::now();
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_seconds = duration.as_secs();
+
+    // Basic math to get HH:MM:SS (UTC)
+    let seconds = total_seconds % 60;
+    let minutes = (total_seconds / 60) % 60;
+    let hours = (total_seconds / 3600) % 24;
+
+    let time_str = format!("{:02}:{:02}:{:02}", hours, minutes, seconds);
+
+    let prefix = match level
+    {
+      LogLevel::Info => "[INFO]",
+      LogLevel::Warning => "[WARN]",
+      LogLevel::Error => "[ERRO]",
+      LogLevel::Critical => "[CRIT]",
+      LogLevel::Debug => "[DEBUG]",
+    };
+
+    let entry_text = format!("{} {} {}\n", time_str, prefix, message);
+
+    // 1. Terminal Output
+    print!("{}", entry_text);
+
+    // 2. In-Memory Ring Buffer (for In-Game Console)
+    if self.buffer.len() >= MAX_BUFFER_SIZE
+    {
+      self.buffer.pop_front();
+    }
+    self.buffer.push_back(LogEntry { level, message: message.to_string(), timestamp: now });
+
+    // 3. File Output
+    let file_result = OpenOptions::new().create(true).append(true).open(&self.file_path);
+
+    if let Ok(mut file) = file_result
+    {
+      let _ = file.write_all(entry_text.as_bytes());
+    }
+  }
+
+  pub fn info(&mut self, msg: &str)
+  {
+    self.emit(LogLevel::Info, msg);
+  }
+  pub fn error(&mut self, msg: &str)
+  {
+    self.emit(LogLevel::Error, msg);
+  }
+}
+
+--- FILE: .\src\core\math.rs ---
+use glam;
+
+// Double precision for the "Infinite" simulation
+pub type WorldVec3 = glam::DVec3;
+pub type WorldMat4 = glam::DMat4;
+
+// Single precision for the GPU (wgpu-compatible)
+pub type RenderVec2 = glam::Vec2;
+pub type RenderVec3 = glam::Vec3;
+pub type RenderMat4 = glam::Mat4;
+
+pub struct Viewport
+{
+  pub width: f32,
+  pub height: f32,
+}
+
+// Crucial: Translates a high-precision world position to a camera-relative GPU position
+pub fn world_to_render_pos(world_pos: WorldVec3, camera_pos: WorldVec3) -> RenderVec3
+{
+  let relative = world_pos - camera_pos;
+
+  // Cast to f32 only after the subtraction to preserve precision
+  glam::vec3(relative.x as f32, relative.y as f32, relative.z as f32)
+}
+
+pub fn get_aspect_ratio(viewport: &Viewport) -> f32
+{
+  if viewport.height > 0.0
+  {
+    return viewport.width / viewport.height;
+  }
+  1.0
+}
+
+--- FILE: .\src\core\mod.rs ---
+pub mod config;
+pub mod error;
+pub mod log;
+pub mod math;
+pub mod time;
+
+--- FILE: .\src\core\time.rs ---
+use std::time::{Duration, Instant};
+
+pub struct TimeState
+{
+  pub last_frame: Instant,
+  pub delta: Duration,
+  pub delta_f32: f32,
+  pub total_time: Duration,
+  pub frame_count: u64,
+  pub fps: f32,
+
+  // For FPS averaging
+  last_fps_update: Instant,
+  frames_since_last_update: u32,
+}
+
+impl TimeState
+{
+  pub fn new() -> Self
+  {
+    let now = Instant::now();
+    Self {
+      last_frame: now,
+      delta: Duration::from_secs(0),
+      delta_f32: 0.0,
+      total_time: Duration::from_secs(0),
+      frame_count: 0,
+      fps: 0.0,
+      last_fps_update: now,
+      frames_since_last_update: 0,
+    }
+  }
+
+  /// Update the clock. Call this at the start of every frame.
+  pub fn update(&mut self)
+  {
+    let now = Instant::now();
+    self.delta = now.duration_since(self.last_frame);
+    self.last_frame = now;
+
+    // Convenience float for math: 0.016 for 60fps
+    self.delta_f32 = self.delta.as_secs_f32();
+    self.total_time += self.delta;
+    self.frame_count += 1;
+
+    // FPS Calculation (Update once per second)
+    self.frames_since_last_update += 1;
+    let elapsed = now.duration_since(self.last_fps_update);
+    if elapsed >= Duration::from_secs(1)
+    {
+      self.fps = self.frames_since_last_update as f32 / elapsed.as_secs_f32();
+      self.frames_since_last_update = 0;
+      self.last_fps_update = now;
+    }
+  }
+}
+
+--- FILE: .\src\core\types.rs ---
+
+--- FILE: .\src\input\binding.rs ---
+
+--- FILE: .\src\input\mod.rs ---
+pub mod state;
+
+--- FILE: .\src\input\state.rs ---
+use std::collections::HashSet;
+
+use glam::Vec2;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
+
+pub struct InputState
+{
+  // We use a HashSet for keys so we don't have to worry about array bounds
+  pub keys_down: HashSet<KeyCode>,
+  pub mouse_pos: Vec2,
+  pub mouse_delta: Vec2,
+  pub mouse_buttons_down: HashSet<MouseButton>,
+  pub scroll_delta: f32,
+}
+
+impl InputState
+{
+  pub fn new() -> Self
+  {
+    Self {
+      keys_down: HashSet::new(),
+      mouse_pos: Vec2::ZERO,
+      mouse_delta: Vec2::ZERO,
+      mouse_buttons_down: HashSet::new(),
+      scroll_delta: 0.0,
+    }
+  }
+
+  pub fn consume_mouse_delta(&mut self) -> glam::Vec2
+  {
+    let delta = self.mouse_delta;
+    self.mouse_delta = glam::Vec2::ZERO;
+    delta
+  }
+
+  /// The core Phase 1.4 logic: Update state from winit events
+  pub fn process_event(&mut self, event: &WindowEvent)
+  {
+    match event
+    {
+      WindowEvent::KeyboardInput { event: key_event, .. } =>
+      {
+        if let PhysicalKey::Code(code) = key_event.physical_key
+        {
+          if key_event.state == ElementState::Pressed
+          {
+            self.keys_down.insert(code);
+          }
+          else
+          {
+            self.keys_down.remove(&code);
+          }
+        }
+      }
+      WindowEvent::CursorMoved { position, .. } =>
+      {
+        let new_pos = Vec2::new(position.x as f32, position.y as f32);
+        self.mouse_delta = new_pos - self.mouse_pos;
+        self.mouse_pos = new_pos;
+      }
+      WindowEvent::MouseInput { state, button, .. } =>
+      {
+        if *state == ElementState::Pressed
+        {
+          self.mouse_buttons_down.insert(*button);
+        }
+        else
+        {
+          self.mouse_buttons_down.remove(button);
+        }
+      }
+      WindowEvent::MouseWheel { delta, .. } => match delta
+      {
+        MouseScrollDelta::LineDelta(_, y) => self.scroll_delta += y,
+        MouseScrollDelta::PixelDelta(pos) => self.scroll_delta += pos.y as f32 * 0.1,
+      },
+      _ =>
+      {}
+    }
+  }
+
+  /// PILFERED IDEA: Reset relative values at the end of the frame
+  pub fn tick(&mut self)
+  {
+    self.mouse_delta = Vec2::ZERO;
+    self.scroll_delta = 0.0;
+  }
+
+  pub fn is_key_down(&self, code: KeyCode) -> bool
+  {
+    self.keys_down.contains(&code)
+  }
+}
+
+--- FILE: .\src\render\depth.rs ---
+use wgpu::*;
+
+pub struct DepthResources
+{
+  pub view: TextureView,
+}
+
+impl DepthResources
+{
+  pub fn create(device: &Device, config: &SurfaceConfiguration) -> Self
+  {
+    let texture = device.create_texture(&TextureDescriptor {
+      label: Some("Depth Texture"),
+      size: Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format: TextureFormat::Depth32Float,
+      usage: TextureUsages::RENDER_ATTACHMENT,
+      view_formats: &[],
+    });
+
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    Self { view }
+  }
+}
+
+--- FILE: .\src\render\frame.rs ---
+
+--- FILE: .\src\render\kernel.rs ---
+use std::sync::Arc;
+
+use winit::window::Window;
+
+use crate::input::state::InputState;
+use crate::render::camera::CameraSystem;
+use crate::render::module::{FrameTargets, RenderModule};
+use crate::render::shared::SharedState;
+
+pub struct Renderer
+{
+  pub instance: wgpu::Instance,
+  pub adapter: wgpu::Adapter,
+  pub device: wgpu::Device,
+  pub queue: wgpu::Queue,
+  pub config: wgpu::SurfaceConfiguration,
+  pub shared: SharedState,
+  pub modules: Vec<Box<dyn RenderModule>>,
+  pub camera_system: CameraSystem,
+  pub surface: wgpu::Surface<'static>,
+}
+
+impl Renderer
+{
+  pub async fn new(window: Arc<Window>) -> anyhow::Result<Self>
+  {
+    let size = window.inner_size();
+    let instance = wgpu::Instance::default();
+    let surface = instance.create_surface(window.clone())?;
+
+    let adapter = instance
+      .request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+      })
+      .await
+      .map_err(|e| anyhow::anyhow!("No suitable GPU adapter found: {:?}", e))?;
+
+    let (device, queue) = adapter
+      .request_device(&wgpu::DeviceDescriptor {
+        label: Some("Kyzu Device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: Default::default(),
+        trace: wgpu::Trace::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+      })
+      .await?;
+
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0];
+
+    let config = wgpu::SurfaceConfiguration {
+      usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+      format: swapchain_format,
+      width: size.width,
+      height: size.height,
+      present_mode: wgpu::PresentMode::Fifo,
+      alpha_mode: swapchain_capabilities.alpha_modes[0],
+      view_formats: vec![],
+      desired_maximum_frame_latency: 2,
+    };
+
+    surface.configure(&device, &config);
+
+    let shared = SharedState::new(&device, config.width, config.height);
+
+    let camera_system = crate::render::camera::CameraSystem::new();
+
+    Ok(Self {
+      instance,
+      surface,
+      adapter,
+      device,
+      queue,
+      config,
+      shared,
+      modules: Vec::new(),
+      camera_system,
+    })
+  }
+
+  pub fn update(&mut self, input: &mut InputState, dt: f32) -> anyhow::Result<()>
+  {
+    self.camera_system.update(&mut self.shared, input, dt);
+    self.shared.camera_gpu.upload(&self.queue, &self.shared.camera);
+
+    for module in &mut self.modules
+    {
+      module.update(&self.queue, &self.shared);
+    }
+
+    Ok(())
+  }
+
+  pub fn add_module(&mut self, module: impl RenderModule + 'static)
+  {
+    self.modules.push(Box::new(module));
+  }
+
+  pub fn resize(&mut self, new_size: Option<winit::dpi::PhysicalSize<u32>>)
+  {
+    if let Some(size) = new_size
+    {
+      if size.width > 0 && size.height > 0
+      {
+        self.config.width = size.width;
+        self.config.height = size.height;
+        self.surface.configure(&self.device, &self.config);
+        // Update shared depth texture etc here
+      }
+    }
+  }
+
+  pub fn render(&mut self) -> anyhow::Result<()>
+  {
+    let frame = match self.surface.get_current_texture()
+    {
+      Ok(frame) => frame,
+      Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) =>
+      {
+        self.resize(None);
+        return Ok(());
+      }
+      Err(wgpu::SurfaceError::Timeout) => return Err(anyhow::anyhow!("Surface timeout")),
+      Err(e) => return Err(anyhow::anyhow!("Surface error: {:?}", e)),
+    };
+
+    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = self
+      .device
+      .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
+
+    let targets = FrameTargets { surface_view: &view, depth_view: &self.shared.depth_view };
+
+    for module in &self.modules
+    {
+      module.encode(&mut encoder, &targets, &self.shared);
+    }
+
+    self.queue.submit(std::iter::once(encoder.finish()));
+    frame.present();
+
+    Ok(())
+  }
+}
+
+--- FILE: .\src\render\mod.rs ---
+pub mod camera;
+pub mod depth;
+pub mod kernel;
+pub mod module;
+pub mod modules;
+pub mod shared;
+
+--- FILE: .\src\render\module.rs ---
+use std::any::Any;
+
+use wgpu::{CommandEncoder, Queue};
+
+pub use crate::render::shared::{FrameTargets, SharedState};
+
+pub trait RenderModule: Send + Sync
+{
+  fn update(&mut self, queue: &Queue, shared: &SharedState);
+
+  fn encode(&self, encoder: &mut CommandEncoder, targets: &FrameTargets, shared: &SharedState);
+
+  fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+--- FILE: .\src\render\shared.rs ---
+use bytemuck::{Pod, Zeroable};
+use wgpu::*;
+use crate::world::registry::BodyRegistry;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraMode
+{
+  Free,    // Deep Space: Fly-through
+  Orbital, // World Body: Focused on a planet/sun
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CameraMatrices
+{
+  pub view_proj: [[f32; 4]; 4],
+  pub inv_view_proj: [[f32; 4]; 4],
+  pub eye_rel: [f32; 3],
+  pub _pad: f32,
+}
+
+impl Default for CameraMatrices
+{
+  fn default() -> Self
+  {
+    Self {
+      view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+      inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+      eye_rel: [0.0; 3],
+      _pad: 0.0,
+    }
+  }
+}
+
+pub struct CameraGpu
+{
+  pub buffer: Buffer,
+  pub bind_group: BindGroup,
+  pub layout: BindGroupLayout,
+}
+
+impl CameraGpu
+{
+  pub fn create(device: &Device) -> Self
+  {
+    let buffer = device.create_buffer(&BufferDescriptor {
+      label: Some("Camera Buffer"),
+      size: std::mem::size_of::<CameraMatrices>() as u64,
+      usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+
+    let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+      label: Some("Camera BGL"),
+      entries: &[BindGroupLayoutEntry {
+        binding: 0,
+        visibility: ShaderStages::VERTEX_FRAGMENT,
+        ty: BindingType::Buffer {
+          ty: BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      }],
+    });
+
+    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+      label: Some("Camera BG"),
+      layout: &layout,
+      entries: &[BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    });
+
+    Self { buffer, bind_group, layout }
+  }
+
+  pub fn upload(&self, queue: &Queue, matrices: &CameraMatrices)
+  {
+    queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(matrices));
+  }
+}
+
+pub struct DepthTexture
+{
+  pub texture: Texture,
+  pub view: TextureView,
+}
+
+pub struct SharedState
+{
+  pub mode: CameraMode,
+  pub camera: CameraMatrices,
+  pub camera_gpu: CameraGpu,
+  pub surface_format: TextureFormat,
+  pub depth_format: TextureFormat,
+  pub depth_view: TextureView,
+  pub screen_width: u32,
+  pub screen_height: u32,
+  pub target_body_pos: glam::DVec3,
+  pub eye_world: glam::DVec3,
+  pub body_registry: BodyRegistry,
+}
+
+impl SharedState
+{
+  pub fn new(device: &Device, width: u32, height: u32) -> Self
+  {
+    let surface_format = TextureFormat::Bgra8UnormSrgb;
+    let depth_format = TextureFormat::Depth32Float;
+
+    let camera = CameraMatrices::default();
+    let camera_gpu = CameraGpu::create(device);
+
+    // Basic depth texture for 3D rendering
+    let depth_texture = device.create_texture(&TextureDescriptor {
+      label: Some("Depth Texture"),
+      size: Extent3d { width, height, depth_or_array_layers: 1 },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: TextureDimension::D2,
+      format: depth_format,
+      usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+      view_formats: &[],
+    });
+
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+    let body_registry = BodyRegistry::new();
+    Self {
+      mode: CameraMode::Orbital,
+      camera,
+      camera_gpu,
+      surface_format,
+      depth_format,
+      depth_view,
+      screen_width: width,
+      screen_height: height,
+      target_body_pos: glam::DVec3::ZERO,
+      eye_world: glam::DVec3::new(0.0, 0.0, 5.0),
+      body_registry,
+    }
+  }
+}
+
+pub struct FrameTargets<'a>
+{
+  pub surface_view: &'a TextureView,
+  pub depth_view: &'a TextureView,
+}
+
+--- FILE: .\src\render\camera\free.rs ---
+use glam::{DVec3, EulerRot, Quat, Vec3};
+use winit::keyboard::KeyCode;
+
+use super::CameraController;
+use crate::input::state::InputState;
+use crate::render::shared::SharedState;
+
+pub struct FreeController
+{
+  pub position: DVec3,
+  pub yaw: f32,
+  pub pitch: f32,
+  pub speed_gear: i32, // gear multiplier: each Shift+scroll notch = 2x/0.5x WASD speed
+  pub sensitivity: f32,
+  pub fov: f32,
+  pub z_near: f32,
+  pub z_far: f32,
+}
+
+impl Default for FreeController
+{
+  fn default() -> Self
+  {
+    Self {
+      position: glam::DVec3::new(0.0, 0.0, 15_000_000.0),
+      yaw: -90.0f32.to_radians(),
+      pitch: 0.0,
+      speed_gear: 0,
+      sensitivity: 0.1,
+      fov: 45.0,
+      z_near: 100_000.0,          // 100km â€” fine for solar system scale
+      z_far: 1_000_000_000_000.0, // 1 trillion metres (~Pluto distance)
+    }
+  }
+}
+
+// Gear multiplier: 2^gear applied to the base distance-proportional speed.
+// Gear  0 = 1x   (base: 10% of distance per second)
+// Gear  1 = 2x
+// Gear  2 = 4x
+// Gear -1 = 0.5x (finer control close up)
+// Gear -2 = 0.25x
+// Range: -4 to +6 gives roughly 0.06x to 64x base speed
+fn gear_multiplier(gear: i32) -> f64
+{
+  2.0_f64.powi(gear)
+}
+
+impl CameraController for FreeController
+{
+  fn update(&mut self, shared: &mut SharedState, input: &mut InputState, dt: f32)
+  {
+    // --- 1. HANDLE INPUT (Rotation) ---
+    if input.mouse_buttons_down.contains(&winit::event::MouseButton::Right)
+    {
+      let sensitivity_scale = 0.005;
+      let delta = input.mouse_delta;
+      self.yaw -= delta.x * self.sensitivity * sensitivity_scale;
+      self.pitch -= delta.y * self.sensitivity * sensitivity_scale;
+      self.pitch = self.pitch.clamp(-1.5, 1.5);
+    }
+
+    // --- 2. Build direction vectors ---
+    let rotation = Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0);
+    let forward = rotation * -Vec3::Z;
+    let right = rotation * Vec3::X;
+    let up = rotation * Vec3::Y;
+
+    // --- 3. HANDLE INPUT (Movement) ---
+
+    // Base speed: always proportional to distance from origin.
+    // At any distance, gear 0 WASD moves you at 10% of that distance per second.
+    // Scroll nudges you by 10% of distance per notch (same scale, feels consistent).
+    let dist = self.position.length().max(100.0);
+    let base_speed = dist * 0.1; // metres per second at gear 0
+
+    // Scroll: instant positional nudge â€” 10% of distance from origin per notch.
+    if input.scroll_delta != 0.0
+    {
+      let scroll_clamped = input.scroll_delta.clamp(-3.0, 3.0) as f64;
+      self.position += forward.as_dvec3() * base_speed * scroll_clamped;
+    }
+
+    // Shift+scroll: adjust gear multiplier for WASD speed.
+    // Negative gears give finer control when close to a surface.
+    if input.is_key_down(KeyCode::ShiftLeft) || input.is_key_down(KeyCode::ShiftRight)
+    {
+      if input.scroll_delta > 0.0
+      {
+        self.speed_gear += 1;
+      }
+      else if input.scroll_delta < 0.0
+      {
+        self.speed_gear -= 1;
+      }
+      self.speed_gear = self.speed_gear.clamp(-4, 6);
+    }
+
+    // WASD: sustained flight at base speed * gear multiplier
+    let wasd_speed = base_speed * gear_multiplier(self.speed_gear);
+
+    let mut move_dir = Vec3::ZERO;
+    if input.is_key_down(KeyCode::KeyW)
+    {
+      move_dir += forward;
+    }
+    if input.is_key_down(KeyCode::KeyS)
+    {
+      move_dir -= forward;
+    }
+    if input.is_key_down(KeyCode::KeyD)
+    {
+      move_dir += right;
+    }
+    if input.is_key_down(KeyCode::KeyA)
+    {
+      move_dir -= right;
+    }
+
+    if move_dir.length_squared() > 0.0
+    {
+      let move_norm = move_dir.normalize();
+      self.position += move_norm.as_dvec3() * wasd_speed * (dt as f64);
+    }
+
+    // --- 4. FLOATING ORIGIN MATRICES ---
+    shared.eye_world = self.position;
+
+    let view_rel = glam::Mat4::look_to_rh(Vec3::ZERO, forward, up);
+    let aspect = shared.screen_width as f32 / shared.screen_height as f32;
+    let proj = glam::Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
+    let view_proj = proj * view_rel;
+
+    shared.camera.view_proj = view_proj.to_cols_array_2d();
+    shared.camera.inv_view_proj = view_proj.inverse().to_cols_array_2d();
+    shared.camera.eye_rel = [0.0, 0.0, 0.0];
+  }
+}
+
+--- FILE: .\src\render\camera\mod.rs ---
+use crate::input::state::InputState;
+use crate::render::shared::{CameraMode, SharedState};
+
+pub trait CameraController
+{
+  fn update(&mut self, shared: &mut SharedState, input: &mut InputState, dt: f32);
+}
+
+pub mod free;
+pub mod orbital;
+
+pub struct CameraSystem
+{
+  pub free_controller: free::FreeController,
+  pub orbital_controller: orbital::OrbitalController,
+  last_mode: CameraMode, // Track the mode to detect transitions
+}
+
+impl CameraSystem
+{
+  pub fn new() -> Self
+  {
+    Self {
+      free_controller: free::FreeController::default(),
+      orbital_controller: orbital::OrbitalController::default(),
+      last_mode: CameraMode::Orbital, // Default starting mode
+    }
+  }
+
+  pub fn update(&mut self, shared: &mut SharedState, input: &mut InputState, dt: f32)
+  {
+    if shared.mode != self.last_mode
+    {
+      // 1. Reset the mouse delta IMMEDIATELY on transition
+      input.consume_mouse_delta();
+
+      match shared.mode
+      {
+        CameraMode::Free =>
+        {
+          self.free_controller.position = shared.eye_world;
+
+          let to_target = (self.orbital_controller.target - shared.eye_world).normalize();
+
+          let pitch = (to_target.y as f32).asin();
+          let yaw = {
+            let xz_len = (to_target.x * to_target.x + to_target.z * to_target.z).sqrt() as f32;
+            if xz_len < 1e-6
+            {
+              self.free_controller.yaw
+            }
+            else
+            {
+              f32::atan2(-to_target.x as f32, -to_target.z as f32)
+            }
+          };
+
+          self.free_controller.pitch = pitch;
+          self.free_controller.yaw = yaw;
+          self.free_controller.speed_gear = 0;
+        }
+        CameraMode::Orbital =>
+        {
+          let rel = shared.eye_world - self.orbital_controller.target;
+          let dist = rel.length();
+          self.orbital_controller.altitude = dist;
+          self.orbital_controller.lat = (rel.y / dist).asin().to_degrees();
+          self.orbital_controller.lon = (rel.x).atan2(rel.z).to_degrees();
+        }
+      }
+      self.last_mode = shared.mode;
+    }
+
+    match shared.mode
+    {
+      CameraMode::Free => self.free_controller.update(shared, input, dt),
+      CameraMode::Orbital => self.orbital_controller.update(shared, input, dt),
+    }
+  }
+}
+
+--- FILE: .\src\render\camera\orbital.rs ---
+use glam::DVec3;
+
+use super::CameraController;
+use crate::render::camera::InputState;
+
+pub struct OrbitalController
+{
+  pub lat: f64,            // Latitude in degrees (-90 to 90)
+  pub lon: f64,            // Longitude in degrees
+  pub altitude: f64,       // Distance from center
+  pub target: glam::DVec3, // The center of the world body
+  pub fov: f32,
+  pub z_near: f32,
+  pub z_far: f32,
+  pub sensitivity: f32,
+}
+
+impl Default for OrbitalController
+{
+  fn default() -> Self
+  {
+    Self {
+      lat: 0.0,
+      lon: 0.0,
+      altitude: 15_000_000.0,
+      target: glam::DVec3::ZERO,
+      fov: 45.0,
+      z_near: 100_000.0,
+      z_far: 1_000_000_000_000.0,
+      sensitivity: 0.005,
+    }
+  }
+}
+
+impl CameraController for OrbitalController
+{
+  fn update(
+    &mut self,
+    shared: &mut crate::render::shared::SharedState,
+    input: &mut InputState,
+    _dt: f32,
+  )
+  {
+    // 1. Handle Input (Logic stays the same)
+    if input.mouse_buttons_down.contains(&winit::event::MouseButton::Right)
+    {
+      self.lon -= (input.mouse_delta.x * 0.2) as f64;
+      self.lat += (input.mouse_delta.y * 0.2) as f64;
+      self.lat = self.lat.clamp(-89.0, 89.0);
+    }
+    if input.scroll_delta != 0.0
+    {
+      self.altitude -= (input.scroll_delta as f64) * self.altitude * 0.1;
+      self.altitude = self.altitude.clamp(7_000_000.0, 100_000_000.0);
+    }
+
+    // 2. High Precision Math (f64)
+    let lat_rad = self.lat.to_radians();
+    let lon_rad = self.lon.to_radians();
+    let x = self.altitude * lat_rad.cos() * lon_rad.sin();
+    let y = self.altitude * lat_rad.sin();
+    let z = self.altitude * lat_rad.cos() * lon_rad.cos();
+    let offset = DVec3::new(x, y, z);
+
+    // Update the CPU "Source of Truth"
+    shared.eye_world = self.target + offset;
+
+    // 3. Floating Origin Math
+    // Relative target is simply negative offset if looking at (0,0,0)
+    let relative_target = -offset;
+
+    let view_rel = glam::DMat4::look_at_rh(DVec3::ZERO, relative_target, DVec3::Y);
+    let aspect = shared.screen_width as f32 / shared.screen_height as f32;
+    let proj = glam::Mat4::perspective_rh(self.fov.to_radians(), aspect, self.z_near, self.z_far);
+
+    // 4. Update SharedState Matrices
+    let view_proj = proj * view_rel.as_mat4();
+    shared.camera.view_proj = view_proj.to_cols_array_2d();
+    shared.camera.inv_view_proj = view_proj.inverse().to_cols_array_2d();
+    shared.camera.eye_rel = [0.0, 0.0, 0.0]; // Camera is the origin!
+  }
+}
+
+--- FILE: .\src\render\modules\atmosphere.rs ---
+
+--- FILE: .\src\render\modules\mod.rs ---
+pub mod solid;
+
+--- FILE: .\src\render\modules\orbit.rs ---
+
+--- FILE: .\src\render\modules\solid.rs ---
+use std::any::Any;
+use std::path::Path;
+
+use glam::{DVec3, Mat4, Quat, Vec3};
+use wgpu::util::DeviceExt;
+use wgpu::{include_wgsl, BindGroup, Buffer, Queue};
+
+use crate::bake::geometry::BakedVertex;
+use crate::core::log::{LogLevel, Logger};
+use crate::render::module::{FrameTargets, RenderModule};
+use crate::render::shared::SharedState;
+
+pub struct SolidModule
+{
+  pipeline: wgpu::RenderPipeline,
+  vertex_buffer: Buffer,
+  index_buffer: Buffer,
+  index_count: u32,
+  model_buffer: Buffer,
+  model_bind_group: BindGroup,
+}
+
+impl SolidModule
+{
+  pub fn new(
+    device: &wgpu::Device,
+    shared: &SharedState,
+    mesh_path: &Path,
+    logger: &mut Logger,
+  ) -> Self
+  {
+    let shader = device.create_shader_module(include_wgsl!("../shaders/solid.wgsl"));
+
+    // 1. Load the mesh
+    let bake_data = std::fs::read(mesh_path).expect("Failed to load baked mesh.");
+    logger.emit(
+      LogLevel::Info,
+      &format!("Loading bake file: {} ({} bytes)", mesh_path.display(), bake_data.len()),
+    );
+
+    // Vertices
+    let v_count = u32::from_le_bytes(bake_data[0..4].try_into().unwrap()) as usize;
+    let vertex_size = std::mem::size_of::<BakedVertex>();
+    let vertex_data_start = 4;
+    let vertex_data_end = vertex_data_start + (v_count * vertex_size);
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("Mesh Stats: {} vertices ({} bytes each)", v_count, vertex_size),
+    );
+
+    let vertices: &[BakedVertex] =
+      bytemuck::cast_slice(&bake_data[vertex_data_start..vertex_data_end]);
+
+    // Indices
+    let i_count_offset = vertex_data_end;
+
+    // SAFETY CHECK: Is there enough data left for an index count?
+    if i_count_offset + 4 > bake_data.len()
+    {
+      panic!(
+        "Bake file truncated! Expected index count at {}, but file ends at {}",
+        i_count_offset,
+        bake_data.len()
+      );
+    }
+
+    let i_count =
+      u32::from_le_bytes(bake_data[i_count_offset..i_count_offset + 4].try_into().unwrap())
+        as usize;
+    let index_data_start = i_count_offset + 4;
+    let index_data_end = index_data_start + (i_count * 4);
+
+    logger.emit(
+      LogLevel::Info,
+      &format!("Mesh Stats: {} indices (offset: {})", i_count, i_count_offset),
+    );
+
+    // CRITICAL FIX: Ensure we aren't passing an empty slice to the GPU
+    if i_count == 0
+    {
+      panic!("Bake file contains 0 indices! The subdivision or save logic in 'cook_body' might be broken.");
+    }
+
+    if index_data_end > bake_data.len()
+    {
+      panic!(
+        "Bake file truncated! Expected index data up to {}, but file ends at {}",
+        index_data_end,
+        bake_data.len()
+      );
+    }
+
+    let indices: &[u32] = bytemuck::cast_slice(&bake_data[index_data_start..index_data_end]);
+
+    // 2. GPU Buffers (Geometry)
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+      label: Some("Solid Vertex Buffer"),
+      contents: bytemuck::cast_slice(vertices),
+      usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+      label: Some("Solid Index Buffer"),
+      contents: bytemuck::cast_slice(indices),
+      usage: wgpu::BufferUsages::INDEX,
+    });
+
+    // 3. Model Matrix Buffer (Group 1)
+    let model_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+      label: Some("Solid Model Buffer"),
+      size: 64, // 16 * f32
+      usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+    });
+
+    let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label: Some("Solid Model BGL"),
+      entries: &[wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Uniform,
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      }],
+    });
+
+    let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+      label: Some("Solid Model BG"),
+      layout: &model_layout,
+      entries: &[wgpu::BindGroupEntry { binding: 0, resource: model_buffer.as_entire_binding() }],
+    });
+
+    // 4. Pipeline Layout
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+      label: Some("Solid Pipeline Layout"),
+      bind_group_layouts: &[&shared.camera_gpu.layout, &model_layout],
+      push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+      label: Some("Solid Render Pipeline"),
+      layout: Some(&pipeline_layout),
+      vertex: wgpu::VertexState {
+        module: &shader,
+        entry_point: Some("vs_main"),
+        compilation_options: Default::default(),
+        buffers: &[wgpu::VertexBufferLayout {
+          array_stride: vertex_size as u64,
+          step_mode: wgpu::VertexStepMode::Vertex,
+          attributes: &wgpu::vertex_attr_array![
+            0 => Float32x3, // position
+            1 => Float32x3, // normal
+            2 => Float32x2, // uv
+            3 => Float32,   // height
+            4 => Uint32,    // hex_id
+            5 => Float32x3, // barycentric
+          ],
+        }],
+      },
+      fragment: Some(wgpu::FragmentState {
+        module: &shader,
+        entry_point: Some("fs_main"),
+        compilation_options: Default::default(),
+        targets: &[Some(wgpu::ColorTargetState {
+          format: wgpu::TextureFormat::Bgra8UnormSrgb,
+          blend: Some(wgpu::BlendState::REPLACE),
+          write_mask: wgpu::ColorWrites::ALL,
+        })],
+      }),
+      primitive: wgpu::PrimitiveState {
+        topology: wgpu::PrimitiveTopology::TriangleList,
+        cull_mode: Some(wgpu::Face::Back),
+        ..Default::default()
+      },
+      depth_stencil: Some(wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: true,
+        depth_compare: wgpu::CompareFunction::Less,
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+      }),
+      multisample: wgpu::MultisampleState::default(),
+      multiview: None,
+      cache: None,
+    });
+
+    Self {
+      pipeline,
+      vertex_buffer,
+      index_buffer,
+      index_count: i_count as u32,
+      model_buffer,
+      model_bind_group,
+    }
+  }
+}
+
+impl RenderModule for SolidModule
+{
+  fn update(&mut self, queue: &Queue, shared: &SharedState)
+  {
+    let planet_pos_world = DVec3::ZERO;
+    let relative_pos = planet_pos_world - shared.eye_world;
+    let scale = 6_371_000.0_f32;
+
+    let model_mat = Mat4::from_scale_rotation_translation(
+      Vec3::splat(scale),
+      Quat::IDENTITY,
+      relative_pos.as_vec3(),
+    );
+
+    queue.write_buffer(&self.model_buffer, 0, bytemuck::cast_slice(&model_mat.to_cols_array()));
+  }
+
+  fn encode(&self, encoder: &mut wgpu::CommandEncoder, targets: &FrameTargets, shared: &SharedState)
+  {
+    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+      label: Some("Solid Render Pass"),
+      color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+        view: targets.surface_view,
+        resolve_target: None,
+        ops: wgpu::Operations {
+          load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
+          store: wgpu::StoreOp::Store,
+        },
+        depth_slice: None,
+      })],
+      depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+        view: targets.depth_view,
+        depth_ops: Some(wgpu::Operations {
+          load: wgpu::LoadOp::Clear(1.0),
+          store: wgpu::StoreOp::Store,
+        }),
+        stencil_ops: None,
+      }),
+      ..Default::default()
+    });
+
+    render_pass.set_pipeline(&self.pipeline);
+    render_pass.set_bind_group(0, &shared.camera_gpu.bind_group, &[]);
+    render_pass.set_bind_group(1, &self.model_bind_group, &[]);
+    render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+    render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+    render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+  }
+
+  fn as_any_mut(&mut self) -> &mut dyn Any
+  {
+    self
+  }
+}
+
+--- FILE: .\src\render\modules\terrain.rs ---
+
+--- FILE: .\src\render\shaders\solid.wgsl ---
+struct Camera {
+    view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    eye_rel: vec3<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(1) @binding(0) var<uniform> model_mat: mat4x4<f32>;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) height: f32,
+    @location(4) hex_id: u32,
+    @location(5) barycentric: vec3<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) local_pos: vec3<f32>,
+    @location(1) world_rel_pos: vec3<f32>,
+    @location(2) barycentric: vec3<f32>,
+    @location(3) height: f32,
+};
+
+@vertex
+fn vs_main(model: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    
+    // 1. Apply Elevation Displacement
+    // 0.00001 is a safe starting scale for ETOPO meters on a unit-scale planet
+    let displacement = 1.0 + (model.height * 0.00001);
+    let displaced_local = model.position * displacement;
+    
+    // 2. Transform to World Space
+    let world_rel = model_mat * vec4<f32>(displaced_local, 1.0);
+    
+    out.clip_position = camera.view_proj * world_rel;
+    out.local_pos = model.position;
+    out.world_rel_pos = world_rel.xyz;
+    out.barycentric = model.barycentric;
+    out.height = model.height;
+
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // 1. Calculate Face Normal for faceted shading
+    let face_normal = normalize(cross(dpdx(in.world_rel_pos), dpdy(in.world_rel_pos)));
+    
+    // 2. Simple Elevation-based Coloring
+    var base_color = vec3<f32>(0.2, 0.5, 0.2); // Default Green
+    if (in.height < 0.0) {
+        base_color = vec3<f32>(0.05, 0.15, 0.5); // Deep Blue
+    } else if (in.height > 3000.0) {
+        base_color = vec3<f32>(0.9, 0.9, 1.0); // Snow Peaks
+    }
+
+    // 3. Lighting (Directional + Ambient)
+    let light_dir = normalize(vec3<f32>(1.0, 1.0, 1.0));
+    let diff = max(dot(face_normal, light_dir), 0.15);
+    let lit_color = base_color * diff;
+
+    // 4. Barycentric Wireframe Overlay
+    // Use fwidth to keep line thickness consistent regardless of distance
+    let edge_dist = min(in.barycentric.x, min(in.barycentric.y, in.barycentric.z));
+    let delta = fwidth(edge_dist);
+    let wireframe_strength = smoothstep(0.0, delta * 1.5, edge_dist);
+
+    // Dark grid color for the lines
+    let grid_color = vec3<f32>(0.02, 0.02, 0.05);
+    let final_rgb = mix(grid_color, lit_color, wireframe_strength);
+
+    return vec4<f32>(final_rgb, 1.0);
+}
+
+--- FILE: .\src\ui\log_panel.rs ---
+
+--- FILE: .\src\ui\menu.rs ---
+
+--- FILE: .\src\ui\mod.rs ---
+use std::any::Any;
+
+use wgpu::{CommandEncoder, Device, Queue, TextureFormat};
+use winit::window::Window;
+
+use crate::render::module::RenderModule;
+use crate::render::shared::{FrameTargets, SharedState};
+
+pub struct UiSystem
+{
+  pub context: egui::Context,
+  pub state: egui_winit::State,
+  pub renderer: egui_wgpu::Renderer,
+}
+
+impl UiSystem
+{
+  pub fn new(device: &Device, format: TextureFormat, window: &Window) -> Self
+  {
+    let context = egui::Context::default();
+
+    let state = egui_winit::State::new(
+      context.clone(),
+      egui::viewport::ViewportId::ROOT,
+      window,
+      None,
+      None,
+      None,
+    );
+
+    let renderer = egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
+
+    Self { context, state, renderer }
+  }
+}
+
+impl RenderModule for UiSystem
+{
+  fn update(&mut self, _queue: &Queue, _shared: &SharedState) {}
+
+  fn encode(&self, _encoder: &mut CommandEncoder, _targets: &FrameTargets, _shared: &SharedState) {}
+
+  fn as_any_mut(&mut self) -> &mut dyn Any
+  {
+    self
+  }
+}
+
+--- FILE: .\src\ui\overlay.rs ---
+
+--- FILE: .\src\world\body.rs ---
+use glam::DVec3;
+use serde::{Deserialize, Serialize};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  BodyKind
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BodyKind
+{
+    /// Full Earth-class body: real heightmap, texture atlas, biome colours,
+    /// feature layer at highest LOD.
+    Terrestrial,
+
+    /// Rocky planet driven by a baked colour ramp (e.g. Mars, Venus, Moon).
+    Rocky
+    {
+        ramp_index: u8,
+    },
+
+    /// Gas giant â€” banded shader, no hex surface detail.
+    GasGiant
+    {
+        /// Primary band colour (equatorial).
+        band_color_a: [f32; 3],
+        /// Secondary band colour (belt/zone alternation).
+        band_color_b: [f32; 3],
+    },
+
+    /// Asteroid or small moon â€” flat colour, diffuse sun lighting only.
+    SmallBody
+    {
+        base_color: [f32; 3],
+    },
+
+    /// Scene light source. The renderer uses the first Star it finds as the sun.
+    Star
+    {
+        light_color: [f32; 3],
+        luminosity: f32,
+    },
+
+    /// Space station, platform, or constructed structure.
+    /// Uses an arbitrary triangle mesh; no hex grid or heightmap.
+    Manmade,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  OrbitalElements
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrbitalElements
+{
+    /// Semi-major axis in metres.
+    pub semi_major_axis_m: f64,
+    pub eccentricity: f64,
+    /// Inclination relative to the ecliptic, in radians.
+    pub inclination_rad: f64,
+    /// Right ascension of the ascending node, in radians.
+    pub raan_rad: f64,
+    /// Argument of periapsis, in radians.
+    pub arg_of_periapsis_rad: f64,
+    /// Mean anomaly at the reference epoch, in radians.
+    pub mean_anomaly_at_epoch_rad: f64,
+    /// Name of the parent body this one orbits. None = root of the system.
+    pub parent_name: Option<String>,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  BodyManifest
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyManifest
+{
+    /// Unique name â€” matches the baked asset directory name (lowercase).
+    pub name: String,
+
+    pub kind: BodyKind,
+
+    /// Radius in metres.
+    pub radius_m: f64,
+
+    /// Highest available LOD level in the asset bundle.
+    pub lod_max: u8,
+
+    /// World-space position at epoch (metres from system origin).
+    /// Stored as ZERO here â€” OrbitalSimulator places the body correctly on
+    /// the first tick using orbital_elements.
+    pub position_at_epoch: DVec3,
+
+    /// Keplerian orbital elements. None for fixed bodies (Sun, stations).
+    pub orbital_elements: Option<OrbitalElements>,
+
+    /// Axial tilt in radians.
+    pub axial_tilt_rad: f64,
+
+    /// Sidereal rotation period in seconds.
+    pub rotation_period_s: f64,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  BodyConfig â†’ BodyManifest conversion
+//
+//  Called at the end of each body's bake to write body_manifest.bin.
+//  Derives BodyKind from the flat BodyConfig fields using the rules below.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+use crate::bake::registry::BodyConfig;
+
+impl BodyManifest
+{
+    pub fn from_config(config: &BodyConfig) -> Self
+    {
+        let kind = derive_kind(config);
+
+        // Orbital elements â€” only for bodies that actually orbit something.
+        // The Sun (orbit_radius_km == 0) gets None.
+        let orbital_elements = if config.orbit_radius_km > 0.0
+        {
+            Some(OrbitalElements {
+                semi_major_axis_m: config.orbit_radius_km as f64 * 1000.0,
+                eccentricity: config.orbital_eccentricity as f64,
+                inclination_rad: (config.orbital_inclination_deg as f64).to_radians(),
+                // RAAN and arg_of_periapsis default to zero until we source
+                // proper ephemeris data.
+                raan_rad: 0.0,
+                arg_of_periapsis_rad: 0.0,
+                mean_anomaly_at_epoch_rad: config.start_angle_rad as f64,
+                parent_name: config.parent.clone(),
+            })
+        }
+        else
+        {
+            None
+        };
+
+        Self {
+            name: config.name.to_lowercase(),
+            kind,
+            radius_m: config.radius_km as f64 * 1000.0,
+            lod_max: config.lod_max,
+            position_at_epoch: DVec3::ZERO,
+            orbital_elements,
+            axial_tilt_rad: (config.axial_tilt_deg as f64).to_radians(),
+            rotation_period_s: config.rotation_period_hours as f64 * 3600.0,
+        }
+    }
+}
+
+/// Derive BodyKind from flat BodyConfig fields.
+///
+/// Rules (in priority order):
+///   is_star                â†’ Star
+///   use_real_data          â†’ Terrestrial
+///   radius_km >= 24_000    â†’ GasGiant  (Jupiter ~71k, Saturn ~58k, Uranus ~25k, Neptune ~24k)
+///   radius_km >= 1_500     â†’ Rocky     (Mars ~3.4k, Venus ~6k, Moon ~1.7k, Pluto ~1.2k)
+///   radius_km <  1_500     â†’ SmallBody (Ceres ~473, Vesta ~263, Charon ~606)
+fn derive_kind(c: &BodyConfig) -> BodyKind
+{
+    if c.is_star
+    {
+        return BodyKind::Star {
+            light_color: [c.color[0], c.color[1], c.color[2]],
+            luminosity: 1.0,
+        };
+    }
+
+    if c.use_real_data
+    {
+        return BodyKind::Terrestrial;
+    }
+
+    if c.radius_km >= 24_000.0
+    {
+        return BodyKind::GasGiant {
+            band_color_a: [c.color[0], c.color[1], c.color[2]],
+            // Darker secondary band derived from the primary colour.
+            band_color_b: [
+                (c.color[0] * 0.7).min(1.0),
+                (c.color[1] * 0.7).min(1.0),
+                (c.color[2] * 0.7).min(1.0),
+            ],
+        };
+    }
+
+    if c.radius_km >= 1_500.0
+    {
+        return BodyKind::Rocky { ramp_index: 0 };
+    }
+
+    BodyKind::SmallBody { base_color: [c.color[0], c.color[1], c.color[2]] }
+}
+
+--- FILE: .\src\world\chunk_reader.rs ---
+
+--- FILE: .\src\world\hex.rs ---
+
+--- FILE: .\src\world\manifest_loader.rs ---
+use std::path::Path;
+
+use crate::core::log::{LogLevel, Logger};
+use crate::world::body::BodyManifest;
+
+/// Scans the baked output directory for `*.manifest` files, deserialises
+/// each one, and returns them as a Vec.
+///
+/// Called once at startup. The Vec is passed into App::new() and then into
+/// SharedState::new() where the BodyRegistry is populated.
+///
+/// Errors on individual manifests are logged and skipped â€” a single corrupt
+/// file won't prevent the rest of the system from loading.
+pub fn load_all_manifests(
+    baked_dir: &Path,
+    logger: &mut Logger,
+) -> anyhow::Result<Vec<BodyManifest>>
+{
+    let mut manifests = Vec::new();
+
+    let entries = std::fs::read_dir(baked_dir).map_err(|e| {
+        anyhow::anyhow!("Cannot read baked dir {:?}: {}", baked_dir, e)
+    })?;
+
+    for entry in entries
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(|e| e.to_str()) != Some("manifest")
+        {
+            continue;
+        }
+
+        match load_single_manifest(&path)
+        {
+            Ok(manifest) =>
+            {
+                logger.emit(
+                    LogLevel::Info,
+                    &format!("Loaded manifest: {} ({:?})", manifest.name, manifest.kind),
+                );
+                manifests.push(manifest);
+            }
+            Err(e) =>
+            {
+                logger.emit(
+                    LogLevel::Error,
+                    &format!("Failed to load manifest {:?}: {}", path, e),
+                );
+            }
+        }
+    }
+
+    logger.emit(
+        LogLevel::Info,
+        &format!("BodyRegistry: {} bodies available", manifests.len()),
+    );
+
+    Ok(manifests)
+}
+
+fn load_single_manifest(path: &Path) -> anyhow::Result<BodyManifest>
+{
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("Read error: {}", e))?;
+
+    let manifest: BodyManifest = bincode::deserialize(&bytes)
+        .map_err(|e| anyhow::anyhow!("Deserialise error: {}", e))?;
+
+    Ok(manifest)
+}
+
+--- FILE: .\src\world\mod.rs ---
+pub mod body;
+pub mod registry;
+pub mod manifest_loader;
+
+--- FILE: .\src\world\registry.rs ---
+use glam::DVec3;
+
+use crate::world::body::BodyManifest;
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  StreamingStatus
+//
+//  Tracks what the BodyStreamManager has loaded for this body so the renderer
+//  knows what it can safely draw this frame.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingStatus
+{
+    /// Manifest loaded, no GPU resources yet. Body not visible this frame.
+    Pending,
+    /// Mesh at this LOD level is on the GPU and ready to draw.
+    Ready
+    {
+        current_lod: u8,
+    },
+    /// A finer LOD is being streamed in the background; draw current_lod
+    /// until the upgrade arrives.
+    Upgrading
+    {
+        current_lod: u8,
+        target_lod: u8,
+    },
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  CameraFocus
+//
+//  Controls the floating-origin anchor for the free camera.
+//  Body(usize) holds an index into BodyRegistry::bodies.
+//
+//  The focal body is sticky â€” it only changes when the player explicitly
+//  focuses a new body, or when spawn_body() is called with focus: true.
+//  During time skip the camera tracks the focal body's orbital motion,
+//  so the skip feels like a timelapse rather than a jump cut.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CameraFocus
+{
+    /// Floating origin is anchored to this body's world_pos.
+    Body(usize),
+    /// No body anchor â€” floating origin follows the camera position directly.
+    /// Used in deep space with no nearby body of interest.
+    Freepoint,
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  BodyState
+//
+//  Runtime state for one body â€” updated every frame by the orbital sim
+//  and the streaming system. Kept separate from BodyManifest so the manifest
+//  can be immutable once loaded.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub struct BodyState
+{
+    /// Immutable description loaded from disk.
+    pub manifest: BodyManifest,
+
+    /// Current world-space position in metres (f64 precision).
+    /// For orbiting bodies: updated every frame by OrbitalSimulator.
+    /// For fixed bodies: always equal to manifest.position_at_epoch.
+    pub world_pos: DVec3,
+
+    /// Current rotation angle around the axial tilt axis, in radians.
+    /// Incremented every frame by (2Ï€ / rotation_period_s) * dt.
+    pub rotation_angle: f64,
+
+    /// What the streaming system currently has resident on the GPU.
+    pub streaming: StreamingStatus,
+}
+
+impl BodyState
+{
+    pub fn new(manifest: BodyManifest) -> Self
+    {
+        let world_pos = manifest.position_at_epoch;
+        Self {
+            manifest,
+            world_pos,
+            rotation_angle: 0.0,
+            streaming: StreamingStatus::Pending,
+        }
+    }
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  BodyRegistry
+//
+//  The single source of truth for all bodies in the active world.
+//  Lives in SharedState so every system (renderer, orbital sim, camera,
+//  streaming) reads from the same place.
+//
+//  Indexing is stable within a session â€” bodies are never removed, only
+//  added. spawn_body() pushes to the end; existing indices never change.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub struct BodyRegistry
+{
+    pub bodies: Vec<BodyState>,
+
+    /// Which body the free camera is anchored to, or Freepoint.
+    pub camera_focus: CameraFocus,
+}
+
+impl BodyRegistry
+{
+    pub fn new() -> Self
+    {
+        Self { bodies: Vec::new(), camera_focus: CameraFocus::Freepoint }
+    }
+
+    /// Add a new body. Returns its stable index.
+    /// If focus is true, shifts camera_focus to this body immediately.
+    pub fn spawn(&mut self, manifest: BodyManifest, focus: bool) -> usize
+    {
+        let index = self.bodies.len();
+        self.bodies.push(BodyState::new(manifest));
+        if focus
+        {
+            self.camera_focus = CameraFocus::Body(index);
+        }
+        index
+    }
+
+    /// The body the camera is currently anchored to, if any.
+    pub fn focal_body(&self) -> Option<&BodyState>
+    {
+        match self.camera_focus
+        {
+            CameraFocus::Body(idx) => self.bodies.get(idx),
+            CameraFocus::Freepoint => None,
+        }
+    }
+
+    /// World-space offset to subtract when building camera-relative transforms.
+    /// If anchored to a body, returns that body's world_pos.
+    /// If Freepoint, returns DVec3::ZERO (caller should use eye_world instead).
+    pub fn floating_origin(&self) -> DVec3
+    {
+        self.focal_body().map(|b| b.world_pos).unwrap_or(DVec3::ZERO)
+    }
+
+    /// Find the nearest body to a given world-space position.
+    /// Returns None only if the registry is empty.
+    pub fn nearest_to(&self, pos: DVec3) -> Option<(usize, f64)>
+    {
+        self.bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, (b.world_pos - pos).length()))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+    }
+}

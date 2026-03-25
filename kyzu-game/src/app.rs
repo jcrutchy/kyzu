@@ -12,6 +12,7 @@ use crate::core::time::TimeState;
 use crate::input::state::InputState;
 use crate::render::kernel::Renderer;
 use crate::render::modules::solid::SolidModule;
+use crate::world::body;
 
 pub struct App
 {
@@ -21,11 +22,16 @@ pub struct App
   pub time: TimeState,
   pub window: Option<Arc<Window>>,
   pub renderer: Option<Renderer>,
+  pub pending_manifests: Vec<body::BodyManifest>,
 }
 
 impl App
 {
-  pub fn new(config: KyzuConfig, logger: Logger) -> Self
+  pub fn new(
+    config: KyzuConfig,
+    logger: Logger,
+    manifests: Vec<crate::world::body::BodyManifest>,
+  ) -> Self
   {
     Self {
       config,
@@ -34,6 +40,7 @@ impl App
       time: TimeState::new(),
       window: None,
       renderer: None,
+      pending_manifests: manifests,
     }
   }
 }
@@ -59,6 +66,15 @@ impl ApplicationHandler for App
       // Resolve the test mesh path: [data_dir] / [test_mesh]
       let test_mesh_path =
         PathBuf::from(&self.config.app.data_dir).join(&self.config.app.test_mesh);
+
+      let manifests = std::mem::take(&mut self.pending_manifests);
+      for manifest in manifests
+      {
+        let name = manifest.name.clone();
+        let kind = format!("{:?}", manifest.kind);
+        renderer.shared.body_registry.spawn(manifest, false);
+        self.logger.emit(LogLevel::Info, &format!("Spawned body: {} ({})", name, kind));
+      }
 
       // Only load the SolidModule if the file actually exists (our "Test Mode" check)
       if test_mesh_path.exists()

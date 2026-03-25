@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-glam = "0.32"
+glam = { version = "0.32", features = ["serde"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -18,3 +18,4 @@ egui-winit = { version = "0.33", default-features = false, features = ["clipboar
 egui-wgpu = { version = "0.33", default-features = false }
 anyhow = "1.0.102"
 flate2 = "1"
+bincode = "1.3"

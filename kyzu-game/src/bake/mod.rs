@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use crate::bake::registry::{load_bodies, BodyConfig};
 use crate::bake::subdivider::Subdivider;
 use crate::bake::tiff_reader::EtopoTiff;
-use crate::core::config::KyzuConfig; // Ensure this matches your project structure
+use crate::core::config::KyzuConfig;
 use crate::core::log::{LogLevel, Logger};
+use crate::world::body::BodyManifest;
 
 pub struct BakeManager
 {
@@ -147,6 +148,8 @@ impl BakeManager
     // Note: We pass an empty slice for indices because the mesh is now non-indexed
     self.save_bake_to_disk(output_path.to_str().unwrap(), &flat_vertices, &[])?;
 
+    self.write_manifest(body, logger)?;
+
     logger.emit(
       LogLevel::Info,
       &format!("[DONE] Baked {} ({} triangles)", body.name, flat_vertices.len() / 3),
@@ -178,6 +181,31 @@ impl BakeManager
     writer.write_all(bytemuck::cast_slice(indices))?;
 
     writer.flush()?;
+    Ok(())
+  }
+
+  fn write_manifest(&self, body: &BodyConfig, logger: &mut Logger) -> anyhow::Result<()>
+  {
+    let manifest = BodyManifest::from_config(body);
+
+    let path = self.output_root.join(format!("{}.manifest", body.name.to_lowercase()));
+
+    let bytes = bincode::serialize(&manifest)
+      .map_err(|e| anyhow::anyhow!("Failed to serialise manifest for {}: {}", body.name, e))?;
+
+    std::fs::write(&path, &bytes)?;
+
+    logger.emit(
+      LogLevel::Info,
+      &format!(
+        "Wrote manifest: {} ({:?}, radius {:.0}km, lod_max {})",
+        path.display(),
+        manifest.kind,
+        manifest.radius_m / 1000.0,
+        manifest.lod_max,
+      ),
+    );
+
     Ok(())
   }
 }

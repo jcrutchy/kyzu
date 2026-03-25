@@ -1,6 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::*;
 
+use crate::world::registry::BodyRegistry;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode
 {
@@ -96,6 +98,7 @@ pub struct SharedState
   pub screen_height: u32,
   pub target_body_pos: glam::DVec3,
   pub eye_world: glam::DVec3,
+  pub body_registry: BodyRegistry,
 }
 
 impl SharedState
@@ -121,7 +124,7 @@ impl SharedState
     });
 
     let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
-
+    let body_registry = BodyRegistry::new();
     Self {
       mode: CameraMode::Orbital,
       camera,
@@ -132,7 +135,8 @@ impl SharedState
       screen_width: width,
       screen_height: height,
       target_body_pos: glam::DVec3::ZERO,
-      eye_world: glam::DVec3::new(0.0, 0.0, 5.0), // Start 5m back in f64
+      eye_world: glam::DVec3::new(0.0, 0.0, 5.0),
+      body_registry,
     }
   }
 }
