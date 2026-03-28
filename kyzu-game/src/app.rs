@@ -11,8 +11,8 @@ use crate::core::log::{LogLevel, Logger};
 use crate::core::time::TimeState;
 use crate::input::state::InputState;
 use crate::render::kernel::Renderer;
-use crate::render::modules::solid::SolidModule;
-use crate::world::body;
+use crate::render::modules::body_renderer::BodyRenderer;
+use crate::world::body::BodyManifest;
 
 pub struct App
 {
@@ -22,16 +22,12 @@ pub struct App
   pub time: TimeState,
   pub window: Option<Arc<Window>>,
   pub renderer: Option<Renderer>,
-  pub pending_manifests: Vec<body::BodyManifest>,
+  pub pending_manifests: Vec<BodyManifest>,
 }
 
 impl App
 {
-  pub fn new(
-    config: KyzuConfig,
-    logger: Logger,
-    manifests: Vec<crate::world::body::BodyManifest>,
-  ) -> Self
+  pub fn new(config: KyzuConfig, logger: Logger, manifests: Vec<BodyManifest>) -> Self
   {
     Self {
       config,
@@ -59,14 +55,10 @@ impl ApplicationHandler for App
         Arc::new(event_loop.create_window(window_attributes).expect("Failed to create window"));
 
       let mut renderer = pollster::block_on(Renderer::new(window.clone()))
-        .expect("Failed to initialize GPU Renderer");
+        .expect("Failed to initialize GPU renderer");
 
-      // --- Framework Logic: Add modules based on config ---
-
-      // Resolve the test mesh path: [data_dir] / [test_mesh]
-      let test_mesh_path =
-        PathBuf::from(&self.config.app.data_dir).join(&self.config.app.test_mesh);
-
+      // Move manifests into the registry before building any GPU resources,
+      // so BodyRenderer can see the full registry in its constructor.
       let manifests = std::mem::take(&mut self.pending_manifests);
       for manifest in manifests
       {
@@ -76,29 +68,27 @@ impl ApplicationHandler for App
         self.logger.emit(LogLevel::Info, &format!("Spawned body: {} ({})", name, kind));
       }
 
-      // Only load the SolidModule if the file actually exists (our "Test Mode" check)
-      if test_mesh_path.exists()
-      {
-        let solid_mod =
-          SolidModule::new(&renderer.device, &renderer.shared, &test_mesh_path, &mut self.logger);
-        renderer.add_module(solid_mod);
-        self.logger.emit(LogLevel::Info, "Test SolidModule loaded.");
-      }
+      // Resolve the icosphere mesh path used as the base geometry for all bodies
+      let mesh_path =
+        PathBuf::from(&self.config.app.data_dir).join("primitives").join("icosahedron.bake");
 
-      // TODO: Later, we will loop through self.config.world and add PlanetModules here
+      let body_renderer =
+        BodyRenderer::new(&renderer.device, &renderer.shared, &mesh_path, &mut self.logger);
+      renderer.add_module(body_renderer);
 
-      // --- Finalize Renderer Setup ---
+      // Prime the camera and upload initial matrices
       renderer.camera_system.update(&mut renderer.shared, &mut self.input, 0.016);
       renderer.shared.camera_gpu.upload(&renderer.queue, &renderer.shared.camera);
 
       self.renderer = Some(renderer);
       self.window = Some(window);
+
       if let Some(renderer) = &self.renderer
       {
-        let mode_msg = format!("Initial Camera Mode: {:?}", renderer.shared.mode);
+        let mode_msg = format!("Initial camera mode: {:?}", renderer.shared.mode);
         self.logger.emit(LogLevel::Info, &mode_msg);
       }
-      self.logger.emit(LogLevel::Info, "Kyzu Engine Initialized (Modular Architecture)");
+      self.logger.emit(LogLevel::Info, "Kyzu engine initialised");
     }
   }
 
@@ -124,7 +114,6 @@ impl ApplicationHandler for App
 
         match key
         {
-          // Handle Escape (Exit)
           Key::Named(NamedKey::Escape) =>
           {
             self.logger.emit(LogLevel::Info, "Exit requested via Escape.");
@@ -132,7 +121,6 @@ impl ApplicationHandler for App
             event_loop.exit();
           }
 
-          // Handle Tab (Camera Toggle)
           Key::Named(NamedKey::Tab) =>
           {
             if let Some(renderer) = &mut self.renderer
@@ -143,7 +131,7 @@ impl ApplicationHandler for App
                 CameraMode::Free => CameraMode::Orbital,
                 CameraMode::Orbital => CameraMode::Free,
               };
-              self.logger.emit(LogLevel::Info, &format!("Camera Mode: {:?}", renderer.shared.mode));
+              self.logger.emit(LogLevel::Info, &format!("Camera mode: {:?}", renderer.shared.mode));
             }
           }
 
