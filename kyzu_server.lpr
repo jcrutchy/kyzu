@@ -1,58 +1,22 @@
 program kyzu_server;
-
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, fpjson, jsonparser
-  {$IFDEF WINDOWS} , Windows {$ELSE} , BaseUnix, Termio {$ENDIF};
+  SysUtils, Classes, SyncObjs, fpjson, jsonparser;
 
-// Helper function to check if bytes are waiting on standard input without blocking
-function IsInputAvailable: Boolean;
-{$IFDEF WINDOWS}
 var
-  H: THandle;
-  Events: DWORD;
-  NumRead: DWORD;
-  InputRecord: TInputRecord;
-  FileType: DWORD;
-begin
-  Result := False;
-  H := GetStdHandle(STD_INPUT_HANDLE);
-  FileType := GetFileType(H);
+  OutputLock: TCriticalSection;
 
-  if FileType = FILE_TYPE_PIPE then
-  begin
-    PeekNamedPipe(H, nil, 0, nil, @Events, nil);
-    Result := (Events > 0);
-  end
-  else if FileType = FILE_TYPE_CHAR then
-  begin
-    GetNumberOfConsoleInputEvents(H, Events);
-    if Events > 0 then
-    begin
-      // Explicitly cast to PInputRecord to satisfy strict type-checking on arg no. 2
-      PeekConsoleInput(H, PInputRecord(@InputRecord)^, 1, NumRead);
-      Result := (NumRead > 0) and (InputRecord.EventType = KEY_EVENT) and (InputRecord.Event.KeyEvent.bKeyDown);
-    end;
+procedure SendLine(const ALine: string);
+begin
+  OutputLock.Enter;
+  try
+    WriteLn(ALine);
+    Flush(Output);
+  finally
+    OutputLock.Leave;
   end;
 end;
-{$ELSE}
-var
-  fds:ofd_set;
-  timeout:timeval;
-  res: cint;
-begin
-  // Standard input file descriptor is 0
-  fpFD_ZERO(fds);
-  fpFD_SET(0, fds);
-
-  timeout.tv_sec := 0;
-  timeout.tv_usec := 0; // Return immediately (polling mode)
-
-  res := fpSelect(1, @fds, nil, nil, @timeout);
-  Result := (res > 0) and fpFD_ISSET(0, fds);
-end;
-{$ENDIF}
 
 procedure DispatchIncoming(const ALine: string);
 var
@@ -71,41 +35,53 @@ begin
     Topic := Obj.Get('topic', '');
 
     if Topic = 'game.cmd.ping' then
-    begin
-      WriteLn('{"topic":"game.event.pong","payload":"{}"}');
-      Flush(Output);
-    end;
+      SendLine('{"topic":"game.event.pong","payload":"{}"}');
     // add more topic handlers here as the command set grows
   finally
     Data.Free;
   end;
 end;
 
+type
+  // Plain blocking ReadLn on its own thread - same idiom as VDRX's own
+  // vdrx_stdin.pas. Deliberately not polling IsInputAvailable on the main
+  // thread: that doesn't mix reliably with FPC's buffered Text I/O on the
+  // same handle (PeekNamedPipe only sees the OS-level pipe buffer, not
+  // bytes the runtime may already have pulled into its own internal
+  // buffer), so input can silently go undetected.
+  TStdinReaderThread = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+
+procedure TStdinReaderThread.Execute;
 var
   Line: string;
+begin
+  WriteLn(StdErr, 'reader thread started, waiting for input...');
+  while not Terminated do
+  begin
+    if Eof(Input) then Break; // stdin closed - bridge is gone, VDRX will restart us
+    ReadLn(Line);
+    WriteLn(StdErr, 'got line: ' + Line); // <-- new
+    if Line <> '' then
+      DispatchIncoming(Line);
+  end;
+  WriteLn(StdErr, 'reader thread exiting'); // <-- new
+end;
+
+var
+  ReaderThread: TStdinReaderThread;
   Tick: Int64;
 begin
   Tick := 0;
-
-  // Optional: Disable input buffering if dealing with line-oriented pipes
-  {$IFNDEF WINDOWS}
-  // Ensures raw character streaming if necessary
-  {$ENDIF}
+  OutputLock := TCriticalSection.Create;
+  ReaderThread := TStdinReaderThread.Create(False); // starts immediately
 
   while True do
   begin
-    if IsInputAvailable then
-    begin
-      if Eof(Input) then Break;
-      ReadLn(Line);
-      if Line <> '' then
-        DispatchIncoming(Line);
-    end;
-
     Inc(Tick);
-    WriteLn(Format('{"topic":"game.tick","payload":"{\"tick\":%d}"}', [Tick]));
-    Flush(Output); // Critical - prevents pipe stalling on the bridge side
-
-    Sleep(50);     // ~20 ticks/sec target loop pacing
+    SendLine(Format('{"topic":"game.tick","payload":"{\"tick\":%d}"}', [Tick]));
+    Sleep(50); // ~20 ticks/sec target loop pacing
   end;
 end.

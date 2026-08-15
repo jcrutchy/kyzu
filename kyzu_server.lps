@@ -9,7 +9,8 @@
         <Filename Value="kyzu_server.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <CursorPos X="20" Y="3"/>
+        <TopLine Value="54"/>
+        <CursorPos X="17" Y="73"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
@@ -22,7 +23,7 @@
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="6">
+    <JumpHistory HistoryIndex="7">
       <Position>
         <Filename Value="kyzu_server.lpr"/>
         <Caret Line="15" Column="27"/>
@@ -50,6 +51,10 @@
       <Position>
         <Filename Value="C:\lazarus\fpc\3.2.2\source\rtl\win\wininc\redef.inc"/>
         <Caret Line="723" Column="10" TopLine="706"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_server.lpr"/>
+        <Caret Line="12" Column="44"/>
       </Position>
     </JumpHistory>
     <RunParams>
