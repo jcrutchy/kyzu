@@ -2,11 +2,20 @@ program kyzu_bake_terrain;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, FPImage, FPWritePNG;
+  SysUtils, FPImage, FPWritePNG, kyzu_geotiff;
 
 const
-  GridW = 360;
-  GridH = 180;
+  GridW = 360;  // 1 cell/degree for this first real-data pass - coarse on
+  GridH = 180;  // purpose, to keep it fast while validating correctness.
+
+  // GlobCover's actual coverage per its readme: full longitude (-180..180)
+  // but only 90N down to 65S in latitude - Antarctica isn't included.
+  // Anything south of 65S gets treated as permanent ice (class 220) below,
+  // since that's a reasonable stand-in for what GlobCover simply doesn't map.
+  SourceLatNorth = 90.0;
+  SourceLatSouth = -65.0;
+
+  SourceTIFFPath = 'C:\dev\kyzu_data\Globcover2009_V2.3_Global_\GLOBCOVER_L4_200901_200912_V2.3.tif';
 
 type
   TGlobCoverClass = record
@@ -16,13 +25,30 @@ type
   end;
 
 const
-  // Subset for the stub pattern - full 23-class table goes here once the
-  // real GeoTIFF reader is wired in.
-  GlobCoverClasses: array[0..3] of TGlobCoverClass = (
-    (ID: 210; R:  0; G: 70; B:200; Name: 'Water bodies'),
-    (ID: 140; R:255; G:180; B: 50; Name: 'Herbaceous/grassland/savanna'),
-    (ID:  40; R:  0; G:100; B:  0; Name: 'Broadleaved evergreen forest'),
-    (ID: 200; R:255; G:245; B:215; Name: 'Bare areas')
+  GlobCoverClasses: array[0..22] of TGlobCoverClass = (
+    (ID: 11;  R:170; G:240; B:240; Name: 'Irrigated cropland (or aquatic)'),
+    (ID: 14;  R:255; G:255; B:100; Name: 'Rainfed cropland'),
+    (ID: 20;  R:220; G:240; B:100; Name: 'Cropland/vegetation mosaic'),
+    (ID: 30;  R:205; G:205; B:102; Name: 'Vegetation/cropland mosaic'),
+    (ID: 40;  R:  0; G:100; B:  0; Name: 'Broadleaved evergreen forest'),
+    (ID: 50;  R:  0; G:160; B:  0; Name: 'Broadleaved deciduous forest'),
+    (ID: 60;  R:170; G:200; B:  0; Name: 'Open deciduous forest/woodland'),
+    (ID: 70;  R:  0; G: 60; B:  0; Name: 'Needleleaved evergreen forest'),
+    (ID: 90;  R: 40; G:100; B:  0; Name: 'Open needleleaved forest'),
+    (ID:100;  R:120; G:130; B:  0; Name: 'Mixed forest'),
+    (ID:110;  R:140; G:160; B:  0; Name: 'Forest/shrubland/grassland mosaic'),
+    (ID:120;  R:190; G:150; B:  0; Name: 'Grassland/forest mosaic'),
+    (ID:130;  R:150; G:100; B:  0; Name: 'Shrubland'),
+    (ID:140;  R:255; G:180; B: 50; Name: 'Herbaceous/grassland/savanna'),
+    (ID:150;  R:255; G:235; B:175; Name: 'Sparse vegetation'),
+    (ID:160;  R:  0; G:120; B: 90; Name: 'Flooded broadleaved forest'),
+    (ID:170;  R:  0; G:150; B:120; Name: 'Flooded forest/shrubland (saline)'),
+    (ID:180;  R:  0; G:220; B:130; Name: 'Flooded grassland/wetland'),
+    (ID:190;  R:195; G: 20; B:  0; Name: 'Urban/artificial surfaces'),
+    (ID:200;  R:255; G:245; B:215; Name: 'Bare areas'),
+    (ID:210;  R:  0; G: 70; B:200; Name: 'Water bodies'),
+    (ID:220;  R:255; G:255; B:255; Name: 'Permanent snow/ice'),
+    (ID:230;  R:  0; G:  0; B:  0; Name: 'No data')
   );
 
 function ClassColor(AID: Byte): TFPColor;
@@ -38,40 +64,70 @@ begin
       Result.Alpha := $FFFF;
       Exit;
     end;
-  Result := colBlack; // unknown class - shouldn't happen once real data is wired in
+  // Unrecognised ID - magenta so it's obvious in the output rather than
+  // silently blending in as black, if the real file has a class value
+  // this table doesn't account for.
+  Result.Red := $FFFF; Result.Green := 0; Result.Blue := $FFFF; Result.Alpha := $FFFF;
 end;
 
 var
   Img: TFPMemoryImage;
   Writer: TFPWriterPNG;
+  Reader: TGeoTIFFReader;
   x, y: Integer;
-  StubClassID: Byte;
+  Lon, Lat: Double;
+  SrcX, SrcY: Integer;
+  ClassID: Byte;
 begin
-  Img := TFPMemoryImage.Create(GridW, GridH);
+  WriteLn('Opening ', SourceTIFFPath, ' ...');
+  Reader := TGeoTIFFReader.Create(SourceTIFFPath);
   try
-    for y := 0 to GridH - 1 do
-      for x := 0 to GridW - 1 do
+    WriteLn('Source: ', Reader.Width, ' x ', Reader.Height);
+
+    Img := TFPMemoryImage.Create(GridW, GridH);
+    try
+      for y := 0 to GridH - 1 do
       begin
-        // Placeholder checkerboard until the real GeoTIFF reader replaces
-        // this loop with actual pixel classification - proves the
-        // bake -> PNG -> served -> viewable pipeline first.
-        case (x div 30 + y div 30) mod 4 of
-          0: StubClassID := 210;
-          1: StubClassID := 140;
-          2: StubClassID := 40;
-          else StubClassID := 200;
+        for x := 0 to GridW - 1 do
+        begin
+          // Cell centre in lon/lat.
+          Lon := -180.0 + (x + 0.5) * (360.0 / GridW);
+          Lat := 90.0 - (y + 0.5) * (180.0 / GridH);
+
+          if Lat < SourceLatSouth then
+            ClassID := 220 // south of GlobCover's coverage - treat as ice
+          else
+          begin
+            // Nearest-neighbour into source pixel space. GlobCover is
+            // already Plate Carree/equirectangular, same as this grid,
+            // so this is a direct linear mapping - no reprojection needed.
+            SrcX := Round((Lon - (-180.0)) / 360.0 * Reader.Width);
+            SrcY := Round((SourceLatNorth - Lat) / (SourceLatNorth - SourceLatSouth) * Reader.Height);
+            if SrcX < 0 then SrcX := 0;
+            if SrcX >= Reader.Width then SrcX := Reader.Width - 1;
+            if SrcY < 0 then SrcY := 0;
+            if SrcY >= Reader.Height then SrcY := Reader.Height - 1;
+
+            ClassID := Reader.GetByteSample(SrcX, SrcY);
+          end;
+
+          Img.Colors[x, y] := ClassColor(ClassID);
         end;
-        Img.Colors[x, y] := ClassColor(StubClassID);
+        if y mod 20 = 0 then
+          WriteLn('  row ', y, '/', GridH);
       end;
 
-    Writer := TFPWriterPNG.Create;
-    try
-      Img.SaveToFile('terrain.png', Writer);
+      Writer := TFPWriterPNG.Create;
+      try
+        Img.SaveToFile('terrain.png', Writer);
+      finally
+        Writer.Free;
+      end;
     finally
-      Writer.Free;
+      Img.Free;
     end;
   finally
-    Img.Free;
+    Reader.Free;
   end;
-  WriteLn('Wrote terrain.png (', GridW, 'x', GridH, ' placeholder grid)');
+  WriteLn('Wrote terrain.png (', GridW, 'x', GridH, ' from real GlobCover data)');
 end.
