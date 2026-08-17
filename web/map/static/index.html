@@ -26,6 +26,32 @@
     line-height: 1.5;
   }
   #hud .dim { color: #5c6b62; }
+
+  #layerPanel {
+    position: fixed; top: 10px; right: 10px;
+    background: rgba(10,14,12,0.85);
+    border: 1px solid #1c2620;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #c9d6cd;
+    min-width: 160px;
+  }
+  #layerPanel .section { margin-bottom: 8px; }
+  #layerPanel .label { color: #5c6b62; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  #layerPanel button {
+    background: #0f1512; border: 1px solid #1c2620; color: #5c6b62;
+    font: inherit; font-size: 11px; padding: 4px 8px; margin-right: 4px; margin-bottom: 4px;
+    cursor: pointer;
+  }
+  #layerPanel button.active { color: #5ee6a8; border-color: #2c5c46; }
+  #layerPanel button:hover { color: #5ee6a8; }
+  #layerPanel select {
+    background: #0f1512; border: 1px solid #1c2620; color: #c9d6cd;
+    font: inherit; font-size: 11px; padding: 3px 6px; width: 100%;
+  }
+  #layerPanel input[type=range] { width: 100%; margin-top: 4px; }
+  #overlayOpacityRow { display: none; }
+  #overlayOpacityRow.shown { display: block; }
 </style>
 </head>
 <body>
@@ -36,15 +62,47 @@
   lon/lat: <span id="hudLonLat">-</span>
 </div>
 
+<div id="layerPanel">
+  <div class="section">
+    <div class="label">base layer</div>
+    <button id="btnBaseLandcover" class="active">Land Cover</button>
+    <button id="btnBaseHeightmap">Elevation</button>
+  </div>
+  <div class="section">
+    <div class="label">overlay</div>
+    <select id="overlaySelect">
+      <option value="none">None</option>
+      <option value="landcover">Land Cover</option>
+      <option value="heightmap">Elevation</option>
+    </select>
+    <div id="overlayOpacityRow">
+      <input type="range" id="overlayOpacity" min="0" max="100" value="50">
+    </div>
+  </div>
+</div>
+
 <script>
 (function(){
-  // MUST match whatever max level the tile pyramid was actually baked to
-  // (kyzu_bake_tiles <level>) - tiles beyond this simply won't exist on
-  // disk and will 404 silently (handled below, just won't render).
-  const MAX_LEVEL = 6;
-  const MIN_LEVEL = 0;
   const TILE_SIZE = 256;
-  const TILES_PATH = 'http://127.0.0.1:8092/tiles'; // relative to this page - served as static files
+  const MIN_LEVEL = 0;
+
+  // Each layer is an independent tile pyramid - MUST match whatever max
+  // level that layer was actually baked to (kyzu_bake_tiles <level> /
+  // kyzu_bake_heightmap_tiles <level>). Tiles beyond a layer's own
+  // maxLevel simply don't exist and fail to load silently (handled - see
+  // getTile), so mismatched values here just mean that layer stops
+  // getting more detailed past that zoom, not a crash.
+  const LAYERS = {
+    landcover: { name: 'Land Cover', path: 'http://127.0.0.1:8092/tiles',           maxLevel: 6, cache: new Map() },
+    heightmap: { name: 'Elevation',  path: 'http://127.0.0.1:8092/tiles_heightmap', maxLevel: 6, cache: new Map() }
+  };
+  const GLOBAL_MAX_LEVEL = Math.max(...Object.values(LAYERS).map(l => l.maxLevel));
+
+  const state = {
+    baseLayer: 'landcover',
+    overlayLayer: 'none',
+    overlayOpacity: 0.5
+  };
 
   const canvas = document.getElementById('mapCanvas');
   const ctx = canvas.getContext('2d');
@@ -52,12 +110,6 @@
   const hudLevel = document.getElementById('hudLevel');
   const hudLonLat = document.getElementById('hudLonLat');
 
-  // View state - lon/lat is the world point at screen centre, zoom is
-  // continuous (not snapped to integer levels) so scaling feels smooth;
-  // only *which tile images get fetched* snaps to the nearest integer
-  // level, everything else (screen position/size) uses the exact
-  // fractional zoom, which is what makes the in-between scaling smooth
-  // rather than jumping in discrete steps.
   const view = { lon: 0, lat: 0, zoom: 2 };
 
   function resizeCanvas() {
@@ -67,12 +119,6 @@
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  // ---- projection: lon/lat <-> world pixel space at a given zoom ----
-  // World pixel space at zoom z has TILE_SIZE * 2^(z+1) px across the
-  // full 360 degrees of longitude, and TILE_SIZE * 2^z px across the full
-  // 180 degrees of latitude - matching the bake tool's tile layout
-  // (level L = 2^(L+1) x 2^L tiles), just evaluated at a continuous z
-  // instead of an integer level.
   function worldPixelWidth(z)  { return TILE_SIZE * Math.pow(2, z + 1); }
   function worldPixelHeight(z) { return TILE_SIZE * Math.pow(2, z); }
 
@@ -89,39 +135,32 @@
     };
   }
 
-  // ---- tile cache ----
-  // No eviction yet - fine up to MAX_LEVEL ~6-7 (a few thousand tiles,
-  // trivial for browser memory). Worth adding an LRU cap before pushing
-  // MAX_LEVEL much higher, since tile count roughly quadruples per level.
-  const tileCache = new Map();
-  function getTile(z, x, y) {
+  function getTile(layerKey, z, x, y) {
+    const layer = LAYERS[layerKey];
     const key = z + '/' + x + '/' + y;
-    let entry = tileCache.get(key);
+    let entry = layer.cache.get(key);
     if (!entry) {
       const img = new Image();
       entry = { img: img, loaded: false, failed: false };
       img.onload = () => { entry.loaded = true; };
-      img.onerror = () => { entry.failed = true; }; // tile doesn't exist - fine, just skip drawing it
-      img.src = TILES_PATH + '/' + key + '.png';
-      tileCache.set(key, entry);
+      img.onerror = () => { entry.failed = true; };
+      img.src = layer.path + '/' + key + '.png';
+      layer.cache.set(key, entry);
     }
     return entry;
   }
 
   function clampView() {
-    view.zoom = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, view.zoom));
+    view.zoom = Math.max(MIN_LEVEL, Math.min(GLOBAL_MAX_LEVEL, view.zoom));
     view.lat = Math.max(-90, Math.min(90, view.lat));
-    view.lon = Math.max(-180, Math.min(180, view.lon)); // no date-line wraparound yet
+    view.lon = Math.max(-180, Math.min(180, view.lon));
   }
 
-  // ---- rendering ----
-  function render() {
+  function drawLayer(layerKey, alpha) {
+    const layer = LAYERS[layerKey];
     const cw = canvas.width, ch = canvas.height;
-    const L = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, Math.round(view.zoom)));
+    const L = Math.max(MIN_LEVEL, Math.min(layer.maxLevel, Math.round(view.zoom)));
     const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
-
-    ctx.fillStyle = '#0a0e0c';
-    ctx.fillRect(0, 0, cw, ch);
 
     const topLeft = worldToLonLat(centerWorld.x - cw / 2, centerWorld.y - ch / 2, view.zoom);
     const bottomRight = worldToLonLat(centerWorld.x + cw / 2, centerWorld.y + ch / 2, view.zoom);
@@ -137,6 +176,7 @@
     txMin = Math.max(0, txMin); txMax = Math.min(tilesAcross - 1, txMax);
     tyMin = Math.max(0, tyMin); tyMax = Math.min(tilesDown - 1, tyMax);
 
+    ctx.globalAlpha = alpha;
     for (let ty = tyMin; ty <= tyMax; ty++) {
       for (let tx = txMin; tx <= txMax; tx++) {
         const lonMin = -180 + tx * (360 / tilesAcross);
@@ -152,15 +192,26 @@
         const sw = p1.x - p0.x;
         const sh = p1.y - p0.y;
 
-        const entry = getTile(L, tx, ty);
+        const entry = getTile(layerKey, L, tx, ty);
         if (entry.loaded) {
-          // +1px overdraw to paper over hairline seams from sub-pixel
-          // rounding between adjacent tiles at high zoom.
           ctx.drawImage(entry.img, sx, sy, sw + 1, sh + 1);
         }
       }
     }
+    ctx.globalAlpha = 1;
+  }
 
+  function render() {
+    const cw = canvas.width, ch = canvas.height;
+    ctx.fillStyle = '#0a0e0c';
+    ctx.fillRect(0, 0, cw, ch);
+
+    drawLayer(state.baseLayer, 1.0);
+    if (state.overlayLayer !== 'none') {
+      drawLayer(state.overlayLayer, state.overlayOpacity);
+    }
+
+    const L = Math.max(MIN_LEVEL, Math.min(LAYERS[state.baseLayer].maxLevel, Math.round(view.zoom)));
     hudZoom.textContent = view.zoom.toFixed(2);
     hudLevel.textContent = String(L);
     hudLonLat.textContent = view.lon.toFixed(2) + ', ' + view.lat.toFixed(2);
@@ -168,7 +219,33 @@
     requestAnimationFrame(render);
   }
 
-  // ---- mouse: drag to pan, wheel to zoom toward cursor ----
+  const btnBaseLandcover = document.getElementById('btnBaseLandcover');
+  const btnBaseHeightmap = document.getElementById('btnBaseHeightmap');
+  const overlaySelect = document.getElementById('overlaySelect');
+  const overlayOpacityRow = document.getElementById('overlayOpacityRow');
+  const overlayOpacitySlider = document.getElementById('overlayOpacity');
+
+  function setBaseLayer(key) {
+    state.baseLayer = key;
+    btnBaseLandcover.classList.toggle('active', key === 'landcover');
+    btnBaseHeightmap.classList.toggle('active', key === 'heightmap');
+    if (state.overlayLayer === key) {
+      state.overlayLayer = 'none';
+      overlaySelect.value = 'none';
+      overlayOpacityRow.classList.remove('shown');
+    }
+  }
+  btnBaseLandcover.addEventListener('click', () => setBaseLayer('landcover'));
+  btnBaseHeightmap.addEventListener('click', () => setBaseLayer('heightmap'));
+
+  overlaySelect.addEventListener('change', () => {
+    state.overlayLayer = overlaySelect.value;
+    overlayOpacityRow.classList.toggle('shown', state.overlayLayer !== 'none');
+  });
+  overlayOpacitySlider.addEventListener('input', () => {
+    state.overlayOpacity = overlayOpacitySlider.value / 100;
+  });
+
   let dragging = false, lastX = 0, lastY = 0;
 
   canvas.addEventListener('mousedown', (e) => {
@@ -196,7 +273,7 @@
     };
     const cursorLonLat = worldToLonLat(cursorWorldBefore.x, cursorWorldBefore.y, view.zoom);
 
-    view.zoom = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, view.zoom + deltaZoom));
+    view.zoom = Math.max(MIN_LEVEL, Math.min(GLOBAL_MAX_LEVEL, view.zoom + deltaZoom));
 
     const cursorWorldAfter = lonLatToWorld(cursorLonLat.lon, cursorLonLat.lat, view.zoom);
     const newCenterWorld = {
@@ -215,8 +292,7 @@
     zoomToward(e.clientX - rect.left, e.clientY - rect.top, -e.deltaY * 0.0025);
   }, { passive: false });
 
-  // ---- touch: single-finger pan, two-finger pinch to zoom ----
-  let touchMode = null; // 'pan' | 'pinch'
+  let touchMode = null;
   let touchLastX = 0, touchLastY = 0;
   let pinchStartDist = 0, pinchStartZoom = 0, pinchMidX = 0, pinchMidY = 0;
 
