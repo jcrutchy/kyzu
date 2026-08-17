@@ -1,26 +1,269 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>Kyzu :: terrain</title>
+<meta charset="UTF-8">
+<title>Kyzu :: map</title>
 <style>
-body
-  {
-    margin: 0;
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
     background: #0a0e0c;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 100vh;
+    font-family: "IBM Plex Mono", "Consolas", monospace;
   }
-img
-  {
-    image-rendering: pixelated;
-    max-width: 95vw;
-    max-height: 95vh;
+  canvas {
+    display: block;
+    width: 100vw; height: 100vh;
+    cursor: grab;
   }
+  canvas.dragging { cursor: grabbing; }
+
+  #hud {
+    position: fixed; top: 10px; left: 10px;
+    color: #5ee6a8; font-size: 12px;
+    background: rgba(10,14,12,0.7);
+    border: 1px solid #1c2620;
+    padding: 6px 10px;
+    pointer-events: none;
+    line-height: 1.5;
+  }
+  #hud .dim { color: #5c6b62; }
 </style>
 </head>
 <body>
-<img src="terrain.png">
+
+<canvas id="mapCanvas"></canvas>
+<div id="hud">
+  zoom: <span id="hudZoom">-</span> <span class="dim">(level <span id="hudLevel">-</span>)</span><br>
+  lon/lat: <span id="hudLonLat">-</span>
+</div>
+
+<script>
+(function(){
+  // MUST match whatever max level the tile pyramid was actually baked to
+  // (kyzu_bake_tiles <level>) - tiles beyond this simply won't exist on
+  // disk and will 404 silently (handled below, just won't render).
+  const MAX_LEVEL = 6;
+  const MIN_LEVEL = 0;
+  const TILE_SIZE = 256;
+  const TILES_PATH = 'http://127.0.0.1:8092/tiles'; // relative to this page - served as static files
+
+  const canvas = document.getElementById('mapCanvas');
+  const ctx = canvas.getContext('2d');
+  const hudZoom = document.getElementById('hudZoom');
+  const hudLevel = document.getElementById('hudLevel');
+  const hudLonLat = document.getElementById('hudLonLat');
+
+  // View state - lon/lat is the world point at screen centre, zoom is
+  // continuous (not snapped to integer levels) so scaling feels smooth;
+  // only *which tile images get fetched* snaps to the nearest integer
+  // level, everything else (screen position/size) uses the exact
+  // fractional zoom, which is what makes the in-between scaling smooth
+  // rather than jumping in discrete steps.
+  const view = { lon: 0, lat: 0, zoom: 2 };
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // ---- projection: lon/lat <-> world pixel space at a given zoom ----
+  // World pixel space at zoom z has TILE_SIZE * 2^(z+1) px across the
+  // full 360 degrees of longitude, and TILE_SIZE * 2^z px across the full
+  // 180 degrees of latitude - matching the bake tool's tile layout
+  // (level L = 2^(L+1) x 2^L tiles), just evaluated at a continuous z
+  // instead of an integer level.
+  function worldPixelWidth(z)  { return TILE_SIZE * Math.pow(2, z + 1); }
+  function worldPixelHeight(z) { return TILE_SIZE * Math.pow(2, z); }
+
+  function lonLatToWorld(lon, lat, z) {
+    return {
+      x: (lon + 180) / 360 * worldPixelWidth(z),
+      y: (90 - lat) / 180 * worldPixelHeight(z)
+    };
+  }
+  function worldToLonLat(x, y, z) {
+    return {
+      lon: x / worldPixelWidth(z) * 360 - 180,
+      lat: 90 - y / worldPixelHeight(z) * 180
+    };
+  }
+
+  // ---- tile cache ----
+  // No eviction yet - fine up to MAX_LEVEL ~6-7 (a few thousand tiles,
+  // trivial for browser memory). Worth adding an LRU cap before pushing
+  // MAX_LEVEL much higher, since tile count roughly quadruples per level.
+  const tileCache = new Map();
+  function getTile(z, x, y) {
+    const key = z + '/' + x + '/' + y;
+    let entry = tileCache.get(key);
+    if (!entry) {
+      const img = new Image();
+      entry = { img: img, loaded: false, failed: false };
+      img.onload = () => { entry.loaded = true; };
+      img.onerror = () => { entry.failed = true; }; // tile doesn't exist - fine, just skip drawing it
+      img.src = TILES_PATH + '/' + key + '.png';
+      tileCache.set(key, entry);
+    }
+    return entry;
+  }
+
+  function clampView() {
+    view.zoom = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, view.zoom));
+    view.lat = Math.max(-90, Math.min(90, view.lat));
+    view.lon = Math.max(-180, Math.min(180, view.lon)); // no date-line wraparound yet
+  }
+
+  // ---- rendering ----
+  function render() {
+    const cw = canvas.width, ch = canvas.height;
+    const L = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, Math.round(view.zoom)));
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+
+    ctx.fillStyle = '#0a0e0c';
+    ctx.fillRect(0, 0, cw, ch);
+
+    const topLeft = worldToLonLat(centerWorld.x - cw / 2, centerWorld.y - ch / 2, view.zoom);
+    const bottomRight = worldToLonLat(centerWorld.x + cw / 2, centerWorld.y + ch / 2, view.zoom);
+
+    const tilesAcross = Math.pow(2, L + 1);
+    const tilesDown = Math.pow(2, L);
+
+    let txMin = Math.floor((topLeft.lon + 180) / 360 * tilesAcross) - 1;
+    let txMax = Math.ceil((bottomRight.lon + 180) / 360 * tilesAcross) + 1;
+    let tyMin = Math.floor((90 - topLeft.lat) / 180 * tilesDown) - 1;
+    let tyMax = Math.ceil((90 - bottomRight.lat) / 180 * tilesDown) + 1;
+
+    txMin = Math.max(0, txMin); txMax = Math.min(tilesAcross - 1, txMax);
+    tyMin = Math.max(0, tyMin); tyMax = Math.min(tilesDown - 1, tyMax);
+
+    for (let ty = tyMin; ty <= tyMax; ty++) {
+      for (let tx = txMin; tx <= txMax; tx++) {
+        const lonMin = -180 + tx * (360 / tilesAcross);
+        const lonMax = lonMin + 360 / tilesAcross;
+        const latMax = 90 - ty * (180 / tilesDown);
+        const latMin = latMax - 180 / tilesDown;
+
+        const p0 = lonLatToWorld(lonMin, latMax, view.zoom);
+        const p1 = lonLatToWorld(lonMax, latMin, view.zoom);
+
+        const sx = cw / 2 + (p0.x - centerWorld.x);
+        const sy = ch / 2 + (p0.y - centerWorld.y);
+        const sw = p1.x - p0.x;
+        const sh = p1.y - p0.y;
+
+        const entry = getTile(L, tx, ty);
+        if (entry.loaded) {
+          // +1px overdraw to paper over hairline seams from sub-pixel
+          // rounding between adjacent tiles at high zoom.
+          ctx.drawImage(entry.img, sx, sy, sw + 1, sh + 1);
+        }
+      }
+    }
+
+    hudZoom.textContent = view.zoom.toFixed(2);
+    hudLevel.textContent = String(L);
+    hudLonLat.textContent = view.lon.toFixed(2) + ', ' + view.lat.toFixed(2);
+
+    requestAnimationFrame(render);
+  }
+
+  // ---- mouse: drag to pan, wheel to zoom toward cursor ----
+  let dragging = false, lastX = 0, lastY = 0;
+
+  canvas.addEventListener('mousedown', (e) => {
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    canvas.classList.add('dragging');
+  });
+  window.addEventListener('mouseup', () => {
+    dragging = false;
+    canvas.classList.remove('dragging');
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    view.lon -= dx / worldPixelWidth(view.zoom) * 360;
+    view.lat += dy / worldPixelHeight(view.zoom) * 180;
+    clampView();
+  });
+
+  function zoomToward(mx, my, deltaZoom) {
+    const centerWorldBefore = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const cursorWorldBefore = {
+      x: centerWorldBefore.x + (mx - canvas.width / 2),
+      y: centerWorldBefore.y + (my - canvas.height / 2)
+    };
+    const cursorLonLat = worldToLonLat(cursorWorldBefore.x, cursorWorldBefore.y, view.zoom);
+
+    view.zoom = Math.max(MIN_LEVEL, Math.min(MAX_LEVEL, view.zoom + deltaZoom));
+
+    const cursorWorldAfter = lonLatToWorld(cursorLonLat.lon, cursorLonLat.lat, view.zoom);
+    const newCenterWorld = {
+      x: cursorWorldAfter.x - (mx - canvas.width / 2),
+      y: cursorWorldAfter.y - (my - canvas.height / 2)
+    };
+    const newCenter = worldToLonLat(newCenterWorld.x, newCenterWorld.y, view.zoom);
+    view.lon = newCenter.lon;
+    view.lat = newCenter.lat;
+    clampView();
+  }
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    zoomToward(e.clientX - rect.left, e.clientY - rect.top, -e.deltaY * 0.0025);
+  }, { passive: false });
+
+  // ---- touch: single-finger pan, two-finger pinch to zoom ----
+  let touchMode = null; // 'pan' | 'pinch'
+  let touchLastX = 0, touchLastY = 0;
+  let pinchStartDist = 0, pinchStartZoom = 0, pinchMidX = 0, pinchMidY = 0;
+
+  function touchDist(t0, t1) {
+    return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+  }
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      touchMode = 'pan';
+      touchLastX = e.touches[0].clientX;
+      touchLastY = e.touches[0].clientY;
+    } else if (e.touches.length === 2) {
+      touchMode = 'pinch';
+      pinchStartDist = touchDist(e.touches[0], e.touches[1]);
+      pinchStartZoom = view.zoom;
+      const rect = canvas.getBoundingClientRect();
+      pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (touchMode === 'pan' && e.touches.length === 1) {
+      const dx = e.touches[0].clientX - touchLastX;
+      const dy = e.touches[0].clientY - touchLastY;
+      touchLastX = e.touches[0].clientX;
+      touchLastY = e.touches[0].clientY;
+      view.lon -= dx / worldPixelWidth(view.zoom) * 360;
+      view.lat += dy / worldPixelHeight(view.zoom) * 180;
+      clampView();
+    } else if (touchMode === 'pinch' && e.touches.length === 2) {
+      const dist = touchDist(e.touches[0], e.touches[1]);
+      const targetZoom = pinchStartZoom + Math.log2(dist / pinchStartDist);
+      zoomToward(pinchMidX, pinchMidY, targetZoom - view.zoom);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    if (e.touches.length === 0) touchMode = null;
+  });
+
+  requestAnimationFrame(render);
+})();
+</script>
+
 </body>
 </html>

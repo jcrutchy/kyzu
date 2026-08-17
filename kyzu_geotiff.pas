@@ -60,6 +60,9 @@ type
     FByteCounts: array of QWord;
 
     FChunkCache: specialize TDictionary<Integer, TBytes>;
+    FLastGoodChunkIndex: Integer;
+    FLastGoodChunkData: TBytes;
+    FDumpFailingChunks: Boolean; // off by default - see GetChunkData comment
 
     // -- endian-aware primitive reads at the current stream position --
     function ReadU16: Word;
@@ -79,6 +82,7 @@ type
     function GetChunkIndex(AX, AY: Integer): Integer;
     function GetChunkData(AChunkIndex: Integer): TBytes;
     function SampleByteWidth: Integer;
+    procedure DumpFailingChunk(AChunkIndex: Integer; AOffset, AByteCount: QWord);
   public
     constructor Create(const AFilename: string);
     destructor Destroy; override;
@@ -90,6 +94,7 @@ type
     property Width: Integer read FWidth;
     property Height: Integer read FHeight;
     property SampleFormat: TGeoTIFFSampleFormat read FSampleFormat;
+    property DumpFailingChunks: Boolean read FDumpFailingChunks write FDumpFailingChunks;
   end;
 
 implementation
@@ -216,7 +221,23 @@ begin
       Entry[High(Entry)] := Dict[OldCode][0];
     end
     else
-      raise EGeoTIFFError.CreateFmt('LZW: bad code %d (dict has %d entries)', [Code, DictCount]);
+    begin
+      // Bitstream has desynced - there's no way to know what code Code
+      // was meant to represent (dictionary entries are derived from
+      // correctly-decoded prior output, not preallocated slots, so
+      // there's nothing to "add" here). BUT everything decoded into
+      // Output so far (OutPos bytes) was validated against the dictionary
+      // state at the time and is genuinely correct - stopping cleanly and
+      // keeping that prefix is far better than discarding it, which is
+      // what raising an exception here used to do. The caller treats a
+      // short result as "valid prefix, pad/patch the rest" rather than
+      // "chunk is worthless."
+      WriteLn(StdErr, Format('LZW: desync at output byte %d (code %d, dict had %d entries) - keeping %d correctly-decoded bytes',
+        [OutPos, Code, DictCount, OutPos]));
+      SetLength(Output, OutPos);
+      Result := Output;
+      Exit;
+    end;
 
     EmitBytes(Entry);
 
@@ -477,6 +498,8 @@ var
 begin
   inherited Create;
   FChunkCache := specialize TDictionary<Integer, TBytes>.Create;
+  FLastGoodChunkIndex := -1;
+  FDumpFailingChunks := False;
   FStream := TFileStream.Create(AFilename, fmOpenRead or fmShareDenyWrite);
 
   FStream.ReadBuffer(Magic, 2);
@@ -524,6 +547,56 @@ begin
     sfFloat32: Result := 4;
     else       Result := 1;
   end;
+end;
+
+// Writes the exact compressed bytes for one failing chunk to disk, plus a
+// small sidecar text file with the context needed to reproduce it (chunk
+// shape, predictor, endian) - so a specific decode failure can be shared
+// and debugged directly without needing the full source file.
+procedure TGeoTIFFReader.DumpFailingChunk(AChunkIndex: Integer; AOffset, AByteCount: QWord);
+var
+  Raw: TBytes;
+  OutStream: TFileStream;
+  InfoFile: TextFile;
+  FileName: string;
+  i: Integer;
+begin
+  SetLength(Raw, AByteCount);
+  FStream.Position := AOffset;
+  if AByteCount > 0 then
+    FStream.ReadBuffer(Raw[0], AByteCount);
+
+  FileName := Format('failing_chunk_%d.bin', [AChunkIndex]);
+  OutStream := TFileStream.Create(FileName, fmCreate);
+  try
+    if Length(Raw) > 0 then
+      OutStream.WriteBuffer(Raw[0], Length(Raw));
+  finally
+    OutStream.Free;
+  end;
+
+  AssignFile(InfoFile, Format('failing_chunk_%d.txt', [AChunkIndex]));
+  Rewrite(InfoFile);
+  try
+    WriteLn(InfoFile, 'ChunkIndex=', AChunkIndex);
+    WriteLn(InfoFile, 'Offset=', AOffset);
+    WriteLn(InfoFile, 'ByteCount=', AByteCount);
+    WriteLn(InfoFile, 'Tiled=', FTiled);
+    WriteLn(InfoFile, 'ChunkWidth=', IfThen(FTiled, FTileWidth, FWidth));
+    WriteLn(InfoFile, 'ChunkHeight=', IfThen(FTiled, FTileHeight, FRowsPerStrip));
+    WriteLn(InfoFile, 'BitsPerSample=', FBitsPerSample);
+    WriteLn(InfoFile, 'Predictor=', FPredictor);
+    WriteLn(InfoFile, 'BigEndian=', FBigEndian);
+    WriteLn(InfoFile, 'TotalStrips=', Length(FOffsets));
+    WriteLn(InfoFile, '--- neighbouring strips (index: offset, bytecount, offset+bytecount) ---');
+    for i := Max(0, AChunkIndex - 5) to Min(High(FOffsets), AChunkIndex + 5) do
+      WriteLn(InfoFile, i, ': ', FOffsets[i], ', ', FByteCounts[i], ', ', FOffsets[i] + FByteCounts[i]);
+  finally
+    CloseFile(InfoFile);
+  end;
+
+  WriteLn(StdErr, 'kyzu_geotiff: dumped raw chunk to ', FileName, ' (', Length(Raw), ' bytes) + ',
+    Format('failing_chunk_%d.txt', [AChunkIndex]));
 end;
 
 function TGeoTIFFReader.DecompressChunk(AOffset, AByteCount: QWord; AExpectedSize: Integer): TBytes;
@@ -609,6 +682,8 @@ begin
     for row := 0 to AChunkHeight - 1 do
     begin
       RowStart := row * AChunkWidth * sw;
+      if RowStart + AChunkWidth * sw > Length(AData) then
+        Break; // partial chunk (LZW desync) - nothing more to un-predict
       for i := 1 to AChunkWidth - 1 do
       begin
         case sw of
@@ -687,6 +762,8 @@ function TGeoTIFFReader.GetChunkData(AChunkIndex: Integer): TBytes;
 var
   Data: TBytes;
   chunkW, chunkH, expectedSize: Integer;
+  validLen: Integer;
+  Patched: TBytes;
 begin
   if FChunkCache.TryGetValue(AChunkIndex, Result) then
     Exit;
@@ -694,22 +771,75 @@ begin
   if FTiled then
   begin
     chunkW := FTileWidth;
-    chunkH := FTileHeight;
+    chunkH := FTileHeight; // tiles are stored at full nominal size even at
+                            // image edges, per spec - unlike strips below
   end
   else
   begin
     chunkW := FWidth;
-    chunkH := FRowsPerStrip;
+    // The last strip is legitimately shorter than FRowsPerStrip whenever
+    // FHeight isn't an exact multiple of it - not a decode problem, just
+    // how TIFF strips work. Using the uniform FRowsPerStrip for every
+    // strip here previously caused the last strip to be misreported as a
+    // partial/desynced decode.
+    if (AChunkIndex + 1) * FRowsPerStrip > FHeight then
+      chunkH := FHeight - AChunkIndex * FRowsPerStrip
+    else
+      chunkH := FRowsPerStrip;
   end;
   expectedSize := chunkW * chunkH * SampleByteWidth;
 
   try
     Data := DecompressChunk(FOffsets[AChunkIndex], FByteCounts[AChunkIndex], expectedSize);
     ApplyPredictor(Data, chunkW, chunkH);
+
     if Length(Data) < expectedSize then
-      SetLength(Data, expectedSize); // pad short/broken chunk rather than crash on read
+    begin
+      // LZW hit a desync partway through (see LZWDecompress) - everything
+      // already in Data is a genuinely correct, validated decode; only the
+      // missing tail needs patching. Borrow just that tail from the last
+      // successfully-decoded chunk at the SAME byte positions, rather than
+      // discarding the valid prefix too. Confirmed (2026-08) this is real,
+      // localized corruption in a tiny fraction of strips in the source
+      // file (~2 of 55800), not a reader bug - see conversation notes /
+      // commit history for the full diagnosis.
+      WriteLn(StdErr, Format('kyzu_geotiff: chunk %d recovered %d/%d bytes before desync - patching tail from chunk %d',
+        [AChunkIndex, Length(Data), expectedSize, FLastGoodChunkIndex]));
+      if FDumpFailingChunks then
+        DumpFailingChunk(AChunkIndex, FOffsets[AChunkIndex], FByteCounts[AChunkIndex]);
+
+      if (FLastGoodChunkIndex >= 0) and (Length(FLastGoodChunkData) = expectedSize) then
+      begin
+        validLen := Length(Data);
+        SetLength(Patched, expectedSize);
+        Move(Data[0], Patched[0], validLen);
+        Move(FLastGoodChunkData[validLen], Patched[validLen], expectedSize - validLen);
+        Data := Patched;
+      end
+      else
+        SetLength(Data, expectedSize); // no prior good chunk yet - zero-pad the tail
+    end;
+
+    FLastGoodChunkIndex := AChunkIndex;
+    FLastGoodChunkData := Copy(Data, 0, Length(Data));
   except
-    SetLength(Data, expectedSize); // zeroed - broken chunk, don't retry it every call
+    on E: Exception do
+    begin
+      // Anything reaching here is a genuine, unexpected failure (not the
+      // routine LZW-desync case handled above, which no longer raises) -
+      // still worth falling back to the last good chunk wholesale rather
+      // than crashing the bake.
+      WriteLn(StdErr, 'kyzu_geotiff: chunk ', AChunkIndex, ' decode failed (offset=',
+        FOffsets[AChunkIndex], ' bytes=', FByteCounts[AChunkIndex], '): ', E.Message,
+        ' - substituting chunk ', FLastGoodChunkIndex);
+      if FDumpFailingChunks then
+        DumpFailingChunk(AChunkIndex, FOffsets[AChunkIndex], FByteCounts[AChunkIndex]);
+
+      if (FLastGoodChunkIndex >= 0) and (Length(FLastGoodChunkData) = expectedSize) then
+        Data := Copy(FLastGoodChunkData, 0, Length(FLastGoodChunkData))
+      else
+        SetLength(Data, expectedSize); // no prior good chunk yet (failure right at the start) - zeroed
+    end;
   end;
 
   FChunkCache.Add(AChunkIndex, Data);

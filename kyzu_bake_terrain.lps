@@ -9,15 +9,56 @@
         <Filename Value="kyzu_bake_terrain.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <CursorPos X="49" Y="15"/>
-        <UsageCount Value="20"/>
+        <TopLine Value="76"/>
+        <CursorPos X="18" Y="78"/>
+        <UsageCount Value="21"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_geotiff.pas"/>
+        <EditorIndex Value="1"/>
+        <TopLine Value="205"/>
+        <CursorPos X="6" Y="205"/>
+        <UsageCount Value="10"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory>
+    <JumpHistory HistoryIndex="8">
       <Position>
         <Filename Value="kyzu_bake_terrain.lpr"/>
         <Caret Line="13" Column="32"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_bake_terrain.lpr"/>
+        <Caret Line="11" Column="41"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_bake_terrain.lpr"/>
+        <Caret Line="83" Column="16" TopLine="68"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_bake_terrain.lpr"/>
+        <Caret Line="84" Column="35" TopLine="75"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_geotiff.pas"/>
+        <Caret Line="223" Column="27" TopLine="203"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_geotiff.pas"/>
+        <Caret Line="212" Column="32" TopLine="203"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_geotiff.pas"/>
+        <Caret Line="569" Column="43" TopLine="555"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_geotiff.pas"/>
+        <Caret Line="868" TopLine="835"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_bake_terrain.lpr"/>
+        <Caret Line="84" Column="35" TopLine="75"/>
       </Position>
     </JumpHistory>
     <RunParams>

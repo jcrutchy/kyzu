@@ -2,12 +2,12 @@ program kyzu_bake_terrain;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, FPImage, FPWritePNG, kyzu_geotiff;
+  SysUtils, DateUtils, Math, FPImage, FPWritePNG, kyzu_geotiff;
+
+var
+  GridW, GridH: Integer; // set from ParamStr(1) below - was fixed at 360x180
 
 const
-  GridW = 360;  // 1 cell/degree for this first real-data pass - coarse on
-  GridH = 180;  // purpose, to keep it fast while validating correctness.
-
   // GlobCover's actual coverage per its readme: full longitude (-180..180)
   // but only 90N down to 65S in latitude - Antarctica isn't included.
   // Anything south of 65S gets treated as permanent ice (class 220) below,
@@ -51,6 +51,16 @@ const
     (ID:230;  R:  0; G:  0; B:  0; Name: 'No data')
   );
 
+function ClassKnown(AID: Byte): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(GlobCoverClasses) do
+    if GlobCoverClasses[i].ID = AID then
+      Exit(True);
+end;
+
 function ClassColor(AID: Byte): TFPColor;
 var
   i: Integer;
@@ -78,11 +88,25 @@ var
   Lon, Lat: Double;
   SrcX, SrcY: Integer;
   ClassID: Byte;
+  UnknownCount: Integer;
+  StartTime, OpenedTime, EndTime: TDateTime;
 begin
+  UnknownCount := 0;
+  GridW := 5760;
+  if ParamCount >= 1 then
+    GridW := StrToIntDef(ParamStr(1), GridW);
+  GridH := GridW div 2; // output always covers the full globe 2:1, regardless
+                         // of GridW - only the source data's own coverage is
+                         // partial (see SourceLatSouth handling below)
+
+  StartTime := Now;
+  WriteLn('Grid: ', GridW, ' x ', GridH);
   WriteLn('Opening ', SourceTIFFPath, ' ...');
   Reader := TGeoTIFFReader.Create(SourceTIFFPath);
   try
-    WriteLn('Source: ', Reader.Width, ' x ', Reader.Height);
+    OpenedTime := Now;
+    WriteLn('Source: ', Reader.Width, ' x ', Reader.Height, '  (open took ',
+      MilliSecondsBetween(OpenedTime, StartTime), ' ms)');
 
     Img := TFPMemoryImage.Create(GridW, GridH);
     try
@@ -109,12 +133,19 @@ begin
             if SrcY >= Reader.Height then SrcY := Reader.Height - 1;
 
             ClassID := Reader.GetByteSample(SrcX, SrcY);
+
+            if (not ClassKnown(ClassID)) and (UnknownCount < 20) then
+            begin
+              Inc(UnknownCount);
+              WriteLn('  UNKNOWN class ', ClassID, ' at grid(', x, ',', y,
+                ') lon=', Lon:0:2, ' lat=', Lat:0:2, ' src(', SrcX, ',', SrcY, ')');
+            end;
           end;
 
           Img.Colors[x, y] := ClassColor(ClassID);
         end;
-        if y mod 20 = 0 then
-          WriteLn('  row ', y, '/', GridH);
+        if (y mod Max(1, GridH div 20)) = 0 then
+          WriteLn('  row ', y, '/', GridH, '  (', MilliSecondsBetween(Now, OpenedTime), ' ms elapsed)');
       end;
 
       Writer := TFPWriterPNG.Create;
@@ -129,5 +160,8 @@ begin
   finally
     Reader.Free;
   end;
+  EndTime := Now;
   WriteLn('Wrote terrain.png (', GridW, 'x', GridH, ' from real GlobCover data)');
+  WriteLn('Total time: ', MilliSecondsBetween(EndTime, StartTime), ' ms',
+    '  (bake loop: ', MilliSecondsBetween(EndTime, OpenedTime), ' ms)');
 end.
