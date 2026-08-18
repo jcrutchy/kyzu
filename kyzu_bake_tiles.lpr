@@ -2,7 +2,7 @@ program kyzu_bake_tiles;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, DateUtils, Math, FPImage, FPWritePNG, kyzu_geotiff;
+  SysUtils, DateUtils, Math, FPImage, FPWritePNG, kyzu_geotiff, kyzu_palette;
 
 const
   TileSize = 256;
@@ -12,60 +12,12 @@ const
   SourceLatNorth = 90.0;
   SourceLatSouth = -65.0;
 
-  SourceTIFFPath = 'C:\dev\kyzu_data\Globcover2009_V2.3_Global_\GLOBCOVER_L4_200901_200912_V2.3.tif';
+  SourceTIFFPath = 'GLOBCOVER_L4_200901_200912_V2.3.tif';
+  PalettePath = 'globcover_palette.json';
   TilesOutDir = 'tiles';
 
-type
-  TGlobCoverClass = record
-    ID: Byte;
-    R, G, B: Byte;
-    Name: string;
-  end;
-
-const
-  GlobCoverClasses: array[0..22] of TGlobCoverClass = (
-    (ID: 11;  R:170; G:240; B:240; Name: 'Irrigated cropland (or aquatic)'),
-    (ID: 14;  R:255; G:255; B:100; Name: 'Rainfed cropland'),
-    (ID: 20;  R:220; G:240; B:100; Name: 'Cropland/vegetation mosaic'),
-    (ID: 30;  R:205; G:205; B:102; Name: 'Vegetation/cropland mosaic'),
-    (ID: 40;  R:  0; G:100; B:  0; Name: 'Broadleaved evergreen forest'),
-    (ID: 50;  R:  0; G:160; B:  0; Name: 'Broadleaved deciduous forest'),
-    (ID: 60;  R:170; G:200; B:  0; Name: 'Open deciduous forest/woodland'),
-    (ID: 70;  R:  0; G: 60; B:  0; Name: 'Needleleaved evergreen forest'),
-    (ID: 90;  R: 40; G:100; B:  0; Name: 'Open needleleaved forest'),
-    (ID:100;  R:120; G:130; B:  0; Name: 'Mixed forest'),
-    (ID:110;  R:140; G:160; B:  0; Name: 'Forest/shrubland/grassland mosaic'),
-    (ID:120;  R:190; G:150; B:  0; Name: 'Grassland/forest mosaic'),
-    (ID:130;  R:150; G:100; B:  0; Name: 'Shrubland'),
-    (ID:140;  R:255; G:180; B: 50; Name: 'Herbaceous/grassland/savanna'),
-    (ID:150;  R:255; G:235; B:175; Name: 'Sparse vegetation'),
-    (ID:160;  R:  0; G:120; B: 90; Name: 'Flooded broadleaved forest'),
-    (ID:170;  R:  0; G:150; B:120; Name: 'Flooded forest/shrubland (saline)'),
-    (ID:180;  R:  0; G:220; B:130; Name: 'Flooded grassland/wetland'),
-    (ID:190;  R:195; G: 20; B:  0; Name: 'Urban/artificial surfaces'),
-    (ID:200;  R:255; G:245; B:215; Name: 'Bare areas'),
-    (ID:210;  R:  0; G: 70; B:200; Name: 'Water bodies'),
-    (ID:220;  R:255; G:255; B:255; Name: 'Permanent snow/ice'),
-    (ID:230;  R:  0; G:  0; B:  0; Name: 'No data')
-  );
-
-function ClassColor(AID: Byte): TFPColor;
 var
-  i: Integer;
-begin
-  for i := 0 to High(GlobCoverClasses) do
-    if GlobCoverClasses[i].ID = AID then
-    begin
-      Result.Red   := GlobCoverClasses[i].R shl 8;
-      Result.Green := GlobCoverClasses[i].G shl 8;
-      Result.Blue  := GlobCoverClasses[i].B shl 8;
-      Result.Alpha := $FFFF;
-      Exit;
-    end;
-  Result.Red := $FFFF; Result.Green := 0; Result.Blue := $FFFF; Result.Alpha := $FFFF;
-end;
-
-var
+  Palette: TGlobCoverPalette;
   Reader: TGeoTIFFReader;
 
 // Shared sampling logic - identical mapping to kyzu_bake_terrain, just
@@ -115,7 +67,7 @@ begin
         Lon := LonMin + (px + 0.5) / TileSize * (LonMax - LonMin);
         Lat := LatMax - (py + 0.5) / TileSize * (LatMax - LatMin);
         ClassID := SampleClassAt(Lon, Lat);
-        Img.Colors[px, py] := ClassColor(ClassID);
+        Img.Colors[px, py] := PaletteClassColor(Palette, ClassID);
       end;
 
     Dir := Format('%s/%d/%d', [TilesOutDir, ALevel, ATileX]);
@@ -146,6 +98,10 @@ begin
   for Level := 0 to MaxLevel do
     Inc(TotalTiles, Int64(1 shl (Level + 1)) * Int64(1 shl Level));
   WriteLn('Max level: ', MaxLevel, '  Total tiles to bake: ', TotalTiles);
+
+  WriteLn('Loading palette from ', PalettePath, ' ...');
+  Palette := LoadPalette(PalettePath);
+  WriteLn('  ', Length(Palette), ' classes loaded.');
 
   StartTime := Now;
   WriteLn('Opening ', SourceTIFFPath, ' ...');
@@ -180,4 +136,3 @@ begin
   end;
   WriteLn('All done. Total time: ', MilliSecondsBetween(Now, StartTime), ' ms');
 end.
-

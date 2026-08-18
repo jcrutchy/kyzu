@@ -1,0 +1,27 @@
+{
+  "classes": [
+    { "id": 11,  "r": 110, "g": 170, "b": 150, "name": "Irrigated cropland (or aquatic)" },
+    { "id": 14,  "r": 196, "g": 176, "b": 92,  "name": "Rainfed cropland" },
+    { "id": 20,  "r": 168, "g": 178, "b": 88,  "name": "Cropland/vegetation mosaic" },
+    { "id": 30,  "r": 140, "g": 162, "b": 90,  "name": "Vegetation/cropland mosaic" },
+    { "id": 40,  "r": 23,  "g": 74,  "b": 33,  "name": "Broadleaved evergreen forest" },
+    { "id": 50,  "r": 48,  "g": 97,  "b": 42,  "name": "Broadleaved deciduous forest" },
+    { "id": 60,  "r": 98,  "g": 122, "b": 58,  "name": "Open deciduous forest/woodland" },
+    { "id": 70,  "r": 23,  "g": 51,  "b": 30,  "name": "Needleleaved evergreen forest" },
+    { "id": 90,  "r": 63,  "g": 89,  "b": 51,  "name": "Open needleleaved forest" },
+    { "id": 100, "r": 75,  "g": 97,  "b": 51,  "name": "Mixed forest" },
+    { "id": 110, "r": 128, "g": 133, "b": 79,  "name": "Forest/shrubland/grassland mosaic" },
+    { "id": 120, "r": 156, "g": 148, "b": 87,  "name": "Grassland/forest mosaic" },
+    { "id": 130, "r": 150, "g": 130, "b": 83,  "name": "Shrubland" },
+    { "id": 140, "r": 196, "g": 178, "b": 118, "name": "Herbaceous/grassland/savanna" },
+    { "id": 150, "r": 206, "g": 190, "b": 155, "name": "Sparse vegetation" },
+    { "id": 160, "r": 35,  "g": 87,  "b": 74,  "name": "Flooded broadleaved forest" },
+    { "id": 170, "r": 58,  "g": 97,  "b": 87,  "name": "Flooded forest/shrubland (saline)" },
+    { "id": 180, "r": 79,  "g": 130, "b": 105, "name": "Flooded grassland/wetland" },
+    { "id": 190, "r": 144, "g": 130, "b": 120, "name": "Urban/artificial surfaces" },
+    { "id": 200, "r": 196, "g": 174, "b": 133, "name": "Bare areas" },
+    { "id": 210, "r": 26,  "g": 65,  "b": 112, "name": "Water bodies" },
+    { "id": 220, "r": 230, "g": 238, "b": 245, "name": "Permanent snow/ice" },
+    { "id": 230, "r": 20,  "g": 20,  "b": 20,  "name": "No data" }
+  ]
+}

@@ -67,6 +67,7 @@
     <div class="label">base layer</div>
     <button id="btnBaseLandcover" class="active">Land Cover</button>
     <button id="btnBaseHeightmap">Elevation</button>
+    <button id="btnBaseCombined">Combined</button>
   </div>
   <div class="section">
     <div class="label">overlay</div>
@@ -74,6 +75,7 @@
       <option value="none">None</option>
       <option value="landcover">Land Cover</option>
       <option value="heightmap">Elevation</option>
+      <option value="combined">Combined</option>
     </select>
     <div id="overlayOpacityRow">
       <input type="range" id="overlayOpacity" min="0" max="100" value="50">
@@ -94,7 +96,8 @@
   // getting more detailed past that zoom, not a crash.
   const LAYERS = {
     landcover: { name: 'Land Cover', path: 'http://127.0.0.1:8092/tiles',           maxLevel: 6, cache: new Map() },
-    heightmap: { name: 'Elevation',  path: 'http://127.0.0.1:8092/tiles_heightmap', maxLevel: 6, cache: new Map() }
+    heightmap: { name: 'Elevation',  path: 'http://127.0.0.1:8092/tiles_heightmap', maxLevel: 6, cache: new Map() },
+    combined:  { name: 'Combined',   path: 'http://127.0.0.1:8092/tiles_combined',  maxLevel: 6, cache: new Map() }
   };
   const GLOBAL_MAX_LEVEL = Math.max(...Object.values(LAYERS).map(l => l.maxLevel));
 
@@ -221,6 +224,7 @@
 
   const btnBaseLandcover = document.getElementById('btnBaseLandcover');
   const btnBaseHeightmap = document.getElementById('btnBaseHeightmap');
+  const btnBaseCombined = document.getElementById('btnBaseCombined');
   const overlaySelect = document.getElementById('overlaySelect');
   const overlayOpacityRow = document.getElementById('overlayOpacityRow');
   const overlayOpacitySlider = document.getElementById('overlayOpacity');
@@ -229,6 +233,7 @@
     state.baseLayer = key;
     btnBaseLandcover.classList.toggle('active', key === 'landcover');
     btnBaseHeightmap.classList.toggle('active', key === 'heightmap');
+    btnBaseCombined.classList.toggle('active', key === 'combined');
     if (state.overlayLayer === key) {
       state.overlayLayer = 'none';
       overlaySelect.value = 'none';
@@ -237,6 +242,7 @@
   }
   btnBaseLandcover.addEventListener('click', () => setBaseLayer('landcover'));
   btnBaseHeightmap.addEventListener('click', () => setBaseLayer('heightmap'));
+  btnBaseCombined.addEventListener('click', () => setBaseLayer('combined'));
 
   overlaySelect.addEventListener('change', () => {
     state.overlayLayer = overlaySelect.value;
