@@ -17,7 +17,7 @@ const
 
   LightX = -0.5;
   LightY = 0.5;
-  LightZ = 0.7;
+  LightZ = 0.15; // raking light
   MetresPerDegreeLat = 110540.0;
   MetresPerDegreeLonAtEquator = 111320.0;
 
@@ -139,7 +139,7 @@ begin
         ClassID := SampleClassAt(Lon, Lat);
         PaletteClassRGB(Palette, ClassID, R, G, B);
         Shade := ComputeShade(Lon, Lat, StepLon, StepLat);
-        Mult := EnsureRange(0.55 + 0.55 * Shade, 0.35, 1.35);
+        Mult := EnsureRange(0.55 + 2.5 * Shade, 0.15, 5.0);
 
         Col.Red := Round(EnsureRange(R * Mult, 0, 255)) shl 8;
         Col.Green := Round(EnsureRange(G * Mult, 0, 255)) shl 8;
