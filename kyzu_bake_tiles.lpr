@@ -2,37 +2,28 @@ program kyzu_bake_tiles;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, DateUtils, Math, FPImage, FPWritePNG, kyzu_geotiff, kyzu_palette;
-
-const
-  TileSize = 256;
-
-  // Same coverage convention as kyzu_bake_terrain: GlobCover's readme
-  // states 90N to 65S - south of that gets treated as ice.
-  SourceLatNorth = 90.0;
-  SourceLatSouth = -65.0;
-
-  SourceTIFFPath = 'GLOBCOVER_L4_200901_200912_V2.3.tif';
-  PalettePath = 'globcover_palette.json';
-  TilesOutDir = 'tiles';
+  SysUtils, FPImage, kyzu_geotiff, kyzu_bakeconfig, kyzu_baketiles;
 
 var
-  Palette: TGlobCoverPalette;
+  Config: TBakeConfig;
   Reader: TGeoTIFFReader;
 
-// Shared sampling logic - identical mapping to kyzu_bake_terrain, just
-// called per-tile-pixel here instead of per-global-grid-pixel.
+// South of GlobCover's own coverage this falls back to a blanket ice
+// class, since this tool doesn't open the elevation file at all - it's
+// meant to run standalone without needing ETOPO. See
+// kyzu_bake_combined_tiles for the ETOPO-informed version that traces
+// Antarctica's actual coastline instead.
 function SampleClassAt(Lon, Lat: Double): Byte;
 var
   SrcX, SrcY: Integer;
 begin
-  if Lat < SourceLatSouth then
+  if Lat < Config.GlobCoverLatSouth then
   begin
-    Result := 220; // south of GlobCover's coverage - ice stand-in
+    Result := 220;
     Exit;
   end;
   SrcX := Round((Lon - (-180.0)) / 360.0 * Reader.Width);
-  SrcY := Round((SourceLatNorth - Lat) / (SourceLatNorth - SourceLatSouth) * Reader.Height);
+  SrcY := Round((90.0 - Lat) / (90.0 - Config.GlobCoverLatSouth) * Reader.Height);
   if SrcX < 0 then SrcX := 0;
   if SrcX >= Reader.Width then SrcX := Reader.Width - 1;
   if SrcY < 0 then SrcY := 0;
@@ -42,97 +33,53 @@ end;
 
 procedure BakeTile(ALevel, ATileX, ATileY: Integer);
 var
-  TilesAcross, TilesDown: Integer;
   LonMin, LonMax, LatMin, LatMax: Double;
   Img: TFPMemoryImage;
-  Writer: TFPWriterPNG;
   px, py: Integer;
   Lon, Lat: Double;
   ClassID: Byte;
-  Dir, FileName: string;
+  R, G, B: Byte;
+  Col: TFPColor;
 begin
-  TilesAcross := 1 shl (ALevel + 1);
-  TilesDown := 1 shl ALevel;
+  TileBounds(ALevel, ATileX, ATileY, LonMin, LonMax, LatMin, LatMax);
 
-  LonMin := -180.0 + ATileX * (360.0 / TilesAcross);
-  LonMax := LonMin + (360.0 / TilesAcross);
-  LatMax := 90.0 - ATileY * (180.0 / TilesDown);
-  LatMin := LatMax - (180.0 / TilesDown);
-
-  Img := TFPMemoryImage.Create(TileSize, TileSize);
+  Img := TFPMemoryImage.Create(Config.TileSize, Config.TileSize);
   try
-    for py := 0 to TileSize - 1 do
-      for px := 0 to TileSize - 1 do
+    for py := 0 to Config.TileSize - 1 do
+      for px := 0 to Config.TileSize - 1 do
       begin
-        Lon := LonMin + (px + 0.5) / TileSize * (LonMax - LonMin);
-        Lat := LatMax - (py + 0.5) / TileSize * (LatMax - LatMin);
+        Lon := LonMin + (px + 0.5) / Config.TileSize * (LonMax - LonMin);
+        Lat := LatMax - (py + 0.5) / Config.TileSize * (LatMax - LatMin);
+
         ClassID := SampleClassAt(Lon, Lat);
-        Img.Colors[px, py] := PaletteClassColor(Palette, ClassID);
+        PaletteClassRGB(Config, ClassID, R, G, B);
+
+        Col.Red := R shl 8; Col.Green := G shl 8; Col.Blue := B shl 8; Col.Alpha := $FFFF;
+        Img.Colors[px, py] := Col;
       end;
-
-    Dir := Format('%s/%d/%d', [TilesOutDir, ALevel, ATileX]);
-    ForceDirectories(Dir);
-    FileName := Format('%s/%d.png', [Dir, ATileY]);
-
-    Writer := TFPWriterPNG.Create;
-    try
-      Img.SaveToFile(FileName, Writer);
-    finally
-      Writer.Free;
-    end;
+    SaveTilePNG(Img, Config.OutDirLandcover, ALevel, ATileX, ATileY);
   finally
     Img.Free;
   end;
 end;
 
 var
-  MaxLevel, Level, tx, ty, TilesAcross, TilesDown: Integer;
-  TotalTiles, DoneTiles: Int64;
-  StartTime, LevelStartTime: TDateTime;
+  MaxLevel: Integer;
 begin
   MaxLevel := 6;
   if ParamCount >= 1 then
     MaxLevel := StrToIntDef(ParamStr(1), 6);
 
-  TotalTiles := 0;
-  for Level := 0 to MaxLevel do
-    Inc(TotalTiles, Int64(1 shl (Level + 1)) * Int64(1 shl Level));
-  WriteLn('Max level: ', MaxLevel, '  Total tiles to bake: ', TotalTiles);
+  WriteLn('Loading bake_config.json ...');
+  Config := LoadBakeConfig('bake_config.json');
+  WriteLn('  ', Length(Config.Classes), ' land-cover classes loaded.');
 
-  WriteLn('Loading palette from ', PalettePath, ' ...');
-  Palette := LoadPalette(PalettePath);
-  WriteLn('  ', Length(Palette), ' classes loaded.');
-
-  StartTime := Now;
-  WriteLn('Opening ', SourceTIFFPath, ' ...');
-  Reader := TGeoTIFFReader.Create(SourceTIFFPath);
+  WriteLn('Opening ', Config.GlobCoverPath, ' ...');
+  Reader := TGeoTIFFReader.Create(Config.GlobCoverPath);
   try
     WriteLn('Source: ', Reader.Width, ' x ', Reader.Height);
-
-    DoneTiles := 0;
-    for Level := 0 to MaxLevel do
-    begin
-      TilesAcross := 1 shl (Level + 1);
-      TilesDown := 1 shl Level;
-      LevelStartTime := Now;
-      WriteLn('Level ', Level, ': ', TilesAcross, ' x ', TilesDown, ' tiles');
-
-      // ty outer, tx inner: all tiles in one ty row share the same latitude
-      // band, so they tend to reuse the same cached source strip(s) -
-      // matches the row-major cache-friendly pattern from kyzu_bake_terrain.
-      for ty := 0 to TilesDown - 1 do
-      begin
-        for tx := 0 to TilesAcross - 1 do
-        begin
-          BakeTile(Level, tx, ty);
-          Inc(DoneTiles);
-        end;
-      end;
-      WriteLn('  level ', Level, ' done in ', MilliSecondsBetween(Now, LevelStartTime), ' ms  (',
-        DoneTiles, '/', TotalTiles, ' total tiles so far)');
-    end;
+    RunTilePyramidBake(MaxLevel, @BakeTile);
   finally
     Reader.Free;
   end;
-  WriteLn('All done. Total time: ', MilliSecondsBetween(Now, StartTime), ' ms');
 end.

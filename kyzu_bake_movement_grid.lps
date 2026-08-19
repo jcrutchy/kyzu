@@ -6,11 +6,11 @@
     <BuildModes Active="Default"/>
     <Units>
       <Unit>
-        <Filename Value="kyzu_bake_combined_tiles.lpr"/>
+        <Filename Value="kyzu_bake_movement_grid.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <CursorPos X="52" Y="17"/>
-        <UsageCount Value="22"/>
+        <CursorPos X="69" Y="17"/>
+        <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>

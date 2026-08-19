@@ -1,0 +1,63 @@
+{
+  "paths": {
+    "globcover_tif": "C:/dev/kyzu_data/Globcover2009_V2.3_Global_/GLOBCOVER_L4_200901_200912_V2.3.tif",
+    "elevation_tif": "C:/dev/kyzu_data/ETOPO_2022_v1_60s_N90W180_surface.tif"
+  },
+  "tile_size": 256,
+  "globcover_lat_south": -65.0,
+  "movement_grid_path": "C:/dev/kyzu_data/server/movement_grid.bin",
+  "output_dirs": {
+    "landcover": "C:/dev/kyzu_data/public/tiles",
+    "heightmap": "C:/dev/kyzu_data/public/tiles_heightmap",
+    "combined": "C:/dev/kyzu_data/public/tiles_combined"
+  },
+  "shading": {
+    "light_x": -0.5,
+    "light_y": 0.5,
+    "light_z": 0.07,
+    "gain_base": 0.5,
+    "gain_scale": 2.0,
+    "clamp_min": 0.1,
+    "clamp_max": 5.0,
+    "metres_per_degree_lat": 110540.0,
+    "metres_per_degree_lon_equator": 111320.0
+  },
+  "classes": [
+    { "id": 11,  "r": 150, "g": 185, "b": 90, "move_cost": 1.5, "name": "Irrigated cropland (or aquatic)" },
+    { "id": 14,  "r": 196, "g": 176, "b": 92,  "move_cost": 1.0, "name": "Rainfed cropland" },
+    { "id": 20,  "r": 168, "g": 178, "b": 88,  "move_cost": 1.0, "name": "Cropland/vegetation mosaic" },
+    { "id": 30,  "r": 140, "g": 162, "b": 90,  "move_cost": 1.1, "name": "Vegetation/cropland mosaic" },
+    { "id": 40,  "r": 23,  "g": 74,  "b": 33,  "move_cost": 2.0, "name": "Broadleaved evergreen forest" },
+    { "id": 50,  "r": 48,  "g": 97,  "b": 42,  "move_cost": 2.0, "name": "Broadleaved deciduous forest" },
+    { "id": 60,  "r": 98,  "g": 122, "b": 58,  "move_cost": 1.7, "name": "Open deciduous forest/woodland" },
+    { "id": 70,  "r": 23,  "g": 51,  "b": 30,  "move_cost": 2.0, "name": "Needleleaved evergreen forest" },
+    { "id": 90,  "r": 63,  "g": 89,  "b": 51,  "move_cost": 1.7, "name": "Open needleleaved forest" },
+    { "id": 100, "r": 75,  "g": 97,  "b": 51,  "move_cost": 1.9, "name": "Mixed forest" },
+    { "id": 110, "r": 128, "g": 133, "b": 79,  "move_cost": 1.5, "name": "Forest/shrubland/grassland mosaic" },
+    { "id": 120, "r": 156, "g": 148, "b": 87,  "move_cost": 1.3, "name": "Grassland/forest mosaic" },
+    { "id": 130, "r": 150, "g": 130, "b": 83,  "move_cost": 1.4, "name": "Shrubland" },
+    { "id": 140, "r": 196, "g": 178, "b": 118, "move_cost": 1.0, "name": "Herbaceous/grassland/savanna" },
+    { "id": 150, "r": 206, "g": 190, "b": 155, "move_cost": 1.2, "name": "Sparse vegetation" },
+    { "id": 160, "r": 35,  "g": 87,  "b": 74,  "move_cost": 2.5, "name": "Flooded broadleaved forest" },
+    { "id": 170, "r": 58,  "g": 97,  "b": 87,  "move_cost": 2.5, "name": "Flooded forest/shrubland (saline)" },
+    { "id": 180, "r": 79,  "g": 130, "b": 105, "move_cost": 2.0, "name": "Flooded grassland/wetland" },
+    { "id": 190, "r": 144, "g": 130, "b": 120, "move_cost": 0.8, "name": "Urban/artificial surfaces" },
+    { "id": 200, "r": 196, "g": 174, "b": 133, "move_cost": 1.3, "name": "Bare areas" },
+    { "id": 210, "r": 26,  "g": 65,  "b": 112, "move_cost": -1,  "name": "Water bodies" },
+    { "id": 220, "r": 230, "g": 238, "b": 245, "move_cost": 3.0, "name": "Permanent snow/ice" },
+    { "id": 230, "r": 20,  "g": 20,  "b": 20,  "move_cost": -1,  "name": "No data" }
+  ],
+  "hypsometric": [
+    { "elevation": -8000, "r": 10,  "g": 10,  "b": 40 },
+    { "elevation": -4000, "r": 15,  "g": 40,  "b": 90 },
+    { "elevation": -2000, "r": 25,  "g": 80,  "b": 140 },
+    { "elevation": -200,  "r": 60,  "g": 130, "b": 190 },
+    { "elevation": 0,     "r": 90,  "g": 170, "b": 210 },
+    { "elevation": 1,     "r": 70,  "g": 140, "b": 70 },
+    { "elevation": 300,   "r": 110, "g": 160, "b": 70 },
+    { "elevation": 1000,  "r": 180, "g": 180, "b": 100 },
+    { "elevation": 2200,  "r": 170, "g": 130, "b": 90 },
+    { "elevation": 3500,  "r": 190, "g": 180, "b": 170 },
+    { "elevation": 5500,  "r": 255, "g": 255, "b": 255 }
+  ]
+}
