@@ -62,6 +62,18 @@
   }
   header .tick b{ color:var(--accent); font-weight:600; }
 
+  .unitsbar{
+    padding:6px 16px;
+    border-bottom:1px solid var(--line);
+    font-size:11px;
+    color:var(--dim);
+    background:rgba(10,14,12,0.6);
+    display:flex; flex-wrap:wrap; gap:14px;
+    min-height:14px;
+  }
+  .unitsbar .unit b{ color:var(--accent); font-weight:600; }
+  .unitsbar .placeholder{ opacity:0.5; }
+
   .filterrow{ display:flex; align-items:center; gap:8px; }
   .filterrow label{ font-size:11px; color:var(--dim); white-space:nowrap; }
   .filterrow input[type=text]{
@@ -136,15 +148,19 @@
   <div class="status" id="statusText">disconnected</div>
 </header>
 
+<div class="unitsbar" id="unitsBar"><span class="placeholder">no active units</span></div>
+
 <div id="log"></div>
 
 <footer>
   <div class="filterrow">
     <label>hide topics starting with (comma-separated):</label>
-    <input type="text" id="filterInput" value="game.tick">
+    <input type="text" id="filterInput" value="game.tick,game.event.position">
   </div>
   <div class="quickrow">
     <button data-topic="game.cmd.ping" data-payload="{}">ping</button>
+    <button data-topic="game.cmd.spawn" data-payload='{"unit_id":"u1","x":10,"y":10}'>spawn u1</button>
+    <button data-topic="game.cmd.move" data-payload='{"unit_id":"u1","to_x":50,"to_y":50}'>move u1</button>
     <button id="btnSubscribe">subscribe game.&gt;</button>
     <button id="btnReconnect">reconnect</button>
   </div>
@@ -167,10 +183,25 @@
   const payloadInput = document.getElementById('payloadInput');
   const filterInput = document.getElementById('filterInput');
   const tickDisplay = document.getElementById('tickDisplay').querySelector('b');
+  const unitsBar = document.getElementById('unitsBar');
 
   let ws = null;
   let authed = false;
   let hiddenPrefixes = [];
+  const units = new Map(); // unit_id -> {lon, lat}
+
+  function renderUnitsBar(){
+    if (units.size === 0){
+      unitsBar.innerHTML = '<span class="placeholder">no active units</span>';
+      return;
+    }
+    let html = '';
+    for (const [id, pos] of units){
+      html += '<span class="unit"><b>' + escapeHtml(id) + '</b> ' +
+        pos.lon.toFixed(2) + ', ' + pos.lat.toFixed(2) + '</span>';
+    }
+    unitsBar.innerHTML = html;
+  }
 
   function refreshFilters(){
     hiddenPrefixes = filterInput.value.split(',')
@@ -208,6 +239,21 @@
       try {
         const parsed = JSON.parse(payload);
         if (parsed && parsed.tick !== undefined) tickDisplay.textContent = parsed.tick;
+      } catch(e) { /* payload wasn't the shape we expected - ignore */ }
+    }
+
+    // Same idea for game.event.position - with units actually moving now,
+    // this can fire ~20/sec per unit. Consolidate into a live per-unit
+    // readout instead of flooding the scroll. Still goes through the same
+    // hide-filter below (defaulted to hidden alongside game.tick), so
+    // removing it from the filter still shows raw lines too if needed.
+    if (topic === 'game.event.position'){
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed && parsed.unit_id !== undefined){
+          units.set(parsed.unit_id, {lon: parsed.lon, lat: parsed.lat});
+          renderUnitsBar();
+        }
       } catch(e) { /* payload wasn't the shape we expected - ignore */ }
     }
 

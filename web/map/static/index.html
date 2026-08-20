@@ -26,6 +26,11 @@
     line-height: 1.5;
   }
   #hud .dim { color: #5c6b62; }
+  #hud .wsdot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #e65e5e; margin-right: 4px;
+  }
+  #hud .wsdot.up { background: #5ee6a8; }
 
   #layerPanel {
     position: fixed; top: 10px; right: 10px;
@@ -58,6 +63,7 @@
 
 <canvas id="mapCanvas"></canvas>
 <div id="hud">
+  <span class="wsdot" id="wsDot"></span>ws: <span id="wsStatus">connecting</span> <span class="dim">| units: <span id="unitCount">0</span></span><br>
   zoom: <span id="hudZoom">-</span> <span class="dim">(level <span id="hudLevel">-</span>)</span><br>
   lon/lat: <span id="hudLonLat">-</span>
 </div>
@@ -114,6 +120,99 @@
   const hudLonLat = document.getElementById('hudLonLat');
 
   const view = { lon: 0, lat: 0, zoom: 2 };
+
+  // ---- live units, fed over the same WS bus the terminal page uses ----
+  // Below this zoom, units render as simple dots; at/above it, as a small
+  // icon shape with an id label - same "snap the data source, smooth the
+  // visual" LOD spirit as the tile pyramid's continuous zoom scaling.
+  const ICON_ZOOM_THRESHOLD = 4;
+  const WS_URL = 'ws://' + location.hostname + ':8082';
+  const AUTH_TOKEN = 'dev'; // stub auth - matches the terminal page's convention
+
+  const units = new Map(); // unit_id -> {lon, lat, prevLon, prevLat, updateTime, prevUpdateTime}
+  let ws = null;
+  let wsAuthed = false;
+
+  const wsDot = document.getElementById('wsDot');
+  const wsStatus = document.getElementById('wsStatus');
+  const unitCountEl = document.getElementById('unitCount');
+
+  function setWsStatus(state) {
+    wsDot.classList.toggle('up', state === 'up');
+    wsStatus.textContent = state;
+  }
+
+  function onUnitPosition(unitId, lon, lat) {
+    const now = performance.now();
+    const existing = units.get(unitId);
+    if (existing) {
+      existing.prevLon = existing.lon; existing.prevLat = existing.lat; existing.prevUpdateTime = existing.updateTime;
+      existing.lon = lon; existing.lat = lat; existing.updateTime = now;
+    } else {
+      units.set(unitId, { lon, lat, prevLon: lon, prevLat: lat, updateTime: now, prevUpdateTime: now });
+    }
+    unitCountEl.textContent = String(units.size);
+  }
+
+  // Interpolates between a unit's last two known server positions based
+  // on elapsed real time since the latest update, using the actual
+  // measured interval between those updates as the interpolation window -
+  // so display stays smooth regardless of the server's exact tick rate,
+  // and just holds at the last known position (rather than overshooting)
+  // if an update is late.
+  function getUnitDisplayPosition(u) {
+    const interval = u.updateTime - u.prevUpdateTime;
+    const t = interval > 0 ? Math.min(1, (performance.now() - u.updateTime) / interval) : 1;
+    return {
+      lon: u.prevLon + (u.lon - u.prevLon) * t,
+      lat: u.prevLat + (u.lat - u.prevLat) * t
+    };
+  }
+
+  function connectWS() {
+    setWsStatus('connecting');
+    ws = new WebSocket(WS_URL);
+    wsAuthed = false;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ method: 'sys.auth', token: AUTH_TOKEN }));
+    };
+
+    ws.onmessage = (evt) => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch (e) { return; }
+
+      // First message after sys.auth is treated as an implicit ack, same
+      // convention as the terminal page - adjust here if the server ever
+      // starts sending an explicit ack shape.
+      if (!wsAuthed) {
+        wsAuthed = true;
+        setWsStatus('up');
+        ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
+        return;
+      }
+
+      if (msg.topic === 'game.event.position') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.unit_id !== undefined) {
+          onUnitPosition(payload.unit_id, payload.lon, payload.lat);
+        }
+      }
+      // spawned/path_found/arrived/move_failed intentionally not handled
+      // here yet - this viewer only needs live position to render units,
+      // the terminal page is still the place to watch full command/event
+      // traffic for now.
+    };
+
+    ws.onerror = () => { setWsStatus('error'); };
+    ws.onclose = () => {
+      setWsStatus('disconnected');
+      setTimeout(connectWS, 2000); // simple reconnect - fine for a dev viewer, revisit if this becomes player-facing
+    };
+  }
+
 
   function resizeCanvas() {
     canvas.width = window.innerWidth;
@@ -204,6 +303,52 @@
     ctx.globalAlpha = 1;
   }
 
+  // Units are vector-drawn on top of whatever tile layers are showing,
+  // not baked into any raster tile - completely decoupled from terrain
+  // resolution, same architecture decision as the city-growth-footprint
+  // discussion (dynamic game data doesn't belong in the static pyramid).
+  function drawUnits() {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useIcons = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, u] of units) {
+      const pos = getUnitDisplayPosition(u);
+      const w = lonLatToWorld(pos.lon, pos.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue; // offscreen
+
+      if (useIcons) {
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.beginPath();
+        ctx.moveTo(0, -8); ctx.lineTo(6, 0); ctx.lineTo(0, 8); ctx.lineTo(-6, 0);
+        ctx.closePath();
+        ctx.fillStyle = '#5ee6a8';
+        ctx.fill();
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.fillStyle = '#c9d6cd';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(id, sx, sy + 18);
+      } else {
+        ctx.beginPath();
+        ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#5ee6a8';
+        ctx.fill();
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+  }
+
   function render() {
     const cw = canvas.width, ch = canvas.height;
     ctx.fillStyle = '#0a0e0c';
@@ -213,6 +358,7 @@
     if (state.overlayLayer !== 'none') {
       drawLayer(state.overlayLayer, state.overlayOpacity);
     }
+    drawUnits();
 
     const L = Math.max(MIN_LEVEL, Math.min(LAYERS[state.baseLayer].maxLevel, Math.round(view.zoom)));
     hudZoom.textContent = view.zoom.toFixed(2);
@@ -344,6 +490,7 @@
   });
 
   requestAnimationFrame(render);
+  connectWS();
 })();
 </script>
 
