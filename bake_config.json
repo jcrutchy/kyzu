@@ -5,11 +5,15 @@
   },
   "tile_size": 256,
   "globcover_lat_south": -65.0,
+  "impassable_color_r": 30,
+  "impassable_color_g": 30,
+  "impassable_color_b": 35,
   "movement_grid_path": "C:/dev/kyzu_data/server/movement_grid.bin",
   "output_dirs": {
     "landcover": "C:/dev/kyzu_data/public/tiles",
     "heightmap": "C:/dev/kyzu_data/public/tiles_heightmap",
-    "combined": "C:/dev/kyzu_data/public/tiles_combined"
+    "combined": "C:/dev/kyzu_data/public/tiles_combined",
+    "movecost": "C:/dev/kyzu_data/public/tiles_movecost"
   },
   "shading": {
     "light_x": -0.5,
@@ -59,5 +63,13 @@
     { "elevation": 2200,  "r": 170, "g": 130, "b": 90 },
     { "elevation": 3500,  "r": 190, "g": 180, "b": 170 },
     { "elevation": 5500,  "r": 255, "g": 255, "b": 255 }
+  ],
+  "movement_cost_ramp": [
+    { "value": 0.8, "r": 40,  "g": 170, "b": 60 },
+    { "value": 1.2, "r": 150, "g": 200, "b": 40 },
+    { "value": 1.6, "r": 230, "g": 210, "b": 40 },
+    { "value": 2.0, "r": 230, "g": 150, "b": 30 },
+    { "value": 2.5, "r": 220, "g": 80,  "b": 30 },
+    { "value": 3.0, "r": 180, "g": 30,  "b": 30 }
   ]
 }

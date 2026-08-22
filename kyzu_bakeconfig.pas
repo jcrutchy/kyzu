@@ -17,7 +17,7 @@ type
   TGlobCoverPalette = array of TGlobCoverClass;
 
   TColorStop = record
-    Elevation: Double;
+    Value: Double;
     R, G, B: Byte;
   end;
   THypsometricRamp = array of TColorStop;
@@ -38,16 +38,25 @@ type
     OutDirLandcover: string;
     OutDirHeightmap: string;
     OutDirCombined: string;
+    OutDirMovecost: string;
     MovementGridPath: string;
     Shading: TShadingParams;
     Classes: TGlobCoverPalette;
     Hypsometric: THypsometricRamp;
+    MovementCostRamp: THypsometricRamp;
+    ImpassableColor: array[0..2] of Byte;
   end;
 
 function LoadBakeConfig(const AFilename: string): TBakeConfig;
 function PaletteClassRGB(const AConfig: TBakeConfig; AID: Byte; out R, G, B: Byte): Boolean;
 function PaletteClassMoveCost(const AConfig: TBakeConfig; AID: Byte): Double;
+
+// Generic piecewise-linear interpolation over any color ramp - shared by
+// the elevation hypsometric tint and the movement-cost choropleth below,
+// rather than duplicating the interpolation logic for each.
+procedure RampColorRGB(const ARamp: THypsometricRamp; AValue: Double; out R, G, B: Byte);
 procedure HypsometricColorRGB(const AConfig: TBakeConfig; AElev: Double; out R, G, B: Byte);
+procedure MovementCostColorRGB(const AConfig: TBakeConfig; AMoveCost: Double; out R, G, B: Byte);
 
 implementation
 
@@ -78,6 +87,11 @@ begin
       Result.OutDirLandcover := JOutDirs.Get('landcover', 'tiles');
       Result.OutDirHeightmap := JOutDirs.Get('heightmap', 'tiles_heightmap');
       Result.OutDirCombined := JOutDirs.Get('combined', 'tiles_combined');
+      Result.OutDirMovecost := JOutDirs.Get('movecost', 'tiles_movecost');
+
+      Result.ImpassableColor[0] := JRoot.Get('impassable_color_r', 40);
+      Result.ImpassableColor[1] := JRoot.Get('impassable_color_g', 40);
+      Result.ImpassableColor[2] := JRoot.Get('impassable_color_b', 40);
 
       JShading := TJSONObject(JRoot.Find('shading'));
       Result.Shading.LightX := JShading.Get('light_x', -0.5);
@@ -112,11 +126,27 @@ begin
       for i := 0 to JArr.Count - 1 do
       begin
         JItem := TJSONObject(JArr[i]);
-        Result.Hypsometric[i].Elevation := JItem.Get('elevation', 0.0);
+        Result.Hypsometric[i].Value := JItem.Get('elevation', 0.0);
         Result.Hypsometric[i].R := JItem.Get('r', 0);
         Result.Hypsometric[i].G := JItem.Get('g', 0);
         Result.Hypsometric[i].B := JItem.Get('b', 0);
       end;
+
+      JArr := TJSONArray(JRoot.Find('movement_cost_ramp'));
+      if Assigned(JArr) then
+      begin
+        SetLength(Result.MovementCostRamp, JArr.Count);
+        for i := 0 to JArr.Count - 1 do
+        begin
+          JItem := TJSONObject(JArr[i]);
+          Result.MovementCostRamp[i].Value := JItem.Get('value', 0.0);
+          Result.MovementCostRamp[i].R := JItem.Get('r', 0);
+          Result.MovementCostRamp[i].G := JItem.Get('g', 0);
+          Result.MovementCostRamp[i].B := JItem.Get('b', 0);
+        end;
+      end
+      else
+        SetLength(Result.MovementCostRamp, 0); // not baking the movecost layer - fine, optional
     finally
       JData.Free;
     end;
@@ -149,41 +179,53 @@ begin
   Result := -1; // unrecognised class - treat as impassable rather than silently walkable
 end;
 
-procedure HypsometricColorRGB(const AConfig: TBakeConfig; AElev: Double; out R, G, B: Byte);
+procedure RampColorRGB(const ARamp: THypsometricRamp; AValue: Double; out R, G, B: Byte);
 var
   i: Integer;
   t, rf, gf, bf: Double;
-  Stops: THypsometricRamp;
 begin
-  Stops := AConfig.Hypsometric;
-  if Length(Stops) = 0 then
+  if Length(ARamp) = 0 then
   begin
     R := 128; G := 128; B := 128;
     Exit;
   end;
 
-  if AElev <= Stops[0].Elevation then
+  if AValue <= ARamp[0].Value then
   begin
-    rf := Stops[0].R; gf := Stops[0].G; bf := Stops[0].B;
+    rf := ARamp[0].R; gf := ARamp[0].G; bf := ARamp[0].B;
   end
-  else if AElev >= Stops[High(Stops)].Elevation then
+  else if AValue >= ARamp[High(ARamp)].Value then
   begin
-    rf := Stops[High(Stops)].R; gf := Stops[High(Stops)].G; bf := Stops[High(Stops)].B;
+    rf := ARamp[High(ARamp)].R; gf := ARamp[High(ARamp)].G; bf := ARamp[High(ARamp)].B;
   end
   else
   begin
     i := 0;
-    while (i < High(Stops)) and (Stops[i + 1].Elevation < AElev) do
+    while (i < High(ARamp)) and (ARamp[i + 1].Value < AValue) do
       Inc(i);
-    t := (AElev - Stops[i].Elevation) / (Stops[i + 1].Elevation - Stops[i].Elevation);
-    rf := Stops[i].R + t * (Stops[i + 1].R - Stops[i].R);
-    gf := Stops[i].G + t * (Stops[i + 1].G - Stops[i].G);
-    bf := Stops[i].B + t * (Stops[i + 1].B - Stops[i].B);
+    t := (AValue - ARamp[i].Value) / (ARamp[i + 1].Value - ARamp[i].Value);
+    rf := ARamp[i].R + t * (ARamp[i + 1].R - ARamp[i].R);
+    gf := ARamp[i].G + t * (ARamp[i + 1].G - ARamp[i].G);
+    bf := ARamp[i].B + t * (ARamp[i + 1].B - ARamp[i].B);
   end;
 
   R := Round(EnsureRange(rf, 0, 255));
   G := Round(EnsureRange(gf, 0, 255));
   B := Round(EnsureRange(bf, 0, 255));
+end;
+
+procedure HypsometricColorRGB(const AConfig: TBakeConfig; AElev: Double; out R, G, B: Byte);
+begin
+  RampColorRGB(AConfig.Hypsometric, AElev, R, G, B);
+end;
+
+// Caller is responsible for checking AMoveCost <= 0 (impassable) first and
+// using AConfig.ImpassableColor instead - this function only makes sense
+// for genuinely passable values, since "impassable" isn't a point on a
+// continuous cost gradient, it's a categorically different case.
+procedure MovementCostColorRGB(const AConfig: TBakeConfig; AMoveCost: Double; out R, G, B: Byte);
+begin
+  RampColorRGB(AConfig.MovementCostRamp, AMoveCost, R, G, B);
 end;
 
 end.

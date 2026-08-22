@@ -1,4 +1,4 @@
-program kyzu;
+program kyzu_server;
 {$mode objfpc}{$H+}
 
 uses
@@ -58,6 +58,23 @@ end;
 function LatToGridY(Lat: Double): Integer;
 begin
   Result := Trunc((90.0 - Lat) / 180.0 * Grid.Height);
+end;
+
+// Raw JSON array text, e.g. [[20.08,15.09],[20.15,15.02],...] - no quotes
+// anywhere in this, so it can be embedded directly into the escaped
+// payload string below without needing further escaping itself (only
+// the surrounding quoted fields like unit_id need the \" treatment).
+function BuildPathJSON(const APath: TGridPath): string;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(APath) do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + Format('[%.4f,%.4f]', [GridToLon(APath[i].X + 0.5), GridToLat(APath[i].Y + 0.5)]);
+  end;
+  Result := Result + ']';
 end;
 
 procedure HandleSpawn(APayload: TJSONObject);
@@ -150,8 +167,8 @@ begin
     UnitsLock.Leave;
   end;
 
-  SendLine(Format('{"topic":"game.event.path_found","payload":"{\"unit_id\":\"%s\",\"steps\":%d}"}',
-    [UnitID, Length(Path)]));
+  SendLine('{"topic":"game.event.path_found","payload":"{\"unit_id\":\"' + UnitID +
+    '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
 end;
 
 procedure DispatchIncoming(const ALine: string);

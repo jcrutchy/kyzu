@@ -74,6 +74,7 @@
     <button id="btnBaseLandcover" class="active">Land Cover</button>
     <button id="btnBaseHeightmap">Elevation</button>
     <button id="btnBaseCombined">Combined</button>
+    <button id="btnBaseMovecost">Move Cost</button>
   </div>
   <div class="section">
     <div class="label">overlay</div>
@@ -82,10 +83,17 @@
       <option value="landcover">Land Cover</option>
       <option value="heightmap">Elevation</option>
       <option value="combined">Combined</option>
+      <option value="movecost">Move Cost</option>
     </select>
     <div id="overlayOpacityRow">
       <input type="range" id="overlayOpacity" min="0" max="100" value="50">
     </div>
+  </div>
+  <div class="section">
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <input type="checkbox" id="showPaths" checked style="margin:0;">
+      <span class="label" style="margin:0;">show paths</span>
+    </label>
   </div>
 </div>
 
@@ -103,14 +111,16 @@
   const LAYERS = {
     landcover: { name: 'Land Cover', path: 'http://127.0.0.1:8092/tiles',           maxLevel: 6, cache: new Map() },
     heightmap: { name: 'Elevation',  path: 'http://127.0.0.1:8092/tiles_heightmap', maxLevel: 6, cache: new Map() },
-    combined:  { name: 'Combined',   path: 'http://127.0.0.1:8092/tiles_combined',  maxLevel: 6, cache: new Map() }
+    combined:  { name: 'Combined',   path: 'http://127.0.0.1:8092/tiles_combined',  maxLevel: 6, cache: new Map() },
+    movecost:  { name: 'Move Cost',  path: 'http://127.0.0.1:8092/tiles_movecost',  maxLevel: 6, cache: new Map() }
   };
   const GLOBAL_MAX_LEVEL = Math.max(...Object.values(LAYERS).map(l => l.maxLevel));
 
   const state = {
     baseLayer: 'landcover',
     overlayLayer: 'none',
-    overlayOpacity: 0.5
+    overlayOpacity: 0.5,
+    showPaths: true
   };
 
   const canvas = document.getElementById('mapCanvas');
@@ -130,6 +140,7 @@
   const AUTH_TOKEN = 'dev'; // stub auth - matches the terminal page's convention
 
   const units = new Map(); // unit_id -> {lon, lat, prevLon, prevLat, updateTime, prevUpdateTime}
+  const unitPaths = new Map(); // unit_id -> [{lon, lat}, ...] - cleared on arrival
   let ws = null;
   let wsAuthed = false;
 
@@ -199,10 +210,24 @@
         if (payload && payload.unit_id !== undefined) {
           onUnitPosition(payload.unit_id, payload.lon, payload.lat);
         }
+      } else if (msg.topic === 'game.event.path_found') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.unit_id !== undefined && Array.isArray(payload.path)) {
+          unitPaths.set(payload.unit_id, payload.path.map(p => ({ lon: p[0], lat: p[1] })));
+        }
+      } else if (msg.topic === 'game.event.arrived') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.unit_id !== undefined) {
+          unitPaths.delete(payload.unit_id); // arrived - no longer an "in progress" route to show
+        }
       }
-      // spawned/path_found/arrived/move_failed intentionally not handled
-      // here yet - this viewer only needs live position to render units,
-      // the terminal page is still the place to watch full command/event
+      // spawned/move_failed intentionally not handled here yet - this
+      // viewer only needs live position and route to render units, the
+      // terminal page is still the place to watch full command/event
       // traffic for now.
     };
 
@@ -307,6 +332,35 @@
   // not baked into any raster tile - completely decoupled from terrain
   // resolution, same architecture decision as the city-growth-footprint
   // discussion (dynamic game data doesn't belong in the static pyramid).
+  // Drawn separately from drawUnits so paths render underneath the unit
+  // markers (called first in render()) - a route line poking out from
+  // behind its own unit icon reads more clearly than one drawn on top.
+  function drawPaths() {
+    if (!state.showPaths || unitPaths.size === 0) return;
+
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+
+    ctx.save();
+    ctx.strokeStyle = '#5ee6a8';
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+
+    for (const [id, path] of unitPaths) {
+      if (path.length < 2) continue;
+      ctx.beginPath();
+      for (let i = 0; i < path.length; i++) {
+        const w = lonLatToWorld(path[i].lon, path[i].lat, view.zoom);
+        const sx = cw / 2 + (w.x - centerWorld.x);
+        const sy = ch / 2 + (w.y - centerWorld.y);
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   function drawUnits() {
     const cw = canvas.width, ch = canvas.height;
     const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
@@ -358,6 +412,7 @@
     if (state.overlayLayer !== 'none') {
       drawLayer(state.overlayLayer, state.overlayOpacity);
     }
+    drawPaths();
     drawUnits();
 
     const L = Math.max(MIN_LEVEL, Math.min(LAYERS[state.baseLayer].maxLevel, Math.round(view.zoom)));
@@ -371,15 +426,18 @@
   const btnBaseLandcover = document.getElementById('btnBaseLandcover');
   const btnBaseHeightmap = document.getElementById('btnBaseHeightmap');
   const btnBaseCombined = document.getElementById('btnBaseCombined');
+  const btnBaseMovecost = document.getElementById('btnBaseMovecost');
   const overlaySelect = document.getElementById('overlaySelect');
   const overlayOpacityRow = document.getElementById('overlayOpacityRow');
   const overlayOpacitySlider = document.getElementById('overlayOpacity');
+  const showPathsCheckbox = document.getElementById('showPaths');
 
   function setBaseLayer(key) {
     state.baseLayer = key;
     btnBaseLandcover.classList.toggle('active', key === 'landcover');
     btnBaseHeightmap.classList.toggle('active', key === 'heightmap');
     btnBaseCombined.classList.toggle('active', key === 'combined');
+    btnBaseMovecost.classList.toggle('active', key === 'movecost');
     if (state.overlayLayer === key) {
       state.overlayLayer = 'none';
       overlaySelect.value = 'none';
@@ -389,6 +447,7 @@
   btnBaseLandcover.addEventListener('click', () => setBaseLayer('landcover'));
   btnBaseHeightmap.addEventListener('click', () => setBaseLayer('heightmap'));
   btnBaseCombined.addEventListener('click', () => setBaseLayer('combined'));
+  btnBaseMovecost.addEventListener('click', () => setBaseLayer('movecost'));
 
   overlaySelect.addEventListener('change', () => {
     state.overlayLayer = overlaySelect.value;
@@ -396,6 +455,10 @@
   });
   overlayOpacitySlider.addEventListener('input', () => {
     state.overlayOpacity = overlayOpacitySlider.value / 100;
+  });
+
+  showPathsCheckbox.addEventListener('change', () => {
+    state.showPaths = showPathsCheckbox.checked;
   });
 
   let dragging = false, lastX = 0, lastY = 0;
