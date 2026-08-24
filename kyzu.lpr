@@ -1,4 +1,4 @@
-program kyzu_server;
+program kyzu;
 {$mode objfpc}{$H+}
 
 uses
@@ -22,9 +22,23 @@ type
     PathIndex: Integer; // index of the path node the unit is currently departing from
   end;
 
+// StdErr is buffered by default and only auto-flushes on a clean, natural
+// exit - a forceful kill (VDRX's normal way of stopping this process)
+// loses anything not explicitly flushed. Confirmed by direct test: an
+// unflushed WriteLn(StdErr,...) followed by a kill produces literally
+// zero output, even though the line executed. Route all startup/
+// diagnostic messages through this instead of raw WriteLn(StdErr,...).
+procedure LogDiag(const AMsg: string);
+begin
+  WriteLn(StdErr, AMsg);
+  Flush(StdErr);
+end;
+
 var
   OutputLock: TCriticalSection;
   UnitsLock: TCriticalSection;
+  EventLogLock: TCriticalSection;
+  EventLogFile: TextFile;
   Units: specialize TDictionary<string, TUnit>;
   Grid: TMovementGrid;
   Config: TBakeConfig;
@@ -37,6 +51,25 @@ begin
     Flush(Output);
   finally
     OutputLock.Leave;
+  end;
+end;
+
+// Persistence: append-only JSONL event log, same convention as VDRX's own
+// TVDRX_BucketExecutive. Logs resolved OUTCOMES (a spawn's actual
+// location, a move's actual computed path), not raw commands - replay
+// never needs to re-run pathfinding, and never risks silently producing
+// a DIFFERENT path than what actually happened if bake_config.json's
+// move_cost values get edited between the original run and a later
+// replay. Flushed after every write - durability over throughput, this
+// isn't a hot path.
+procedure LogEvent(const AJSON: string);
+begin
+  EventLogLock.Enter;
+  try
+    WriteLn(EventLogFile, AJSON);
+    Flush(EventLogFile);
+  finally
+    EventLogLock.Leave;
   end;
 end;
 
@@ -115,6 +148,9 @@ begin
     UnitsLock.Leave;
   end;
 
+  LogEvent(Format('{"type":"spawned","unit_id":"%s","lon":%.4f,"lat":%.4f}',
+    [UnitID, GridToLon(U.GX), GridToLat(U.GY)]));
+
   SendLine(Format('{"topic":"game.event.spawned","payload":"{\"unit_id\":\"%s\",\"lon\":%.4f,\"lat\":%.4f}"}',
     [UnitID, GridToLon(U.GX), GridToLat(U.GY)]));
 end;
@@ -166,6 +202,8 @@ begin
   finally
     UnitsLock.Leave;
   end;
+
+  LogEvent('{"type":"path_found","unit_id":"' + UnitID + '","path":' + BuildPathJSON(Path) + '}');
 
   SendLine('{"topic":"game.event.path_found","payload":"{\"unit_id\":\"' + UnitID +
     '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
@@ -264,9 +302,11 @@ begin
       U.GX := TargetX + 0.5;
       U.GY := TargetY + 0.5;
       Inc(U.PathIndex);
+      LogEvent(Format('{"type":"waypoint","unit_id":"%s","path_index":%d}', [Keys[i], U.PathIndex]));
       if U.PathIndex >= High(U.Path) then
       begin
         SetLength(U.Path, 0); // arrived - unit goes idle, stops generating traffic
+        LogEvent(Format('{"type":"arrived","unit_id":"%s"}', [Keys[i]]));
         SendLine(Format('{"topic":"game.event.arrived","payload":"{\"unit_id\":\"%s\"}"}', [Keys[i]]));
       end;
     end
@@ -286,6 +326,119 @@ begin
     SendLine(Format('{"topic":"game.event.position","payload":"{\"unit_id\":\"%s\",\"lon\":%.4f,\"lat\":%.4f}"}',
       [Keys[i], GridToLon(U.GX), GridToLat(U.GY)]));
   end;
+end;
+
+// Reconstructs Units from the event log, in order, before anything else
+// touches Units - called from the main block before the reader thread
+// starts, so there's no window where a live command could race a
+// still-in-progress replay. Malformed lines (e.g. a log truncated by a
+// crash mid-write) are skipped rather than aborting startup entirely -
+// losing the last partial line is an acceptable, bounded cost; refusing
+// to start at all over it would not be.
+procedure ReplayEventLog(const AFilename: string);
+var
+  F: TextFile;
+  Line, EventType, UnitID: string;
+  Data: TJSONData;
+  Obj: TJSONObject;
+  U: TUnit;
+  Lon, Lat: Double;
+  PathArr, PointArr: TJSONArray;
+  GridPath: TGridPath;
+  i, PathIdx, EventCount: Integer;
+begin
+  EventCount := 0;
+  if not FileExists(AFilename) then
+  begin
+    LogDiag('No existing event log at ' + AFilename + ' - starting fresh.');
+    Exit;
+  end;
+
+  AssignFile(F, AFilename);
+  Reset(F);
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      if Line = '' then Continue;
+
+      try
+        Data := GetJSON(Line);
+      except
+        Continue; // malformed line - skip rather than abort startup
+      end;
+
+      try
+        if Data.JSONType <> jtObject then Continue;
+        Obj := TJSONObject(Data);
+        EventType := Obj.Get('type', '');
+        UnitID := Obj.Get('unit_id', '');
+        if UnitID = '' then Continue;
+
+        if EventType = 'spawned' then
+        begin
+          Lon := Obj.Get('lon', 0.0);
+          Lat := Obj.Get('lat', 0.0);
+          U.ID := UnitID;
+          U.GX := LonToGridX(Lon) + 0.5;
+          U.GY := LatToGridY(Lat) + 0.5;
+          SetLength(U.Path, 0);
+          U.PathIndex := 0;
+          Units.AddOrSetValue(UnitID, U);
+        end
+        else if EventType = 'path_found' then
+        begin
+          if Units.TryGetValue(UnitID, U) then
+          begin
+            PathArr := TJSONArray(Obj.Find('path'));
+            if Assigned(PathArr) then
+            begin
+              SetLength(GridPath, PathArr.Count);
+              for i := 0 to PathArr.Count - 1 do
+              begin
+                PointArr := TJSONArray(PathArr.Items[i]);
+                GridPath[i].X := LonToGridX(PointArr.Floats[0]);
+                GridPath[i].Y := LatToGridY(PointArr.Floats[1]);
+              end;
+              U.Path := GridPath;
+              U.PathIndex := 0;
+              Units.AddOrSetValue(UnitID, U);
+            end;
+          end;
+        end
+        else if EventType = 'waypoint' then
+        begin
+          if Units.TryGetValue(UnitID, U) then
+          begin
+            PathIdx := Obj.Get('path_index', 0);
+            if (PathIdx >= 0) and (PathIdx <= High(U.Path)) then
+            begin
+              U.PathIndex := PathIdx;
+              U.GX := U.Path[PathIdx].X + 0.5;
+              U.GY := U.Path[PathIdx].Y + 0.5;
+              Units.AddOrSetValue(UnitID, U);
+            end;
+          end;
+        end
+        else if EventType = 'arrived' then
+        begin
+          if Units.TryGetValue(UnitID, U) then
+          begin
+            SetLength(U.Path, 0);
+            Units.AddOrSetValue(UnitID, U);
+          end;
+        end;
+
+        Inc(EventCount);
+      finally
+        Data.Free;
+      end;
+    end;
+  finally
+    CloseFile(F);
+  end;
+
+  LogDiag('Replayed ' + IntToStr(EventCount) + ' events - ' + IntToStr(Units.Count) + ' units restored.');
 end;
 
 type
@@ -316,21 +469,38 @@ end;
 var
   ReaderThread: TStdinReaderThread;
   Tick: Int64;
+  EventLogPath: string;
+  EventLogExisted: Boolean;
 begin
   Tick := 0;
   OutputLock := TCriticalSection.Create;
   UnitsLock := TCriticalSection.Create;
+  EventLogLock := TCriticalSection.Create;
   Units := specialize TDictionary<string, TUnit>.Create;
 
-  WriteLn(StdErr, 'Loading bake_config.json ...');
+  LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
-  WriteLn(StdErr, 'Loading ', Config.MovementGridPath, ' ...');
+  LogDiag('Loading ' + Config.MovementGridPath + ' ...');
   Grid := LoadMovementGrid(Config.MovementGridPath);
-  WriteLn(StdErr, 'Movement grid: ', Grid.Width, ' x ', Grid.Height);
+  LogDiag('Movement grid: ' + IntToStr(Grid.Width) + ' x ' + IntToStr(Grid.Height));
 
-  // Grid/Config are read-only from here on, so it's safe to start the
-  // reader thread only now - no window where it could race a concurrent
-  // load.
+  EventLogPath := ExpandFileName(ExtractFilePath(ParamStr(0))) + 'events.jsonl';
+  LogDiag('Event log: ' + EventLogPath);
+  EventLogExisted := FileExists(EventLogPath);
+  ReplayEventLog(EventLogPath);
+
+  // Open for appending only after the full replay read pass above - if
+  // this were opened first and appended to while also being read, we'd
+  // risk replaying partially-written data from this same run.
+  AssignFile(EventLogFile, EventLogPath);
+  if EventLogExisted then
+    Append(EventLogFile)
+  else
+    Rewrite(EventLogFile);
+
+  // Grid/Config/EventLogFile are all read-only or append-only from here
+  // on, so it's safe to start the reader thread only now - no window
+  // where it could race a concurrent load or an in-progress replay.
   ReaderThread := TStdinReaderThread.Create(False); // starts immediately
 
   while True do

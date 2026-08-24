@@ -32,6 +32,16 @@
   }
   #hud .wsdot.up { background: #5ee6a8; }
 
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(230,94,94,0.92); color: #0a0e0c;
+    padding: 8px 18px; font-size: 12px; font-weight: 600;
+    border-radius: 3px;
+    opacity: 0; transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+
   #layerPanel {
     position: fixed; top: 10px; right: 10px;
     background: rgba(10,14,12,0.85);
@@ -65,8 +75,11 @@
 <div id="hud">
   <span class="wsdot" id="wsDot"></span>ws: <span id="wsStatus">connecting</span> <span class="dim">| units: <span id="unitCount">0</span></span><br>
   zoom: <span id="hudZoom">-</span> <span class="dim">(level <span id="hudLevel">-</span>)</span><br>
-  lon/lat: <span id="hudLonLat">-</span>
+  lon/lat: <span id="hudLonLat">-</span><br>
+  <span class="dim">selected: <span id="hudSelected">none</span></span>
 </div>
+
+<div id="toast"></div>
 
 <div id="layerPanel">
   <div class="section">
@@ -141,6 +154,22 @@
 
   const units = new Map(); // unit_id -> {lon, lat, prevLon, prevLat, updateTime, prevUpdateTime}
   const unitPaths = new Map(); // unit_id -> [{lon, lat}, ...] - cleared on arrival
+  let selectedUnitId = null;
+  const hudSelected = document.getElementById('hudSelected');
+
+  function setSelectedUnit(id) {
+    selectedUnitId = id;
+    hudSelected.textContent = id || 'none';
+  }
+
+  let toastTimeout = null;
+  function showToast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimeout);
+    toastTimeout = setTimeout(() => el.classList.remove('show'), 2200);
+  }
   let ws = null;
   let wsAuthed = false;
 
@@ -178,6 +207,57 @@
       lon: u.prevLon + (u.lon - u.prevLon) * t,
       lat: u.prevLat + (u.lat - u.prevLat) * t
     };
+  }
+
+  // ---- selection & commands - the viewer's first time actually
+  // publishing anything, everything before this was subscribe-only ----
+  function publish(topic, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ method: 'publish', topic: topic, payload: payload }));
+  }
+
+  // Screen-space hit test against currently-rendered unit positions -
+  // hitRadius matches the visual size of the dot/icon markers at the
+  // current zoom, so the clickable area lines up with what's actually
+  // drawn rather than an arbitrary fixed radius.
+  function findUnitNear(mx, my) {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const hitRadius = view.zoom >= ICON_ZOOM_THRESHOLD ? 14 : 10;
+    let closestId = null, closestDist = hitRadius;
+
+    for (const [id, u] of units) {
+      const pos = getUnitDisplayPosition(u);
+      const w = lonLatToWorld(pos.lon, pos.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      const d = Math.hypot(mx - sx, my - sy);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    return closestId;
+  }
+
+  // Click on a unit selects it (always takes priority). Click elsewhere
+  // while a unit is selected issues a move order there. Click elsewhere
+  // with nothing selected is a no-op - matches standard RTS-style
+  // select-then-command conventions rather than inventing a new one.
+  function handleClick(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = clientX - rect.left, my = clientY - rect.top;
+
+    const hitUnit = findUnitNear(mx, my);
+    if (hitUnit) {
+      setSelectedUnit(hitUnit);
+      return;
+    }
+
+    if (selectedUnitId) {
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const worldX = centerWorld.x + (mx - canvas.width / 2);
+      const worldY = centerWorld.y + (my - canvas.height / 2);
+      const target = worldToLonLat(worldX, worldY, view.zoom);
+      publish('game.cmd.move', { unit_id: selectedUnitId, to_lon: target.lon, to_lat: target.lat });
+    }
   }
 
   function connectWS() {
@@ -224,8 +304,13 @@
         if (payload && payload.unit_id !== undefined) {
           unitPaths.delete(payload.unit_id); // arrived - no longer an "in progress" route to show
         }
+      } else if (msg.topic === 'game.event.move_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
       }
-      // spawned/move_failed intentionally not handled here yet - this
+      // spawned intentionally not handled here yet - this
       // viewer only needs live position and route to render units, the
       // terminal page is still the place to watch full command/event
       // traffic for now.
@@ -374,6 +459,14 @@
 
       if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue; // offscreen
 
+      if (id === selectedUnitId) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, useIcons ? 13 : 9, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
       if (useIcons) {
         ctx.save();
         ctx.translate(sx, sy);
@@ -462,22 +555,34 @@
   });
 
   let dragging = false, lastX = 0, lastY = 0;
+  let mouseDownX = 0, mouseDownY = 0, mouseMoved = false;
+  const CLICK_MOVE_THRESHOLD = 5; // px - below this, treat mouseup as a click, not a drag
 
   canvas.addEventListener('mousedown', (e) => {
     dragging = true; lastX = e.clientX; lastY = e.clientY;
+    mouseDownX = e.clientX; mouseDownY = e.clientY; mouseMoved = false;
     canvas.classList.add('dragging');
   });
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', (e) => {
     dragging = false;
     canvas.classList.remove('dragging');
+    if (!mouseMoved) handleClick(e.clientX, e.clientY);
   });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
+    if (Math.abs(e.clientX - mouseDownX) > CLICK_MOVE_THRESHOLD ||
+        Math.abs(e.clientY - mouseDownY) > CLICK_MOVE_THRESHOLD) {
+      mouseMoved = true;
+    }
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     view.lon -= dx / worldPixelWidth(view.zoom) * 360;
     view.lat += dy / worldPixelHeight(view.zoom) * 180;
     clampView();
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setSelectedUnit(null);
   });
 
   function zoomToward(mx, my, deltaZoom) {
@@ -509,6 +614,8 @@
 
   let touchMode = null;
   let touchLastX = 0, touchLastY = 0;
+  let touchStartX = 0, touchStartY = 0, touchMoved = false;
+  const TAP_MOVE_THRESHOLD = 8; // px - a bit more forgiving than mouse, fingers aren't as precise
   let pinchStartDist = 0, pinchStartZoom = 0, pinchMidX = 0, pinchMidY = 0;
 
   function touchDist(t0, t1) {
@@ -521,6 +628,9 @@
       touchMode = 'pan';
       touchLastX = e.touches[0].clientX;
       touchLastY = e.touches[0].clientY;
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      touchMoved = false;
     } else if (e.touches.length === 2) {
       touchMode = 'pinch';
       pinchStartDist = touchDist(e.touches[0], e.touches[1]);
@@ -534,6 +644,10 @@
   canvas.addEventListener('touchmove', (e) => {
     e.preventDefault();
     if (touchMode === 'pan' && e.touches.length === 1) {
+      if (Math.abs(e.touches[0].clientX - touchStartX) > TAP_MOVE_THRESHOLD ||
+          Math.abs(e.touches[0].clientY - touchStartY) > TAP_MOVE_THRESHOLD) {
+        touchMoved = true;
+      }
       const dx = e.touches[0].clientX - touchLastX;
       const dy = e.touches[0].clientY - touchLastY;
       touchLastX = e.touches[0].clientX;
@@ -549,6 +663,9 @@
   }, { passive: false });
 
   canvas.addEventListener('touchend', (e) => {
+    if (touchMode === 'pan' && !touchMoved) {
+      handleClick(touchStartX, touchStartY);
+    }
     if (e.touches.length === 0) touchMode = null;
   });
 

@@ -9,13 +9,17 @@
         <Filename Value="kyzu.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <TopLine Value="290"/>
-        <CursorPos X="64" Y="305"/>
+        <CursorPos X="18" Y="10"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="-1"/>
+    <JumpHistory>
+      <Position>
+        <Filename Value="kyzu.lpr"/>
+        <Caret Line="8" Column="21"/>
+      </Position>
+    </JumpHistory>
     <RunParams>
       <FormatVersion Value="2"/>
       <Modes ActiveMode=""/>

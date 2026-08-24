@@ -53,6 +53,17 @@ begin
       begin
         Lon := -180.0 + (x + 0.5) * (360.0 / GridW);
         Lat := 90.0 - (y + 0.5) * (180.0 / GridH);
+        // Single center-point nearest-neighbour sample per cell - can
+        // alias narrow features (e.g. a lake narrower than one cell)
+        // right out of the grid entirely if both neighbouring cell
+        // centres happen to land on dry ground either side of it.
+        // Observed in practice: a unit's path crossing open water on a
+        // narrow rift lake. Visual tile layers don't need a fix here
+        // (a slightly under-rendered lake is harmless), but the
+        // movement grid genuinely should - a future improvement is
+        // majority-vote sampling (several sub-points per cell, take the
+        // most common class) instead of one point sample, to catch
+        // thin features without needing to raise overall resolution.
         Row[x] := SampleLandCoverClass(LandCoverReader, ElevationReader, Config, Lon, Lat);
       end;
       Stream.WriteBuffer(Row[0], GridW);
