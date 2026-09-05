@@ -15,6 +15,7 @@
     cursor: grab;
   }
   canvas.dragging { cursor: grabbing; }
+  canvas.spawn-armed { cursor: crosshair; }
 
   #hud {
     position: fixed; top: 10px; left: 10px;
@@ -65,8 +66,14 @@
     font: inherit; font-size: 11px; padding: 3px 6px; width: 100%;
   }
   #layerPanel input[type=range] { width: 100%; margin-top: 4px; }
+  #layerPanel input[type=text] {
+    background: #0f1512; border: 1px solid #1c2620; color: #c9d6cd;
+    font: inherit; font-size: 11px; padding: 3px 6px; width: 100%;
+    box-sizing: border-box; margin-bottom: 4px;
+  }
   #overlayOpacityRow { display: none; }
   #overlayOpacityRow.shown { display: block; }
+  #btnSpawn.armed { color: #ffd166; border-color: #6b5a2c; }
 </style>
 </head>
 <body>
@@ -107,6 +114,12 @@
       <input type="checkbox" id="showPaths" checked style="margin:0;">
       <span class="label" style="margin:0;">show paths</span>
     </label>
+  </div>
+  <div class="section">
+    <div class="label">faction</div>
+    <input type="text" id="factionInput" value="me" maxlength="24">
+    <button id="btnSpawn" style="width:100%;margin:0;">Spawn (S)</button>
+    <div class="label" style="margin-top:4px;">select unit, X to despawn</div>
   </div>
 </div>
 
@@ -153,6 +166,7 @@
   const AUTH_TOKEN = 'dev'; // stub auth - matches the terminal page's convention
 
   const units = new Map(); // unit_id -> {lon, lat, prevLon, prevLat, updateTime, prevUpdateTime}
+  const unitMeta = new Map(); // unit_id -> {owner, unitType} - populated from the one-time spawned event
   const unitPaths = new Map(); // unit_id -> [{lon, lat}, ...] - cleared on arrival
   let selectedUnitId = null;
   const hudSelected = document.getElementById('hudSelected');
@@ -180,6 +194,20 @@
   function setWsStatus(state) {
     wsDot.classList.toggle('up', state === 'up');
     wsStatus.textContent = state;
+  }
+
+  // Deterministic string -> color, so the same faction id always renders
+  // the same hue across units, page reloads, and separate clients - no
+  // shared palette-assignment state needed anywhere. '' (unowned) keeps
+  // the original green rather than hashing to an arbitrary hue, so
+  // existing spawns from before ownership existed still look normal.
+  function colorForOwner(owner) {
+    if (!owner) return '#5ee6a8';
+    let hash = 0;
+    for (let i = 0; i < owner.length; i++) {
+      hash = (hash * 31 + owner.charCodeAt(i)) >>> 0;
+    }
+    return 'hsl(' + (hash % 360) + ', 70%, 60%)';
   }
 
   function onUnitPosition(unitId, lon, lat) {
@@ -216,6 +244,33 @@
     ws.send(JSON.stringify({ method: 'publish', topic: topic, payload: payload }));
   }
 
+  // ---- spawn-from-map: arm with the button or 'S', then next click
+  // spawns a unit for the current faction at that spot rather than
+  // selecting/moving. Mirrors the select-then-command click convention
+  // below rather than replacing it - armed mode just intercepts the
+  // click one time.
+  let spawnArmed = false;
+  const btnSpawn = document.getElementById('btnSpawn');
+  const factionInput = document.getElementById('factionInput');
+
+  function setSpawnArmed(armed) {
+    spawnArmed = armed;
+    btnSpawn.classList.toggle('armed', armed);
+    canvas.classList.toggle('spawn-armed', armed);
+  }
+  btnSpawn.addEventListener('click', () => setSpawnArmed(!spawnArmed));
+
+  function spawnUnitAt(lon, lat) {
+    const unitId = 'u_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    publish('game.cmd.spawn', {
+      unit_id: unitId,
+      lon: lon,
+      lat: lat,
+      owner: factionInput.value || '',
+      unit_type: 'generic'
+    });
+  }
+
   // Screen-space hit test against currently-rendered unit positions -
   // hitRadius matches the visual size of the dot/icon markers at the
   // current zoom, so the clickable area lines up with what's actually
@@ -241,9 +296,23 @@
   // while a unit is selected issues a move order there. Click elsewhere
   // with nothing selected is a no-op - matches standard RTS-style
   // select-then-command conventions rather than inventing a new one.
+  // Armed spawn mode is checked first and always consumes the click,
+  // whether or not it landed on an existing unit.
   function handleClick(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const mx = clientX - rect.left, my = clientY - rect.top;
+
+    if (spawnArmed) {
+      setSpawnArmed(false);
+      const hitUnit = findUnitNear(mx, my);
+      if (hitUnit) return; // clicked an existing unit - cancel the spawn silently rather than stack one on top
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const worldX = centerWorld.x + (mx - canvas.width / 2);
+      const worldY = centerWorld.y + (my - canvas.height / 2);
+      const target = worldToLonLat(worldX, worldY, view.zoom);
+      spawnUnitAt(target.lon, target.lat);
+      return;
+    }
 
     const hitUnit = findUnitNear(mx, my);
     if (hitUnit) {
@@ -256,8 +325,17 @@
       const worldX = centerWorld.x + (mx - canvas.width / 2);
       const worldY = centerWorld.y + (my - canvas.height / 2);
       const target = worldToLonLat(worldX, worldY, view.zoom);
-      publish('game.cmd.move', { unit_id: selectedUnitId, to_lon: target.lon, to_lat: target.lat });
+      publish('game.cmd.move', { unit_id: selectedUnitId, to_lon: target.lon, to_lat: target.lat, by: factionInput.value || '' });
     }
+  }
+
+  // Despawns the currently selected unit - server is the source of truth
+  // on whether it's actually allowed (ownership), this just fires the
+  // command and lets the existing despawned/despawn_failed handlers
+  // above react to whatever comes back.
+  function despawnSelected() {
+    if (!selectedUnitId) return;
+    publish('game.cmd.despawn', { unit_id: selectedUnitId, by: factionInput.value || '' });
   }
 
   function connectWS() {
@@ -290,6 +368,38 @@
         if (payload && payload.unit_id !== undefined) {
           onUnitPosition(payload.unit_id, payload.lon, payload.lat);
         }
+      } else if (msg.topic === 'game.event.spawned') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.unit_id !== undefined) {
+          unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic' });
+          // Idle spawned units generate no further position traffic until
+          // they're first given a move order, so this is the only chance
+          // to place them on the map at all - not just cache metadata.
+          onUnitPosition(payload.unit_id, payload.lon, payload.lat);
+        }
+      } else if (msg.topic === 'game.event.despawned') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.unit_id !== undefined) {
+          units.delete(payload.unit_id);
+          unitMeta.delete(payload.unit_id);
+          unitPaths.delete(payload.unit_id);
+          if (selectedUnitId === payload.unit_id) setSelectedUnit(null);
+          unitCountEl.textContent = String(units.size);
+        }
+      } else if (msg.topic === 'game.event.spawn_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('spawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.despawn_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
       } else if (msg.topic === 'game.event.path_found') {
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
@@ -310,10 +420,6 @@
         catch (e) { return; }
         showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
       }
-      // spawned intentionally not handled here yet - this
-      // viewer only needs live position and route to render units, the
-      // terminal page is still the place to watch full command/event
-      // traffic for now.
     };
 
     ws.onerror = () => { setWsStatus('error'); };
@@ -459,6 +565,9 @@
 
       if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue; // offscreen
 
+      const meta = unitMeta.get(id);
+      const fillColor = colorForOwner(meta ? meta.owner : '');
+
       if (id === selectedUnitId) {
         ctx.beginPath();
         ctx.arc(sx, sy, useIcons ? 13 : 9, 0, Math.PI * 2);
@@ -473,7 +582,7 @@
         ctx.beginPath();
         ctx.moveTo(0, -8); ctx.lineTo(6, 0); ctx.lineTo(0, 8); ctx.lineTo(-6, 0);
         ctx.closePath();
-        ctx.fillStyle = '#5ee6a8';
+        ctx.fillStyle = fillColor;
         ctx.fill();
         ctx.strokeStyle = '#0a0e0c';
         ctx.lineWidth = 1.5;
@@ -487,7 +596,7 @@
       } else {
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);
-        ctx.fillStyle = '#5ee6a8';
+        ctx.fillStyle = fillColor;
         ctx.fill();
         ctx.strokeStyle = '#0a0e0c';
         ctx.lineWidth = 1;
@@ -582,7 +691,10 @@
   });
 
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') setSelectedUnit(null);
+    if (document.activeElement === factionInput) return; // typing a faction name, not issuing a shortcut
+    if (e.key === 'Escape') { setSelectedUnit(null); setSpawnArmed(false); }
+    if (e.key === 's' || e.key === 'S') setSpawnArmed(!spawnArmed);
+    if (e.key === 'Delete' || e.key === 'x' || e.key === 'X') despawnSelected();
   });
 
   function zoomToward(mx, my, deltaZoom) {
