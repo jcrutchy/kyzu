@@ -73,7 +73,7 @@
   }
   #overlayOpacityRow { display: none; }
   #overlayOpacityRow.shown { display: block; }
-  #btnSpawn.armed { color: #ffd166; border-color: #6b5a2c; }
+  #btnSpawn.armed, #btnFoundCity.armed, #btnRoad.armed { color: #ffd166; border-color: #6b5a2c; }
 </style>
 </head>
 <body>
@@ -83,7 +83,8 @@
   <span class="wsdot" id="wsDot"></span>ws: <span id="wsStatus">connecting</span> <span class="dim">| units: <span id="unitCount">0</span></span><br>
   zoom: <span id="hudZoom">-</span> <span class="dim">(level <span id="hudLevel">-</span>)</span><br>
   lon/lat: <span id="hudLonLat">-</span> <span class="dim">| cell: <span id="hudCell">-</span></span><br>
-  <span class="dim">selected: <span id="hudSelected">none</span></span>
+  <span class="dim">selected: <span id="hudSelected">none</span></span><br>
+  <span class="dim">city: <span id="hudSelectedCity">none</span></span>
 </div>
 
 <div id="toast"></div>
@@ -119,11 +120,17 @@
       <input type="checkbox" id="showPaths" checked style="margin:0;">
       <span class="label" style="margin:0;">show paths</span>
     </label>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;">
+      <input type="checkbox" id="showDevelopment" checked style="margin:0;">
+      <span class="label" style="margin:0;">show development</span>
+    </label>
   </div>
   <div class="section">
     <div class="label">faction</div>
     <input type="text" id="factionInput" value="me" maxlength="24">
     <button id="btnSpawn" style="width:100%;margin:0;">Spawn (S)</button>
+    <button id="btnFoundCity" style="width:100%;margin:4px 0 0;">Found City (F)</button>
+    <button id="btnRoad" style="width:100%;margin:4px 0 0;">Build Road (R)</button>
     <div class="label" style="margin-top:4px;">select unit, X to despawn, C to collect</div>
   </div>
   <div class="section">
@@ -154,7 +161,8 @@
     overlayLayer: 'none',
     overlayOpacity: 0.5,
     showPaths: true,
-    showGrid: false
+    showGrid: false,
+    showDevelopment: true
   };
 
   const canvas = document.getElementById('mapCanvas');
@@ -163,6 +171,7 @@
   const hudLevel = document.getElementById('hudLevel');
   const hudLonLat = document.getElementById('hudLonLat');
   const hudCell = document.getElementById('hudCell');
+  const hudSelectedCity = document.getElementById('hudSelectedCity');
 
   const view = { lon: 0, lat: 0, zoom: 2 };
   let cursorLonLat = { lon: 0, lat: 0 };
@@ -175,8 +184,17 @@
   const unitMeta = new Map();
   const unitPaths = new Map();
   const nodes = new Map();
+  const cities = new Map();       // id -> {owner, lon, lat, population}
+  const roads = new Map();        // id -> {fromCityId, toCityId, path:[{lon,lat}]}
+  const development = new Map();  // "gx,gy" -> level 0-255
   let selectedUnitId = null;
+  let selectedCityId = null;
   const hudSelected = document.getElementById('hudSelected');
+
+  // Mirrors the server's GridToLon/GridToLat exactly, so a development
+  // cell paints at the same spot the server computed it for.
+  function gridToLon(gx) { return -180 + (gx + 0.5) * (360 / GRID_WIDTH); }
+  function gridToLat(gy) { return 90 - (gy + 0.5) * (180 / GRID_HEIGHT); }
 
   const myLedger = {};
   const stashDisplay = document.getElementById('stashDisplay');
@@ -276,6 +294,44 @@
     });
   }
 
+  let foundCityArmed = false;
+  let roadArmed = false;
+  let roadFromCityId = null;
+  const btnFoundCity = document.getElementById('btnFoundCity');
+  const btnRoad = document.getElementById('btnRoad');
+
+  function setFoundCityArmed(armed) {
+    foundCityArmed = armed;
+    btnFoundCity.classList.toggle('armed', armed);
+    canvas.classList.toggle('spawn-armed', armed || spawnArmed);
+  }
+  function setRoadArmed(armed) {
+    roadArmed = armed;
+    roadFromCityId = null;
+    btnRoad.classList.toggle('armed', armed);
+  }
+  btnFoundCity.addEventListener('click', () => setFoundCityArmed(!foundCityArmed));
+  btnRoad.addEventListener('click', () => setRoadArmed(!roadArmed));
+
+  function foundCityAt(lon, lat) {
+    const cityId = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    publish('game.cmd.found_city', { city_id: cityId, lon: lon, lat: lat, owner: factionInput.value || '' });
+  }
+
+  function findCityNear(mx, my) {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    let closestId = null, closestDist = 20;
+    for (const [id, c] of cities) {
+      const w = lonLatToWorld(c.lon, c.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      const d = Math.hypot(mx - sx, my - sy);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    return closestId;
+  }
+
   function findUnitNear(mx, my) {
     const cw = canvas.width, ch = canvas.height;
     const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
@@ -296,6 +352,37 @@
   function handleClick(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const mx = clientX - rect.left, my = clientY - rect.top;
+
+    if (foundCityArmed) {
+      setFoundCityArmed(false);
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const worldX = centerWorld.x + (mx - canvas.width / 2);
+      const worldY = centerWorld.y + (my - canvas.height / 2);
+      const target = worldToLonLat(worldX, worldY, view.zoom);
+      foundCityAt(target.lon, target.lat);
+      return;
+    }
+
+    if (roadArmed) {
+      const hitCity = findCityNear(mx, my);
+      if (!hitCity) return;
+      if (!roadFromCityId) {
+        roadFromCityId = hitCity;
+        showToast('road from ' + hitCity + ' - click destination city');
+      } else if (hitCity !== roadFromCityId) {
+        const roadId = 'r_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        publish('game.cmd.build_road', { road_id: roadId, from_city_id: roadFromCityId, to_city_id: hitCity, by: factionInput.value || '' });
+        setRoadArmed(false);
+      }
+      return;
+    }
+
+    const hitCity = findCityNear(mx, my);
+    if (hitCity && !spawnArmed) {
+      selectedCityId = hitCity;
+      hudSelectedCity.textContent = hitCity;
+      return;
+    }
 
     if (spawnArmed) {
       setSpawnArmed(false);
@@ -363,6 +450,9 @@
         ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
         publish('game.cmd.list_nodes', {});
         publish('game.cmd.get_ledger', { by: factionInput.value || '' });
+        publish('game.cmd.list_cities', {});
+        publish('game.cmd.list_roads', {});
+        publish('game.cmd.get_development', {});
         return;
       }
 
@@ -458,6 +548,74 @@
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
         showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.city_founded' || msg.topic === 'game.event.city_grew') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.city_id !== undefined) {
+          const existing = cities.get(payload.city_id) || {};
+          cities.set(payload.city_id, {
+            owner: payload.owner !== undefined ? payload.owner : existing.owner,
+            lon: payload.lon !== undefined ? payload.lon : existing.lon,
+            lat: payload.lat !== undefined ? payload.lat : existing.lat,
+            population: payload.population
+          });
+        }
+      } else if (msg.topic === 'game.event.city_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('found city failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.city_list') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && Array.isArray(payload.cities)) {
+          cities.clear();
+          for (const c of payload.cities) {
+            cities.set(c.id, { owner: c.owner, lon: c.lon, lat: c.lat, population: c.population });
+          }
+        }
+      } else if (msg.topic === 'game.event.road_built') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.road_id !== undefined && Array.isArray(payload.path)) {
+          roads.set(payload.road_id, {
+            fromCityId: payload.from_city_id,
+            toCityId: payload.to_city_id,
+            path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
+          });
+        }
+      } else if (msg.topic === 'game.event.road_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('build road failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.road_list') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && Array.isArray(payload.roads)) {
+          roads.clear();
+          for (const r of payload.roads) {
+            roads.set(r.id, {
+              fromCityId: r.from_city_id,
+              toCityId: r.to_city_id,
+              path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
+            });
+          }
+        }
+      } else if (msg.topic === 'game.event.development_delta' || msg.topic === 'game.event.development_snapshot') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && Array.isArray(payload.cells)) {
+          if (msg.topic === 'game.event.development_snapshot') development.clear();
+          for (const c of payload.cells) {
+            development.set(c.gx + ',' + c.gy, c.d);
+          }
+        }
       }
     };
 
@@ -630,6 +788,100 @@
     ctx.restore();
   }
 
+  function drawDevelopment() {
+    if (!state.showDevelopment || development.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const cellPx = worldPixelWidth(view.zoom) / GRID_WIDTH;
+
+    ctx.save();
+    for (const [key, level] of development) {
+      if (level <= 0) continue;
+      const commaIdx = key.indexOf(',');
+      const gx = Number(key.slice(0, commaIdx));
+      const gy = Number(key.slice(commaIdx + 1));
+      const w = lonLatToWorld(gridToLon(gx), gridToLat(gy), view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      if (sx < -cellPx || sx > cw + cellPx || sy < -cellPx || sy > ch + cellPx) continue;
+
+      // Green (low density) ramping to warm amber (high density) -
+      // matches the mint/amber accents already used elsewhere in the HUD.
+      const t = level / 255;
+      const r = Math.round(94 + t * (255 - 94));
+      const g = Math.round(230 - t * (230 - 209));
+      const b = Math.round(168 - t * 168);
+      ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (t * 0.5).toFixed(2) + ')';
+      ctx.fillRect(sx - cellPx / 2, sy - cellPx / 2, cellPx + 1, cellPx + 1);
+    }
+    ctx.restore();
+  }
+
+  function drawRoads() {
+    if (roads.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+
+    ctx.save();
+    ctx.strokeStyle = '#a67c52'; // dirt-road brown, distinct from the dashed mint unit-path lines
+    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = 2.5;
+
+    for (const [id, r] of roads) {
+      if (!r.path || r.path.length < 2) continue;
+      ctx.beginPath();
+      for (let i = 0; i < r.path.length; i++) {
+        const w = lonLatToWorld(r.path[i].lon, r.path[i].lat, view.zoom);
+        const sx = cw / 2 + (w.x - centerWorld.x);
+        const sy = ch / 2 + (w.y - centerWorld.y);
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawCities() {
+    if (cities.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useLabels = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, c] of cities) {
+      if (c.lon === undefined || c.lat === undefined) continue;
+      const w = lonLatToWorld(c.lon, c.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue;
+
+      // Log-scaled radius so a 5000-pop metropolis doesn't dwarf the canvas
+      const radius = 6 + Math.min(14, Math.log2(1 + (c.population || 0)));
+
+      if (id === selectedCityId) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, radius + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+      ctx.fillStyle = colorForOwner(c.owner);
+      ctx.fill();
+      ctx.strokeStyle = '#0a0e0c';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      if (useLabels) {
+        ctx.fillStyle = '#c9d6cd';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(id + ' (' + (c.population || 0) + ')', sx, sy - radius - 6);
+      }
+    }
+  }
+
   function drawPaths() {
     if (!state.showPaths || unitPaths.size === 0) return;
 
@@ -755,8 +1007,11 @@
     }
 
     // Draw vector overlays directly on top of terrain
+    drawDevelopment();
     drawGrid();
     drawNodes();
+    drawRoads();
+    drawCities();
     drawPaths();
     drawUnits();
 
@@ -818,6 +1073,10 @@
   showGridCheckbox.addEventListener('change', () => {
     state.showGrid = showGridCheckbox.checked;
   });
+  const showDevelopmentCheckbox = document.getElementById('showDevelopment');
+  showDevelopmentCheckbox.addEventListener('change', () => {
+    state.showDevelopment = showDevelopmentCheckbox.checked;
+  });
 
   let dragging = false, lastX = 0, lastY = 0;
   let mouseDownX = 0, mouseDownY = 0, mouseMoved = false;
@@ -854,8 +1113,17 @@
 
   window.addEventListener('keydown', (e) => {
     if (document.activeElement === factionInput) return;
-    if (e.key === 'Escape') { setSelectedUnit(null); setSpawnArmed(false); }
+    if (e.key === 'Escape') {
+      setSelectedUnit(null);
+      setSpawnArmed(false);
+      setFoundCityArmed(false);
+      setRoadArmed(false);
+      selectedCityId = null;
+      hudSelectedCity.textContent = 'none';
+    }
     if (e.key === 's' || e.key === 'S') setSpawnArmed(!spawnArmed);
+    if (e.key === 'f' || e.key === 'F') setFoundCityArmed(!foundCityArmed);
+    if (e.key === 'r' || e.key === 'R') setRoadArmed(!roadArmed);
     if (e.key === 'Delete' || e.key === 'x' || e.key === 'X') despawnSelected();
     if (e.key === 'c' || e.key === 'C') collectFromNearestNode();
   });

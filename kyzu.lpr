@@ -6,7 +6,7 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
-  SysUtils, Classes, SyncObjs, Generics.Collections, fpjson, jsonparser,
+  SysUtils, Classes, Math, SyncObjs, Generics.Collections, fpjson, jsonparser,
   kyzu_bakeconfig, kyzu_pathfinding;
 
 const
@@ -19,6 +19,15 @@ const
   // tuning values, same spirit as BaseSpeed above.
   CollectRadiusCells = 1.5;
   CollectAmountPerAction = 10;
+  // City/development tuning - first-pass values, same spirit as BaseSpeed.
+  CityInitialPopulation = 10;
+  CityGrowthAmount = 1;         // population gained per growth step
+  CityGrowthTicks = 40;         // ticks between growth steps (~2s @ 20 ticks/sec)
+  CityMaxPopulation = 5000;
+  DevelopmentRadiusCells = 12;  // max distance a mature city's density reaches
+  DevelopmentUpdateTicks = 20;  // recompute/broadcast interval (~1s)
+  RoadDevelopmentRadiusCells = 2;
+  DevelopmentBroadcastThreshold = 2; // ignore sub-threshold quantized changes
 
 type
   TUnit = record
@@ -43,6 +52,36 @@ type
     Amount: Integer;
   end;
 
+  // Cities are stationary, cell-snapped population centers seeded either
+  // from cities.json at startup or founded live via game.cmd.found_city.
+  // Population is the sole driver of a city's development footprint -
+  // see RecomputeDevelopment.
+  TCity = record
+    ID: string;
+    Owner: string;
+    GX, GY: Integer;
+    Population: Integer;
+    LastGrowthTick: Int64;
+  end;
+
+  // A built connection between two cities - path is computed once via
+  // the same A* used for unit movement, then cached and reused as a
+  // linear development source. Roads never move and are never removed
+  // once built (no despawn/demolish command exists yet).
+  TRoad = record
+    ID: string;
+    FromCityID, ToCityID: string;
+    Owner: string;
+    Path: TGridPath;
+  end;
+
+  // Quantized development intensity for one cell, carrying its own GX/GY
+  // so callers never need to parse them back out of a "gx,gy" string key.
+  TDensityCell = record
+    GX, GY: Integer;
+    Level: Byte; // 0..255
+  end;
+
 // StdErr is buffered by default and only auto-flushes on a clean, natural
 // exit - a forceful kill (VDRX's normal way of stopping this process)
 // loses anything not explicitly flushed. Confirmed by direct test: an
@@ -60,13 +99,23 @@ var
   UnitsLock: TCriticalSection;
   NodesLock: TCriticalSection;
   LedgerLock: TCriticalSection;
+  CitiesLock: TCriticalSection;
+  RoadsLock: TCriticalSection;
+  DensityLock: TCriticalSection;
   EventLogLock: TCriticalSection;
   EventLogFile: TextFile;
   Units: specialize TDictionary<string, TUnit>;
   Nodes: specialize TDictionary<string, TResourceNode>;
   Ledger: specialize TDictionary<string, Integer>; // key: "<owner>|<resource_type>" -> total collected
+  Cities: specialize TDictionary<string, TCity>;
+  Roads: specialize TDictionary<string, TRoad>;
+  Density: specialize TDictionary<string, TDensityCell>; // key: "<gx>,<gy>" - sparse, untouched cells are simply absent
   Grid: TMovementGrid;
   Config: TBakeConfig;
+  // Moved up from the final var block (originally declared right before
+  // the main begin) - GrowCities/HandleFoundCity/RecomputeDevelopment all
+  // need to read it, and those are defined well before that point.
+  Tick: Int64;
 
 procedure SendLine(const ALine: string);
 begin
@@ -176,6 +225,79 @@ begin
       Nodes.AddOrSetValue(Node.ID, Node);
     end;
     LogDiag('Loaded ' + IntToStr(Nodes.Count) + ' resource nodes.');
+  finally
+    Data.Free;
+  end;
+end;
+
+function DensityKey(GX, GY: Integer): string;
+begin
+  Result := IntToStr(GX) + ',' + IntToStr(GY);
+end;
+
+// Loads seed cities from cities.json at startup - a flat array of
+// {id, owner, lon, lat, population}. Same non-fatal tolerance as
+// LoadResourceNodes: a missing or malformed file just means starting
+// with zero seed cities, not a startup failure. Cities founded live via
+// game.cmd.found_city afterward work the same either way, since both
+// paths write into the same Cities dictionary.
+procedure LoadCities(const AFilename: string);
+var
+  Data: TJSONData;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  C: TCity;
+  i: Integer;
+  F: TextFile;
+  Line, JSONText: string;
+begin
+  if not FileExists(AFilename) then
+  begin
+    LogDiag('No cities.json at ' + AFilename + ' - starting with zero seed cities.');
+    Exit;
+  end;
+
+  JSONText := '';
+  AssignFile(F, AFilename);
+  Reset(F);
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      JSONText := JSONText + Line;
+    end;
+  finally
+    CloseFile(F);
+  end;
+
+  try
+    Data := GetJSON(JSONText);
+  except
+    LogDiag('cities.json is not valid JSON - starting with zero seed cities.');
+    Exit;
+  end;
+
+  try
+    if Data.JSONType <> jtArray then Exit;
+    Arr := TJSONArray(Data);
+    for i := 0 to Arr.Count - 1 do
+    begin
+      Obj := TJSONObject(Arr.Items[i]);
+      C.ID := Obj.Get('id', '');
+      if C.ID = '' then Continue;
+      // A seed city that already exists (e.g. re-seeding onto a
+      // continued events.jsonl) is left alone - the replayed
+      // city_founded/city_grew history is the authority, not the seed
+      // file, so this only fills in cities that aren't there yet.
+      if Cities.ContainsKey(C.ID) then Continue;
+      C.Owner := Obj.Get('owner', '');
+      C.GX := LonToGridX(Obj.Get('lon', 0.0));
+      C.GY := LatToGridY(Obj.Get('lat', 0.0));
+      C.Population := Obj.Get('population', CityInitialPopulation);
+      C.LastGrowthTick := 0;
+      Cities.AddOrSetValue(C.ID, C);
+    end;
+    LogDiag('Loaded ' + IntToStr(Arr.Count) + ' seed cities from cities.json (' + IntToStr(Cities.Count) + ' total after replay).');
   finally
     Data.Free;
   end;
@@ -511,6 +633,391 @@ begin
     StringReplace(TotalsJSON, '"', '\"', [rfReplaceAll]) + '}"}');
 end;
 
+// Founds a new city - same shape as HandleSpawn (bounds + terrain
+// checks), but cities are cell-snapped and never move once placed.
+procedure HandleFoundCity(APayload: TJSONObject);
+var
+  CityID, Owner: string;
+  C: TCity;
+  Lon, Lat: Double;
+  GX, GY: Integer;
+begin
+  CityID := APayload.Get('city_id', '');
+  if CityID = '' then Exit;
+
+  Lon := APayload.Get('lon', 0.0);
+  Lat := APayload.Get('lat', 0.0);
+  GX := LonToGridX(Lon);
+  GY := LatToGridY(Lat);
+
+  if (GX < 0) or (GX >= Grid.Width) or (GY < 0) or (GY >= Grid.Height) then
+  begin
+    SendLine(Format('{"topic":"game.event.city_failed","payload":"{\"city_id\":\"%s\",\"reason\":\"out of bounds\"}"}', [CityID]));
+    Exit;
+  end;
+  if CellMoveCost(Grid, Config, GX, GY) <= 0 then
+  begin
+    SendLine(Format('{"topic":"game.event.city_failed","payload":"{\"city_id\":\"%s\",\"reason\":\"impassable terrain\"}"}', [CityID]));
+    Exit;
+  end;
+
+  Owner := APayload.Get('owner', '');
+  C.ID := CityID;
+  C.Owner := Owner;
+  C.GX := GX;
+  C.GY := GY;
+  C.Population := CityInitialPopulation;
+  C.LastGrowthTick := Tick;
+
+  CitiesLock.Enter;
+  try
+    Cities.AddOrSetValue(CityID, C);
+  finally
+    CitiesLock.Leave;
+  end;
+
+  LogEvent(Format('{"type":"city_founded","city_id":"%s","owner":"%s","lon":%.4f,"lat":%.4f,"population":%d}',
+    [CityID, Owner, GridToLon(GX + 0.5), GridToLat(GY + 0.5), C.Population]));
+  SendLine(Format('{"topic":"game.event.city_founded","payload":"{\"city_id\":\"%s\",\"owner\":\"%s\",\"lon\":%.4f,\"lat\":%.4f,\"population\":%d}"}',
+    [CityID, Owner, GridToLon(GX + 0.5), GridToLat(GY + 0.5), C.Population]));
+end;
+
+// Grows every city's population by a fixed step once every
+// CityGrowthTicks ticks - simple time-based growth for a first pass,
+// same tuning-constant spirit as BaseSpeed. A ledger-funded growth
+// boost (spending collected resources to accelerate this) is a natural
+// follow-up once this loop exists to hook into. Called once per tick
+// from the main loop; the per-city interval check keeps it a no-op for
+// idle cities rather than a busy poll.
+procedure GrowCities;
+var
+  Keys: array of string;
+  i: Integer;
+  C: TCity;
+  Pair: specialize TPair<string, TCity>;
+  KeyIdx: Integer;
+begin
+  CitiesLock.Enter;
+  try
+    SetLength(Keys, Cities.Count);
+    KeyIdx := 0;
+    for Pair in Cities do
+    begin
+      Keys[KeyIdx] := Pair.Key;
+      Inc(KeyIdx);
+    end;
+  finally
+    CitiesLock.Leave;
+  end;
+
+  for i := 0 to High(Keys) do
+  begin
+    CitiesLock.Enter;
+    try
+      if not Cities.TryGetValue(Keys[i], C) then Continue;
+    finally
+      CitiesLock.Leave;
+    end;
+
+    if (C.Population >= CityMaxPopulation) or (Tick - C.LastGrowthTick < CityGrowthTicks) then
+      Continue;
+
+    C.Population := C.Population + CityGrowthAmount;
+    if C.Population > CityMaxPopulation then C.Population := CityMaxPopulation;
+    C.LastGrowthTick := Tick;
+
+    CitiesLock.Enter;
+    try
+      Cities.AddOrSetValue(Keys[i], C);
+    finally
+      CitiesLock.Leave;
+    end;
+
+    LogEvent(Format('{"type":"city_grew","city_id":"%s","population":%d}', [Keys[i], C.Population]));
+    SendLine(Format('{"topic":"game.event.city_grew","payload":"{\"city_id\":\"%s\",\"population\":%d}"}', [Keys[i], C.Population]));
+  end;
+end;
+
+// Builds a road between two existing cities, reusing the same A*
+// pathfinding as HandleMove with the cities' cells as start/end. The
+// path is cached on the TRoad so RecomputeDevelopment doesn't need to
+// re-run pathfinding on every density update.
+procedure HandleBuildRoad(APayload: TJSONObject);
+var
+  RoadID, FromCityID, ToCityID, Actor: string;
+  FromCity, ToCity: TCity;
+  Found1, Found2: Boolean;
+  Path: TGridPath;
+  R: TRoad;
+begin
+  RoadID := APayload.Get('road_id', '');
+  FromCityID := APayload.Get('from_city_id', '');
+  ToCityID := APayload.Get('to_city_id', '');
+  Actor := APayload.Get('by', '');
+  if (RoadID = '') or (FromCityID = '') or (ToCityID = '') then Exit;
+
+  CitiesLock.Enter;
+  try
+    Found1 := Cities.TryGetValue(FromCityID, FromCity);
+    Found2 := Cities.TryGetValue(ToCityID, ToCity);
+  finally
+    CitiesLock.Leave;
+  end;
+
+  if (not Found1) or (not Found2) then
+  begin
+    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"unknown city\"}"}', [RoadID]));
+    Exit;
+  end;
+
+  // Same free-for-all spirit as HandleMove, tuned for a two-endpoint
+  // action: requiring ownership of BOTH cities would block the ordinary
+  // case of linking your own city to a neutral (unowned) one, so this
+  // only blocks connecting two cities that are EACH owned by someone
+  // else.
+  if ((FromCity.Owner <> '') and (FromCity.Owner <> Actor)) and
+     ((ToCity.Owner <> '') and (ToCity.Owner <> Actor)) then
+  begin
+    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"not your city\"}"}', [RoadID]));
+    Exit;
+  end;
+
+  Path := FindPath(Grid, Config, FromCity.GX, FromCity.GY, ToCity.GX, ToCity.GY);
+  if Length(Path) = 0 then
+  begin
+    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"no path\"}"}', [RoadID]));
+    Exit;
+  end;
+
+  R.ID := RoadID;
+  R.FromCityID := FromCityID;
+  R.ToCityID := ToCityID;
+  R.Owner := Actor;
+  R.Path := Path;
+
+  RoadsLock.Enter;
+  try
+    Roads.AddOrSetValue(RoadID, R);
+  finally
+    RoadsLock.Leave;
+  end;
+
+  LogEvent('{"type":"road_built","road_id":"' + RoadID + '","from_city_id":"' + FromCityID +
+    '","to_city_id":"' + ToCityID + '","owner":"' + Actor + '","path":' + BuildPathJSON(Path) + '}');
+  SendLine('{"topic":"game.event.road_built","payload":"{\"road_id\":\"' + RoadID +
+    '\",\"from_city_id\":\"' + FromCityID + '\",\"to_city_id\":\"' + ToCityID +
+    '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
+end;
+
+// Same "one message, full current state" pattern as HandleListNodes.
+procedure HandleListCities;
+var
+  C: TCity;
+  ListJSON: string;
+  First: Boolean;
+begin
+  ListJSON := '[';
+  First := True;
+  CitiesLock.Enter;
+  try
+    for C in Cities.Values do
+    begin
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + Format('{"id":"%s","owner":"%s","lon":%.4f,"lat":%.4f,"population":%d}',
+        [C.ID, C.Owner, GridToLon(C.GX + 0.5), GridToLat(C.GY + 0.5), C.Population]);
+    end;
+  finally
+    CitiesLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
+  SendLine('{"topic":"game.event.city_list","payload":"{\"cities\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+end;
+
+procedure HandleListRoads;
+var
+  R: TRoad;
+  ListJSON: string;
+  First: Boolean;
+begin
+  ListJSON := '[';
+  First := True;
+  RoadsLock.Enter;
+  try
+    for R in Roads.Values do
+    begin
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + Format('{"id":"%s","from_city_id":"%s","to_city_id":"%s","owner":"%s","path":%s}',
+        [R.ID, R.FromCityID, R.ToCityID, R.Owner, BuildPathJSON(R.Path)]);
+    end;
+  finally
+    RoadsLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
+  SendLine('{"topic":"game.event.road_list","payload":"{\"roads\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+end;
+
+// Recomputes the whole density field from Cities+Roads every
+// DevelopmentUpdateTicks ticks. A full recompute (not incremental
+// deltas) is cheap at this map's scale and can never drift from what
+// actually exists. Density itself is NEVER logged to events.jsonl -
+// it's a deterministic function of city population + road paths at any
+// given tick, so replay only needs city_founded/city_grew/road_built to
+// reconstruct it, same principle as the ledger being rebuildable from
+// collected events alone.
+procedure RecomputeDevelopment(ABroadcast: Boolean = True);
+var
+  Contrib: specialize TDictionary<string, TDensityCell>;
+  NewDensity: specialize TDictionary<string, TDensityCell>;
+  C: TCity;
+  R: TRoad;
+  Cell, OldCell: TDensityCell;
+  dx, dy, dist, falloff, val: Double;
+  gx, gy, radius, i: Integer;
+  key: string;
+  Pair: specialize TPair<string, TDensityCell>;
+  DeltaJSON: string;
+  First: Boolean;
+begin
+  Contrib := specialize TDictionary<string, TDensityCell>.Create;
+  try
+    CitiesLock.Enter;
+    try
+      for C in Cities.Values do
+      begin
+        radius := Min(DevelopmentRadiusCells, Round(3 + DevelopmentRadiusCells * (C.Population / CityMaxPopulation)));
+        for gy := C.GY - radius to C.GY + radius do
+          for gx := C.GX - radius to C.GX + radius do
+          begin
+            if (gx < 0) or (gx >= Grid.Width) or (gy < 0) or (gy >= Grid.Height) then Continue;
+            dx := gx - C.GX; dy := gy - C.GY;
+            dist := Sqrt(dx * dx + dy * dy);
+            if dist > radius then Continue;
+            falloff := 1.0 - (dist / radius);
+            // Squared falloff gives a denser core with a softer edge,
+            // rather than a linear cone - reads more like an actual
+            // urban footprint on the map.
+            val := falloff * falloff * (C.Population / CityMaxPopulation) * 255.0;
+            key := DensityKey(gx, gy);
+            if Contrib.TryGetValue(key, Cell) then
+            begin
+              // Overlapping cities don't stack additively - the denser
+              // of the two influences wins, so two adjacent cities
+              // don't saturate the cell between them past what either
+              // alone would produce.
+              if val > Cell.Level then
+              begin
+                Cell.Level := Min(255, Round(val));
+                Contrib.AddOrSetValue(key, Cell);
+              end;
+            end
+            else
+            begin
+              Cell.GX := gx; Cell.GY := gy; Cell.Level := Min(255, Round(val));
+              Contrib.Add(key, Cell);
+            end;
+          end;
+      end;
+    finally
+      CitiesLock.Leave;
+    end;
+
+    RoadsLock.Enter;
+    try
+      for R in Roads.Values do
+        for i := 0 to High(R.Path) do
+          for gy := R.Path[i].Y - RoadDevelopmentRadiusCells to R.Path[i].Y + RoadDevelopmentRadiusCells do
+            for gx := R.Path[i].X - RoadDevelopmentRadiusCells to R.Path[i].X + RoadDevelopmentRadiusCells do
+            begin
+              if (gx < 0) or (gx >= Grid.Width) or (gy < 0) or (gy >= Grid.Height) then Continue;
+              dx := gx - R.Path[i].X; dy := gy - R.Path[i].Y;
+              dist := Sqrt(dx * dx + dy * dy);
+              if dist > RoadDevelopmentRadiusCells then Continue;
+              falloff := 1.0 - (dist / RoadDevelopmentRadiusCells);
+              val := falloff * 60.0; // a modest fixed contribution, well below a mature city's peak
+              key := DensityKey(gx, gy);
+              if Contrib.TryGetValue(key, Cell) then
+              begin
+                if val > Cell.Level then
+                begin
+                  Cell.Level := Min(255, Round(val));
+                  Contrib.AddOrSetValue(key, Cell);
+                end;
+              end
+              else
+              begin
+                Cell.GX := gx; Cell.GY := gy; Cell.Level := Min(255, Round(val));
+                Contrib.Add(key, Cell);
+              end;
+            end;
+    finally
+      RoadsLock.Leave;
+    end;
+
+    DeltaJSON := '[';
+    First := True;
+    DensityLock.Enter;
+    try
+      NewDensity := specialize TDictionary<string, TDensityCell>.Create;
+      for Pair in Contrib do
+      begin
+        Cell := Pair.Value;
+        NewDensity.Add(Pair.Key, Cell);
+        OldCell.Level := 0;
+        Density.TryGetValue(Pair.Key, OldCell);
+        if Abs(Integer(Cell.Level) - Integer(OldCell.Level)) >= DevelopmentBroadcastThreshold then
+        begin
+          if not First then DeltaJSON := DeltaJSON + ',';
+          First := False;
+          DeltaJSON := DeltaJSON + Format('{"gx":%d,"gy":%d,"d":%d}', [Cell.GX, Cell.GY, Cell.Level]);
+        end;
+      end;
+      Density.Free;
+      Density := NewDensity;
+    finally
+      DensityLock.Leave;
+    end;
+
+    if ABroadcast and (DeltaJSON <> '[') then
+    begin
+      DeltaJSON := DeltaJSON + ']';
+      SendLine('{"topic":"game.event.development_delta","payload":"{\"cells\":' +
+        StringReplace(DeltaJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+    end;
+  finally
+    Contrib.Free;
+  end;
+end;
+
+// Full snapshot for a freshly-connected viewer - same role as
+// HandleListNodes relative to the per-collection events.
+procedure HandleGetDevelopment;
+var
+  Pair: specialize TPair<string, TDensityCell>;
+  ListJSON: string;
+  First: Boolean;
+begin
+  ListJSON := '[';
+  First := True;
+  DensityLock.Enter;
+  try
+    for Pair in Density do
+    begin
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + Format('{"gx":%d,"gy":%d,"d":%d}', [Pair.Value.GX, Pair.Value.GY, Pair.Value.Level]);
+    end;
+  finally
+    DensityLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
+  SendLine('{"topic":"game.event.development_snapshot","payload":"{\"cells\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+end;
+
 procedure DispatchIncoming(const ALine: string);
 var
   Data: TJSONData;
@@ -558,7 +1065,23 @@ begin
     begin
       if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
         HandleGetLedger(TJSONObject(PayloadData));
-    end;
+    end
+    else if Topic = 'game.cmd.found_city' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleFoundCity(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.build_road' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleBuildRoad(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.list_cities' then
+      HandleListCities
+    else if Topic = 'game.cmd.list_roads' then
+      HandleListRoads
+    else if Topic = 'game.cmd.get_development' then
+      HandleGetDevelopment;
     // add more topic handlers here as the command set grows
   finally
     Data.Free;
@@ -658,11 +1181,13 @@ end;
 procedure ReplayEventLog(const AFilename: string);
 var
   F: TextFile;
-  Line, EventType, UnitID, NodeID, ByActor, LedgerKey: string;
+  Line, EventType, UnitID, NodeID, ByActor, LedgerKey, CityID, RoadID: string;
   Data: TJSONData;
   Obj: TJSONObject;
   U: TUnit;
   Node: TResourceNode;
+  C: TCity;
+  R: TRoad;
   Lon, Lat: Double;
   PathArr, PointArr: TJSONArray;
   GridPath: TGridPath;
@@ -694,11 +1219,17 @@ begin
         if Data.JSONType <> jtObject then Continue;
         Obj := TJSONObject(Data);
         EventType := Obj.Get('type', '');
+        // NOTE: unit_id is only present on unit-related event types.
+        // City/road events carry city_id/road_id instead, so the
+        // "no unit_id -> skip" guard that used to sit here up front has
+        // been pushed down into each unit-specific branch below -
+        // otherwise every city_founded/city_grew/road_built line would
+        // get silently skipped.
         UnitID := Obj.Get('unit_id', '');
-        if UnitID = '' then Continue;
 
         if EventType = 'spawned' then
         begin
+          if UnitID = '' then Continue;
           Lon := Obj.Get('lon', 0.0);
           Lat := Obj.Get('lat', 0.0);
           U.ID := UnitID;
@@ -712,6 +1243,7 @@ begin
         end
         else if EventType = 'path_found' then
         begin
+          if UnitID = '' then Continue;
           if Units.TryGetValue(UnitID, U) then
           begin
             PathArr := TJSONArray(Obj.Find('path'));
@@ -732,6 +1264,7 @@ begin
         end
         else if EventType = 'waypoint' then
         begin
+          if UnitID = '' then Continue;
           if Units.TryGetValue(UnitID, U) then
           begin
             PathIdx := Obj.Get('path_index', 0);
@@ -746,6 +1279,7 @@ begin
         end
         else if EventType = 'arrived' then
         begin
+          if UnitID = '' then Continue;
           if Units.TryGetValue(UnitID, U) then
           begin
             SetLength(U.Path, 0);
@@ -754,10 +1288,12 @@ begin
         end
         else if EventType = 'despawned' then
         begin
+          if UnitID = '' then Continue;
           Units.Remove(UnitID);
         end
         else if EventType = 'collected' then
         begin
+          if UnitID = '' then Continue;
           NodeID := Obj.Get('node_id', '');
           CollectedAmount := Obj.Get('amount', 0);
           ByActor := Obj.Get('by', '');
@@ -788,6 +1324,54 @@ begin
               NodesLock.Leave;
             end;
           end;
+        end
+        else if EventType = 'city_founded' then
+        begin
+          CityID := Obj.Get('city_id', '');
+          if CityID = '' then Continue;
+          C.ID := CityID;
+          C.Owner := Obj.Get('owner', '');
+          C.GX := LonToGridX(Obj.Get('lon', 0.0));
+          C.GY := LatToGridY(Obj.Get('lat', 0.0));
+          C.Population := Obj.Get('population', CityInitialPopulation);
+          // Tick itself resets to 0 on every restart already (see the
+          // main block), so a city's growth clock resets alongside it -
+          // same precedent as everything else tick-based here, rather
+          // than trying to preserve an absolute tick that the rest of
+          // the server doesn't preserve either.
+          C.LastGrowthTick := 0;
+          Cities.AddOrSetValue(CityID, C);
+        end
+        else if EventType = 'city_grew' then
+        begin
+          CityID := Obj.Get('city_id', '');
+          if (CityID <> '') and Cities.TryGetValue(CityID, C) then
+          begin
+            C.Population := Obj.Get('population', C.Population);
+            Cities.AddOrSetValue(CityID, C);
+          end;
+        end
+        else if EventType = 'road_built' then
+        begin
+          RoadID := Obj.Get('road_id', '');
+          if RoadID = '' then Continue;
+          R.ID := RoadID;
+          R.FromCityID := Obj.Get('from_city_id', '');
+          R.ToCityID := Obj.Get('to_city_id', '');
+          R.Owner := Obj.Get('owner', '');
+          PathArr := TJSONArray(Obj.Find('path'));
+          if Assigned(PathArr) then
+          begin
+            SetLength(GridPath, PathArr.Count);
+            for i := 0 to PathArr.Count - 1 do
+            begin
+              PointArr := TJSONArray(PathArr.Items[i]);
+              GridPath[i].X := LonToGridX(PointArr.Floats[0]);
+              GridPath[i].Y := LatToGridY(PointArr.Floats[1]);
+            end;
+            R.Path := GridPath;
+            Roads.AddOrSetValue(RoadID, R);
+          end;
         end;
 
         Inc(EventCount);
@@ -799,7 +1383,8 @@ begin
     CloseFile(F);
   end;
 
-  LogDiag('Replayed ' + IntToStr(EventCount) + ' events - ' + IntToStr(Units.Count) + ' units restored.');
+  LogDiag('Replayed ' + IntToStr(EventCount) + ' events - ' + IntToStr(Units.Count) + ' units, ' +
+    IntToStr(Cities.Count) + ' cities, ' + IntToStr(Roads.Count) + ' roads restored.');
 end;
 
 type
@@ -829,7 +1414,6 @@ end;
 
 var
   ReaderThread: TStdinReaderThread;
-  Tick: Int64;
   EventLogPath: string;
   EventLogExisted: Boolean;
 
@@ -839,10 +1423,16 @@ begin
   UnitsLock := TCriticalSection.Create;
   NodesLock := TCriticalSection.Create;
   LedgerLock := TCriticalSection.Create;
+  CitiesLock := TCriticalSection.Create;
+  RoadsLock := TCriticalSection.Create;
+  DensityLock := TCriticalSection.Create;
   EventLogLock := TCriticalSection.Create;
   Units := specialize TDictionary<string, TUnit>.Create;
   Nodes := specialize TDictionary<string, TResourceNode>.Create;
   Ledger := specialize TDictionary<string, Integer>.Create;
+  Cities := specialize TDictionary<string, TCity>.Create;
+  Roads := specialize TDictionary<string, TRoad>.Create;
+  Density := specialize TDictionary<string, TDensityCell>.Create;
 
   LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
@@ -858,6 +1448,19 @@ begin
   LogDiag('Event log: ' + EventLogPath);
   EventLogExisted := FileExists(EventLogPath);
   ReplayEventLog(EventLogPath);
+
+  // cities.json is loaded AFTER replay, not before - LoadCities skips
+  // any city ID already present, so a continued events.jsonl's replayed
+  // history always wins over the seed file, and the seed file only ever
+  // fills in cities that don't exist yet (e.g. the very first run).
+  LogDiag('Loading cities.json ...');
+  LoadCities(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'cities.json');
+
+  // Build the initial density field now, before anyone can connect, so
+  // the first viewer's game.cmd.get_development gets real data instead
+  // of an empty snapshot while waiting for the first tick-loop
+  // recompute. Not broadcast - nothing is subscribed yet.
+  RecomputeDevelopment(False);
 
   // Open for appending only after the full replay read pass above - if
   // this were opened first and appended to while also being read, we'd
@@ -878,6 +1481,9 @@ begin
     Inc(Tick);
     SendLine(Format('{"topic":"game.tick","payload":"{\"tick\":%d}"}', [Tick]));
     AdvanceUnits;
+    GrowCities;
+    if Tick mod DevelopmentUpdateTicks = 0 then
+      RecomputeDevelopment;
     Sleep(50); // ~20 ticks/sec target loop pacing
   end;
 end.
