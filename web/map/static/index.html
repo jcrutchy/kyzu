@@ -121,6 +121,10 @@
     <button id="btnSpawn" style="width:100%;margin:0;">Spawn (S)</button>
     <div class="label" style="margin-top:4px;">select unit, X to despawn, C to collect</div>
   </div>
+  <div class="section">
+    <div class="label">stash</div>
+    <div id="stashDisplay" class="dim">-</div>
+  </div>
 </div>
 
 <script>
@@ -171,6 +175,20 @@
   const nodes = new Map(); // node_id -> {resourceType, lon, lat, amount}
   let selectedUnitId = null;
   const hudSelected = document.getElementById('hudSelected');
+
+  // This client's own faction's running totals - seeded from an explicit
+  // game.cmd.get_ledger request, then kept live by incrementing locally
+  // whenever a game.event.collected comes in crediting the CURRENT
+  // faction (every client sees every collect over game.>, so the "by"
+  // field is what tells us whether it was ours).
+  const myLedger = {};
+  const stashDisplay = document.getElementById('stashDisplay');
+  function renderStash() {
+    const entries = Object.entries(myLedger).filter(([, v]) => v > 0);
+    stashDisplay.textContent = entries.length
+      ? entries.map(([k, v]) => k + ': ' + v).join(', ')
+      : '-';
+  }
 
   function setSelectedUnit(id) {
     selectedUnitId = id;
@@ -263,6 +281,15 @@
     canvas.classList.toggle('spawn-armed', armed);
   }
   btnSpawn.addEventListener('click', () => setSpawnArmed(!spawnArmed));
+
+  // Switching factions means the stash shown so far belonged to the old
+  // one - clear it immediately rather than let it linger while the
+  // fresh ledger reply is in flight.
+  factionInput.addEventListener('change', () => {
+    Object.keys(myLedger).forEach(k => delete myLedger[k]);
+    renderStash();
+    publish('game.cmd.get_ledger', { by: factionInput.value || '' });
+  });
 
   function spawnUnitAt(lon, lat) {
     const unitId = 'u_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -383,6 +410,7 @@
         setWsStatus('up');
         ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
         publish('game.cmd.list_nodes', {});
+        publish('game.cmd.get_ledger', { by: factionInput.value || '' });
         return;
       }
 
@@ -442,7 +470,20 @@
         if (payload && payload.node_id !== undefined) {
           const n = nodes.get(payload.node_id);
           if (n) n.amount = payload.remaining;
+          if (payload.by === factionInput.value) {
+            myLedger[payload.resource_type] = (myLedger[payload.resource_type] || 0) + payload.amount;
+            renderStash();
+          }
           showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
+        }
+      } else if (msg.topic === 'game.event.ledger') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.owner === factionInput.value && payload.totals) {
+          Object.keys(myLedger).forEach(k => delete myLedger[k]);
+          Object.assign(myLedger, payload.totals);
+          renderStash();
         }
       } else if (msg.topic === 'game.event.collect_failed') {
         let payload;

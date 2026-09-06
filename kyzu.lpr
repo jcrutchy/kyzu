@@ -59,10 +59,12 @@ var
   OutputLock: TCriticalSection;
   UnitsLock: TCriticalSection;
   NodesLock: TCriticalSection;
+  LedgerLock: TCriticalSection;
   EventLogLock: TCriticalSection;
   EventLogFile: TextFile;
   Units: specialize TDictionary<string, TUnit>;
   Nodes: specialize TDictionary<string, TResourceNode>;
+  Ledger: specialize TDictionary<string, Integer>; // key: "<owner>|<resource_type>" -> total collected
   Grid: TMovementGrid;
   Config: TBakeConfig;
 
@@ -390,12 +392,12 @@ end;
 // owner of their own yet, they're a shared, contestable resource.
 procedure HandleCollect(APayload: TJSONObject);
 var
-  UnitID, NodeID, Actor, Reason: string;
+  UnitID, NodeID, Actor, Reason, LedgerKey: string;
   U: TUnit;
   Node: TResourceNode;
   UnitFound, NodeFound: Boolean;
   Dist: Double;
-  Taken: Integer;
+  Taken, CurrentTotal: Integer;
 begin
   UnitID := APayload.Get('unit_id', '');
   NodeID := APayload.Get('node_id', '');
@@ -449,9 +451,64 @@ begin
     Exit;
   end;
 
-  LogEvent(Format('{"type":"collected","unit_id":"%s","node_id":"%s","amount":%d}', [UnitID, NodeID, Taken]));
-  SendLine(Format('{"topic":"game.event.collected","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"resource_type\":\"%s\",\"amount\":%d,\"remaining\":%d}"}',
-    [UnitID, NodeID, Node.ResourceType, Taken, Node.Amount]));
+  // Credited to the ACTOR who issued the command, not the collecting
+  // unit's Owner - lets a shared/unowned unit's harvest still land in a
+  // real faction's stash. An empty Actor (raw terminal testing, no
+  // faction identity) still depletes the node normally but credits no
+  // one - there's nobody to attribute it to.
+  if Actor <> '' then
+  begin
+    LedgerLock.Enter;
+    try
+      LedgerKey := Actor + '|' + Node.ResourceType;
+      CurrentTotal := 0;
+      Ledger.TryGetValue(LedgerKey, CurrentTotal);
+      Ledger.AddOrSetValue(LedgerKey, CurrentTotal + Taken);
+    finally
+      LedgerLock.Leave;
+    end;
+  end;
+
+  LogEvent(Format('{"type":"collected","unit_id":"%s","node_id":"%s","by":"%s","amount":%d}', [UnitID, NodeID, Actor, Taken]));
+  SendLine(Format('{"topic":"game.event.collected","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"resource_type\":\"%s\",\"by\":\"%s\",\"amount\":%d,\"remaining\":%d}"}',
+    [UnitID, NodeID, Node.ResourceType, Actor, Taken, Node.Amount]));
+end;
+
+// Reports one faction's accumulated totals - deliberately scoped to the
+// requester's own "by", not a scoreboard of everyone's stash. A shared
+// leaderboard view is a reasonable future addition but a different
+// trust question (broadcasting a query would need to enumerate every
+// owner Ledger has ever seen) - not needed for a first pass.
+procedure HandleGetLedger(APayload: TJSONObject);
+var
+  Actor, Prefix, KeyResource, TotalsJSON: string;
+  First: Boolean;
+  Pair: specialize TPair<string, Integer>;
+begin
+  Actor := APayload.Get('by', '');
+  Prefix := Actor + '|';
+  TotalsJSON := '{';
+  First := True;
+
+  LedgerLock.Enter;
+  try
+    for Pair in Ledger do
+    begin
+      if Copy(Pair.Key, 1, Length(Prefix)) = Prefix then
+      begin
+        KeyResource := Copy(Pair.Key, Length(Prefix) + 1, MaxInt);
+        if not First then TotalsJSON := TotalsJSON + ',';
+        First := False;
+        TotalsJSON := TotalsJSON + Format('"%s":%d', [KeyResource, Pair.Value]);
+      end;
+    end;
+  finally
+    LedgerLock.Leave;
+  end;
+  TotalsJSON := TotalsJSON + '}';
+
+  SendLine('{"topic":"game.event.ledger","payload":"{\"owner\":\"' + Actor + '\",\"totals\":' +
+    StringReplace(TotalsJSON, '"', '\"', [rfReplaceAll]) + '}"}');
 end;
 
 procedure DispatchIncoming(const ALine: string);
@@ -496,7 +553,12 @@ begin
         HandleCollect(TJSONObject(PayloadData));
     end
     else if Topic = 'game.cmd.list_nodes' then
-      HandleListNodes;
+      HandleListNodes
+    else if Topic = 'game.cmd.get_ledger' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleGetLedger(TJSONObject(PayloadData));
+    end;
     // add more topic handlers here as the command set grows
   finally
     Data.Free;
@@ -596,7 +658,7 @@ end;
 procedure ReplayEventLog(const AFilename: string);
 var
   F: TextFile;
-  Line, EventType, UnitID, NodeID: string;
+  Line, EventType, UnitID, NodeID, ByActor, LedgerKey: string;
   Data: TJSONData;
   Obj: TJSONObject;
   U: TUnit;
@@ -604,7 +666,7 @@ var
   Lon, Lat: Double;
   PathArr, PointArr: TJSONArray;
   GridPath: TGridPath;
-  i, PathIdx, EventCount, CollectedAmount: Integer;
+  i, PathIdx, EventCount, CollectedAmount, CurrentTotal: Integer;
 begin
   EventCount := 0;
 
@@ -698,6 +760,7 @@ begin
         begin
           NodeID := Obj.Get('node_id', '');
           CollectedAmount := Obj.Get('amount', 0);
+          ByActor := Obj.Get('by', '');
           if NodeID <> '' then
           begin
             NodesLock.Enter;
@@ -707,6 +770,19 @@ begin
                 Node.Amount := Node.Amount - CollectedAmount;
                 if Node.Amount < 0 then Node.Amount := 0;
                 Nodes.AddOrSetValue(NodeID, Node);
+
+                if ByActor <> '' then
+                begin
+                  LedgerLock.Enter;
+                  try
+                    LedgerKey := ByActor + '|' + Node.ResourceType;
+                    CurrentTotal := 0;
+                    Ledger.TryGetValue(LedgerKey, CurrentTotal);
+                    Ledger.AddOrSetValue(LedgerKey, CurrentTotal + CollectedAmount);
+                  finally
+                    LedgerLock.Leave;
+                  end;
+                end;
               end;
             finally
               NodesLock.Leave;
@@ -762,9 +838,11 @@ begin
   OutputLock := TCriticalSection.Create;
   UnitsLock := TCriticalSection.Create;
   NodesLock := TCriticalSection.Create;
+  LedgerLock := TCriticalSection.Create;
   EventLogLock := TCriticalSection.Create;
   Units := specialize TDictionary<string, TUnit>.Create;
   Nodes := specialize TDictionary<string, TResourceNode>.Create;
+  Ledger := specialize TDictionary<string, Integer>.Create;
 
   LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
