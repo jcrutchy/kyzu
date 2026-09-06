@@ -119,7 +119,7 @@
     <div class="label">faction</div>
     <input type="text" id="factionInput" value="me" maxlength="24">
     <button id="btnSpawn" style="width:100%;margin:0;">Spawn (S)</button>
-    <div class="label" style="margin-top:4px;">select unit, X to despawn</div>
+    <div class="label" style="margin-top:4px;">select unit, X to despawn, C to collect</div>
   </div>
 </div>
 
@@ -168,6 +168,7 @@
   const units = new Map(); // unit_id -> {lon, lat, prevLon, prevLat, updateTime, prevUpdateTime}
   const unitMeta = new Map(); // unit_id -> {owner, unitType} - populated from the one-time spawned event
   const unitPaths = new Map(); // unit_id -> [{lon, lat}, ...] - cleared on arrival
+  const nodes = new Map(); // node_id -> {resourceType, lon, lat, amount}
   let selectedUnitId = null;
   const hudSelected = document.getElementById('hudSelected');
 
@@ -196,19 +197,22 @@
     wsStatus.textContent = state;
   }
 
-  // Deterministic string -> color, so the same faction id always renders
-  // the same hue across units, page reloads, and separate clients - no
-  // shared palette-assignment state needed anywhere. '' (unowned) keeps
-  // the original green rather than hashing to an arbitrary hue, so
-  // existing spawns from before ownership existed still look normal.
-  function colorForOwner(owner) {
-    if (!owner) return '#5ee6a8';
+  // Deterministic string -> color, so the same string (a faction id or a
+  // resource type) always renders the same hue across units, page
+  // reloads, and separate clients - no shared palette-assignment state
+  // needed anywhere.
+  function hashColor(str, fallback) {
+    if (!str) return fallback;
     let hash = 0;
-    for (let i = 0; i < owner.length; i++) {
-      hash = (hash * 31 + owner.charCodeAt(i)) >>> 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
     }
     return 'hsl(' + (hash % 360) + ', 70%, 60%)';
   }
+  // '' (unowned) keeps the original green rather than hashing to an
+  // arbitrary hue, so existing spawns from before ownership existed
+  // still look normal.
+  function colorForOwner(owner) { return hashColor(owner, '#5ee6a8'); }
 
   function onUnitPosition(unitId, lon, lat) {
     const now = performance.now();
@@ -338,6 +342,26 @@
     publish('game.cmd.despawn', { unit_id: selectedUnitId, by: factionInput.value || '' });
   }
 
+  // Collects from whichever known node is nearest the selected unit's
+  // CURRENT position - no node-targeting UI yet (no separate click mode,
+  // no visible range indicator), so this is deliberately the simplest
+  // possible interaction: one keypress, server figures out range/
+  // validity and replies with collected or collect_failed either way.
+  function collectFromNearestNode() {
+    if (!selectedUnitId) return;
+    const u = units.get(selectedUnitId);
+    if (!u || nodes.size === 0) return;
+    const pos = getUnitDisplayPosition(u);
+    let closestId = null, closestDist = Infinity;
+    for (const [id, n] of nodes) {
+      const d = Math.hypot(n.lon - pos.lon, n.lat - pos.lat);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    if (closestId) {
+      publish('game.cmd.collect', { unit_id: selectedUnitId, node_id: closestId, by: factionInput.value || '' });
+    }
+  }
+
   function connectWS() {
     setWsStatus('connecting');
     ws = new WebSocket(WS_URL);
@@ -358,6 +382,7 @@
         wsAuthed = true;
         setWsStatus('up');
         ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
+        publish('game.cmd.list_nodes', {});
         return;
       }
 
@@ -400,6 +425,30 @@
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
         showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.node_list') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && Array.isArray(payload.nodes)) {
+          nodes.clear();
+          for (const n of payload.nodes) {
+            nodes.set(n.id, { resourceType: n.resource_type, lon: n.lon, lat: n.lat, amount: n.amount });
+          }
+        }
+      } else if (msg.topic === 'game.event.collected') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.node_id !== undefined) {
+          const n = nodes.get(payload.node_id);
+          if (n) n.amount = payload.remaining;
+          showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
+        }
+      } else if (msg.topic === 'game.event.collect_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('collect failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
       } else if (msg.topic === 'game.event.path_found') {
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
@@ -552,6 +601,47 @@
     ctx.restore();
   }
 
+  // Static resource markers - a small diamond, distinct from the unit
+  // icon shape (which uses the same diamond outline at icon zoom, so
+  // color and a fixed small size are what differentiate them at a
+  // glance rather than shape alone). Amount is shown as a label only at
+  // icon zoom, same LOD threshold as unit id labels, for the same
+  // "don't clutter distant/zoomed-out views" reason.
+  function drawNodes() {
+    if (nodes.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useLabels = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, n] of nodes) {
+      const w = lonLatToWorld(n.lon, n.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue;
+
+      const depleted = n.amount <= 0;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.globalAlpha = depleted ? 0.35 : 1.0;
+      ctx.beginPath();
+      ctx.moveTo(0, -7); ctx.lineTo(7, 0); ctx.lineTo(0, 7); ctx.lineTo(-7, 0);
+      ctx.closePath();
+      ctx.fillStyle = hashColor(n.resourceType, '#c9d6cd');
+      ctx.fill();
+      ctx.strokeStyle = '#0a0e0c';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+
+      if (useLabels) {
+        ctx.fillStyle = '#5c6b62';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(n.resourceType + ' ' + n.amount, sx, sy - 12);
+      }
+    }
+  }
+
   function drawUnits() {
     const cw = canvas.width, ch = canvas.height;
     const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
@@ -614,6 +704,7 @@
     if (state.overlayLayer !== 'none') {
       drawLayer(state.overlayLayer, state.overlayOpacity);
     }
+    drawNodes();
     drawPaths();
     drawUnits();
 
@@ -695,6 +786,7 @@
     if (e.key === 'Escape') { setSelectedUnit(null); setSpawnArmed(false); }
     if (e.key === 's' || e.key === 'S') setSpawnArmed(!spawnArmed);
     if (e.key === 'Delete' || e.key === 'x' || e.key === 'X') despawnSelected();
+    if (e.key === 'c' || e.key === 'C') collectFromNearestNode();
   });
 
   function zoomToward(mx, my, deltaZoom) {

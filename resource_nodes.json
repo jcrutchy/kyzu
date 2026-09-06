@@ -1,0 +1,4 @@
+[
+  {"id": "wood_1", "resource_type": "wood", "lon": 22.0, "lat": 13.0, "amount": 100},
+  {"id": "stone_1", "resource_type": "stone", "lon": 26.0, "lat": 12.0, "amount": 60}
+]

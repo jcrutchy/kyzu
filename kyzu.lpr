@@ -14,6 +14,11 @@ const
   // spirit as the move_cost numbers themselves: adjust once actual
   // gameplay pacing is something to judge against, not before.
   BaseSpeed = 0.15;
+  // How close (in grid cells) a unit must be to a node to collect from
+  // it, and how much a single collect command takes - both first-pass
+  // tuning values, same spirit as BaseSpeed above.
+  CollectRadiusCells = 1.5;
+  CollectAmountPerAction = 10;
 
 type
   TUnit = record
@@ -23,6 +28,19 @@ type
     GX, GY: Double; // fractional grid position, for smooth interpolated reporting
     Path: TGridPath;
     PathIndex: Integer; // index of the path node the unit is currently departing from
+  end;
+
+  // Static resource nodes - placed once from resource_nodes.json at
+  // startup, never moved, only depleted. GX/GY are cached grid
+  // coordinates computed once at load, so HandleCollect's distance
+  // check against a moving unit doesn't repeat the lon/lat conversion
+  // on every call.
+  TResourceNode = record
+    ID: string;
+    ResourceType: string;
+    Lon, Lat: Double;
+    GX, GY: Double;
+    Amount: Integer;
   end;
 
 // StdErr is buffered by default and only auto-flushes on a clean, natural
@@ -40,9 +58,11 @@ end;
 var
   OutputLock: TCriticalSection;
   UnitsLock: TCriticalSection;
+  NodesLock: TCriticalSection;
   EventLogLock: TCriticalSection;
   EventLogFile: TextFile;
   Units: specialize TDictionary<string, TUnit>;
+  Nodes: specialize TDictionary<string, TResourceNode>;
   Grid: TMovementGrid;
   Config: TBakeConfig;
 
@@ -94,6 +114,103 @@ end;
 function LatToGridY(Lat: Double): Integer;
 begin
   Result := Trunc((90.0 - Lat) / 180.0 * Grid.Height);
+end;
+
+// Loads static resource nodes from resource_nodes.json - a flat array of
+// {id, resource_type, lon, lat, amount}. Missing or malformed file is a
+// non-fatal, zero-nodes startup (same tolerance as ReplayEventLog's
+// missing events.jsonl) - resource nodes are optional gameplay content,
+// not core simulation state the server can't run without.
+procedure LoadResourceNodes(const AFilename: string);
+var
+  Data: TJSONData;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  Node: TResourceNode;
+  i: Integer;
+  F: TextFile;
+  Line, JSONText: string;
+begin
+  if not FileExists(AFilename) then
+  begin
+    LogDiag('No resource_nodes.json at ' + AFilename + ' - starting with zero nodes.');
+    Exit;
+  end;
+
+  JSONText := '';
+  AssignFile(F, AFilename);
+  Reset(F);
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      JSONText := JSONText + Line;
+    end;
+  finally
+    CloseFile(F);
+  end;
+
+  try
+    Data := GetJSON(JSONText);
+  except
+    LogDiag('resource_nodes.json is not valid JSON - starting with zero nodes.');
+    Exit;
+  end;
+
+  try
+    if Data.JSONType <> jtArray then Exit;
+    Arr := TJSONArray(Data);
+    for i := 0 to Arr.Count - 1 do
+    begin
+      Obj := TJSONObject(Arr.Items[i]);
+      Node.ID := Obj.Get('id', '');
+      if Node.ID = '' then Continue;
+      Node.ResourceType := Obj.Get('resource_type', 'unknown');
+      Node.Lon := Obj.Get('lon', 0.0);
+      Node.Lat := Obj.Get('lat', 0.0);
+      Node.GX := LonToGridX(Node.Lon) + 0.5;
+      Node.GY := LatToGridY(Node.Lat) + 0.5;
+      Node.Amount := Obj.Get('amount', 0);
+      Nodes.AddOrSetValue(Node.ID, Node);
+    end;
+    LogDiag('Loaded ' + IntToStr(Nodes.Count) + ' resource nodes.');
+  finally
+    Data.Free;
+  end;
+end;
+
+// Emits the full current node state in one message rather than one
+// event per node - a freshly-connected viewer needs this exactly once
+// on load, and a single message is simpler for it to handle than
+// reassembling a burst. Live depletion after this point comes through
+// the per-collection game.event.collected messages instead.
+procedure HandleListNodes;
+var
+  Node: TResourceNode;
+  ListJSON: string;
+  First: Boolean;
+begin
+  ListJSON := '[';
+  First := True;
+  NodesLock.Enter;
+  try
+    for Node in Nodes.Values do
+    begin
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + Format('{"id":"%s","resource_type":"%s","lon":%.4f,"lat":%.4f,"amount":%d}',
+        [Node.ID, Node.ResourceType, Node.Lon, Node.Lat, Node.Amount]);
+    end;
+  finally
+    NodesLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
+
+  // ListJSON has its own internal quotes (ids, resource_type strings) -
+  // unlike BuildPathJSON's plain numeric arrays, this needs actual
+  // escaping before it can be embedded in the outer payload string.
+  SendLine('{"topic":"game.event.node_list","payload":"{\"nodes\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
 end;
 
 // Raw JSON array text, e.g. [[20.08,15.09],[20.15,15.02],...] - no quotes
@@ -266,6 +383,77 @@ begin
     '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
 end;
 
+// A flat, instant harvest - no travel time or animation on the resource
+// side, the unit just needs to already be standing within range. Same
+// ownership rule as HandleMove/HandleDespawn (unowned units free-for-
+// all), applied to the COMMANDING unit, not the node - nodes have no
+// owner of their own yet, they're a shared, contestable resource.
+procedure HandleCollect(APayload: TJSONObject);
+var
+  UnitID, NodeID, Actor, Reason: string;
+  U: TUnit;
+  Node: TResourceNode;
+  UnitFound, NodeFound: Boolean;
+  Dist: Double;
+  Taken: Integer;
+begin
+  UnitID := APayload.Get('unit_id', '');
+  NodeID := APayload.Get('node_id', '');
+  Actor := APayload.Get('by', '');
+  Reason := '';
+  Taken := 0;
+
+  UnitsLock.Enter;
+  try
+    UnitFound := Units.TryGetValue(UnitID, U);
+  finally
+    UnitsLock.Leave;
+  end;
+
+  if not UnitFound then
+    Reason := 'unknown unit'
+  else if (U.Owner <> '') and (U.Owner <> Actor) then
+    Reason := 'not your unit';
+
+  if Reason = '' then
+  begin
+    NodesLock.Enter;
+    try
+      NodeFound := Nodes.TryGetValue(NodeID, Node);
+      if not NodeFound then
+        Reason := 'unknown node'
+      else
+      begin
+        Dist := Sqrt(Sqr(U.GX - Node.GX) + Sqr(U.GY - Node.GY));
+        if Dist > CollectRadiusCells then
+          Reason := 'too far'
+        else if Node.Amount <= 0 then
+          Reason := 'depleted'
+        else
+        begin
+          Taken := CollectAmountPerAction;
+          if Taken > Node.Amount then Taken := Node.Amount;
+          Node.Amount := Node.Amount - Taken;
+          Nodes.AddOrSetValue(NodeID, Node);
+        end;
+      end;
+    finally
+      NodesLock.Leave;
+    end;
+  end;
+
+  if Reason <> '' then
+  begin
+    SendLine(Format('{"topic":"game.event.collect_failed","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"reason\":\"%s\"}"}',
+      [UnitID, NodeID, Reason]));
+    Exit;
+  end;
+
+  LogEvent(Format('{"type":"collected","unit_id":"%s","node_id":"%s","amount":%d}', [UnitID, NodeID, Taken]));
+  SendLine(Format('{"topic":"game.event.collected","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"resource_type\":\"%s\",\"amount\":%d,\"remaining\":%d}"}',
+    [UnitID, NodeID, Node.ResourceType, Taken, Node.Amount]));
+end;
+
 procedure DispatchIncoming(const ALine: string);
 var
   Data: TJSONData;
@@ -301,7 +489,14 @@ begin
     begin
       if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
         HandleMove(TJSONObject(PayloadData));
-    end;
+    end
+    else if Topic = 'game.cmd.collect' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleCollect(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.list_nodes' then
+      HandleListNodes;
     // add more topic handlers here as the command set grows
   finally
     Data.Free;
@@ -401,14 +596,15 @@ end;
 procedure ReplayEventLog(const AFilename: string);
 var
   F: TextFile;
-  Line, EventType, UnitID: string;
+  Line, EventType, UnitID, NodeID: string;
   Data: TJSONData;
   Obj: TJSONObject;
   U: TUnit;
+  Node: TResourceNode;
   Lon, Lat: Double;
   PathArr, PointArr: TJSONArray;
   GridPath: TGridPath;
-  i, PathIdx, EventCount: Integer;
+  i, PathIdx, EventCount, CollectedAmount: Integer;
 begin
   EventCount := 0;
 
@@ -497,6 +693,25 @@ begin
         else if EventType = 'despawned' then
         begin
           Units.Remove(UnitID);
+        end
+        else if EventType = 'collected' then
+        begin
+          NodeID := Obj.Get('node_id', '');
+          CollectedAmount := Obj.Get('amount', 0);
+          if NodeID <> '' then
+          begin
+            NodesLock.Enter;
+            try
+              if Nodes.TryGetValue(NodeID, Node) then
+              begin
+                Node.Amount := Node.Amount - CollectedAmount;
+                if Node.Amount < 0 then Node.Amount := 0;
+                Nodes.AddOrSetValue(NodeID, Node);
+              end;
+            finally
+              NodesLock.Leave;
+            end;
+          end;
         end;
 
         Inc(EventCount);
@@ -546,8 +761,10 @@ begin
   Tick := 0;
   OutputLock := TCriticalSection.Create;
   UnitsLock := TCriticalSection.Create;
+  NodesLock := TCriticalSection.Create;
   EventLogLock := TCriticalSection.Create;
   Units := specialize TDictionary<string, TUnit>.Create;
+  Nodes := specialize TDictionary<string, TResourceNode>.Create;
 
   LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
@@ -555,6 +772,9 @@ begin
   LogDiag('Loading ' + Config.MovementGridPath + ' ...');
   Grid := LoadMovementGrid(Config.MovementGridPath);
   LogDiag('Movement grid: ' + IntToStr(Grid.Width) + ' x ' + IntToStr(Grid.Height));
+
+  LogDiag('Loading resource_nodes.json ...');
+  LoadResourceNodes(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'resource_nodes.json');
 
   EventLogPath := ExpandFileName(ExtractFilePath(ParamStr(0))) + 'events.jsonl';
   LogDiag('Event log: ' + EventLogPath);
