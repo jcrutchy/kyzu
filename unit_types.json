@@ -1,0 +1,7 @@
+[
+  {"type_id": "generic",  "display_name": "Generic",  "speed_multiplier": 1.0, "can_found_city": true,  "can_collect": true,  "collect_multiplier": 1.0, "hp": 20, "attack": 0},
+  {"type_id": "settler",  "display_name": "Settler",  "speed_multiplier": 0.8, "can_found_city": true,  "can_collect": false, "collect_multiplier": 1.0, "hp": 10, "attack": 0},
+  {"type_id": "worker",   "display_name": "Worker",   "speed_multiplier": 1.0, "can_found_city": false, "can_collect": true,  "collect_multiplier": 1.5, "hp": 10, "attack": 0},
+  {"type_id": "scout",    "display_name": "Scout",    "speed_multiplier": 1.6, "can_found_city": false, "can_collect": false, "collect_multiplier": 1.0, "hp": 15, "attack": 0},
+  {"type_id": "soldier",  "display_name": "Soldier",  "speed_multiplier": 1.0, "can_found_city": false, "can_collect": false, "collect_multiplier": 1.0, "hp": 30, "attack": 10}
+]

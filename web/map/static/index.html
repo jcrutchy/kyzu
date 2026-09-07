@@ -73,7 +73,7 @@
   }
   #overlayOpacityRow { display: none; }
   #overlayOpacityRow.shown { display: block; }
-  #btnSpawn.armed, #btnFoundCity.armed, #btnRoad.armed { color: #ffd166; border-color: #6b5a2c; }
+  #btnSpawn.armed, #btnFoundCity.armed, #btnRoad.armed, #btnAttack.armed { color: #ffd166; border-color: #6b5a2c; }
 </style>
 </head>
 <body>
@@ -128,9 +128,18 @@
   <div class="section">
     <div class="label">faction</div>
     <input type="text" id="factionInput" value="me" maxlength="24">
-    <button id="btnSpawn" style="width:100%;margin:0;">Spawn (S)</button>
+    <div class="label" style="margin-top:4px;">unit type</div>
+    <select id="unitTypeSelect" style="width:100%;">
+      <option value="generic">Generic</option>
+      <option value="settler">Settler</option>
+      <option value="worker">Worker</option>
+      <option value="scout">Scout</option>
+      <option value="soldier">Soldier</option>
+    </select>
+    <button id="btnSpawn" style="width:100%;margin:4px 0 0;">Spawn (S)</button>
     <button id="btnFoundCity" style="width:100%;margin:4px 0 0;">Found City (F)</button>
     <button id="btnRoad" style="width:100%;margin:4px 0 0;">Build Road (R)</button>
+    <button id="btnAttack" style="width:100%;margin:4px 0 0;">Attack (A)</button>
     <div class="label" style="margin-top:4px;">select unit, X to despawn, C to collect</div>
   </div>
   <div class="section">
@@ -269,6 +278,7 @@
   let spawnArmed = false;
   const btnSpawn = document.getElementById('btnSpawn');
   const factionInput = document.getElementById('factionInput');
+  const unitTypeSelect = document.getElementById('unitTypeSelect');
 
   function setSpawnArmed(armed) {
     spawnArmed = armed;
@@ -290,32 +300,52 @@
       lon: lon,
       lat: lat,
       owner: factionInput.value || '',
-      unit_type: 'generic'
+      unit_type: unitTypeSelect.value
     });
   }
 
-  let foundCityArmed = false;
+  // Founding no longer arms a click-to-place mode - a city now always
+  // comes from a settler-capable unit standing where it'll be founded,
+  // so "Found City" acts on whichever unit is currently selected rather
+  // than a raw map click. Roads still work the same way (they connect
+  // two already-placed cities, not units).
   let roadArmed = false;
   let roadFromCityId = null;
   const btnFoundCity = document.getElementById('btnFoundCity');
   const btnRoad = document.getElementById('btnRoad');
 
-  function setFoundCityArmed(armed) {
-    foundCityArmed = armed;
-    btnFoundCity.classList.toggle('armed', armed);
-    canvas.classList.toggle('spawn-armed', armed || spawnArmed);
-  }
   function setRoadArmed(armed) {
     roadArmed = armed;
     roadFromCityId = null;
     btnRoad.classList.toggle('armed', armed);
   }
-  btnFoundCity.addEventListener('click', () => setFoundCityArmed(!foundCityArmed));
+  btnFoundCity.addEventListener('click', () => foundCityWithSelectedUnit());
   btnRoad.addEventListener('click', () => setRoadArmed(!roadArmed));
 
-  function foundCityAt(lon, lat) {
+  // Attack fires from the currently selected unit against whatever the
+  // next click lands on - a unit (any owner but your own) or a city
+  // (any owner but your own). One click, one shot: it disarms
+  // regardless of whether the click actually hit a valid target, same
+  // "click always consumes the mode" idiom as Spawn.
+  let attackArmed = false;
+  const btnAttack = document.getElementById('btnAttack');
+  function setAttackArmed(armed) {
+    if (armed && !selectedUnitId) {
+      showToast('select your unit first');
+      return;
+    }
+    attackArmed = armed;
+    btnAttack.classList.toggle('armed', armed);
+  }
+  btnAttack.addEventListener('click', () => setAttackArmed(!attackArmed));
+
+  function foundCityWithSelectedUnit() {
+    if (!selectedUnitId) {
+      showToast('select a unit first');
+      return;
+    }
     const cityId = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    publish('game.cmd.found_city', { city_id: cityId, lon: lon, lat: lat, owner: factionInput.value || '' });
+    publish('game.cmd.found_city', { city_id: cityId, unit_id: selectedUnitId, by: factionInput.value || '' });
   }
 
   function findCityNear(mx, my) {
@@ -353,13 +383,20 @@
     const rect = canvas.getBoundingClientRect();
     const mx = clientX - rect.left, my = clientY - rect.top;
 
-    if (foundCityArmed) {
-      setFoundCityArmed(false);
-      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
-      const worldX = centerWorld.x + (mx - canvas.width / 2);
-      const worldY = centerWorld.y + (my - canvas.height / 2);
-      const target = worldToLonLat(worldX, worldY, view.zoom);
-      foundCityAt(target.lon, target.lat);
+    if (attackArmed) {
+      attackArmed = false;
+      btnAttack.classList.remove('armed');
+      const hitUnit = findUnitNear(mx, my);
+      if (hitUnit && hitUnit !== selectedUnitId) {
+        publish('game.cmd.attack', { attacker_unit_id: selectedUnitId, target_unit_id: hitUnit, by: factionInput.value || '' });
+        return;
+      }
+      const hitCityForAttack = findCityNear(mx, my);
+      if (hitCityForAttack) {
+        publish('game.cmd.attack', { attacker_unit_id: selectedUnitId, target_city_id: hitCityForAttack, by: factionInput.value || '' });
+        return;
+      }
+      showToast('no target there');
       return;
     }
 
@@ -468,7 +505,7 @@
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
         if (payload && payload.unit_id !== undefined) {
-          unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic' });
+          unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', hp: payload.hp });
           onUnitPosition(payload.unit_id, payload.lon, payload.lat);
         }
       } else if (msg.topic === 'game.event.despawned') {
@@ -492,6 +529,71 @@
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
         showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.unit_attacked') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.target_unit_id !== undefined) {
+          const meta = unitMeta.get(payload.target_unit_id);
+          if (meta) meta.hp = payload.remaining_hp;
+          if (payload.by === factionInput.value || (meta && meta.owner === factionInput.value)) {
+            showToast(payload.attacker_unit_id + ' hit ' + payload.target_unit_id + ' for ' + payload.damage + ' (' + payload.remaining_hp + ' hp left)');
+          }
+        }
+      } else if (msg.topic === 'game.event.attack_failed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        showToast('attack failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+      } else if (msg.topic === 'game.event.city_attacked') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.city_id !== undefined) {
+          const c = cities.get(payload.city_id);
+          if (c) c.population = payload.population_remaining;
+          showToast(payload.city_id + ' under siege - ' + payload.population_remaining + ' population left');
+        }
+      } else if (msg.topic === 'game.event.city_captured') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.city_id !== undefined) {
+          const c = cities.get(payload.city_id) || {};
+          c.owner = payload.new_owner;
+          c.population = payload.population;
+          cities.set(payload.city_id, c);
+          showToast(payload.city_id + ' captured by ' + payload.new_owner);
+        }
+      } else if (msg.topic === 'game.event.city_upkeep_spent') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.owner === factionInput.value) {
+          myLedger.wood = Math.max(0, (myLedger.wood || 0) - (payload.wood || 0));
+          renderStash();
+        }
+      } else if (msg.topic === 'game.event.city_population_decayed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.city_id !== undefined) {
+          const c = cities.get(payload.city_id);
+          if (c) c.population = payload.population;
+          showToast(payload.city_id + ' is short on upkeep - population down to ' + payload.population);
+        }
+      } else if (msg.topic === 'game.event.city_abandoned') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.city_id !== undefined) {
+          cities.delete(payload.city_id);
+          if (selectedCityId === payload.city_id) {
+            selectedCityId = null;
+            hudSelectedCity.textContent = 'none';
+          }
+          showToast(payload.city_id + ' was abandoned - upkeep unpaid too long');
+        }
       } else if (msg.topic === 'game.event.node_list') {
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
@@ -514,6 +616,16 @@
             renderStash();
           }
           showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
+        }
+      } else if (msg.topic === 'game.event.city_growth_spent') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.owner === factionInput.value) {
+          myLedger.wood = Math.max(0, (myLedger.wood || 0) - (payload.wood || 0));
+          myLedger.stone = Math.max(0, (myLedger.stone || 0) - (payload.stone || 0));
+          renderStash();
+          showToast('city ' + payload.city_id + ' grew - spent ' + payload.wood + ' wood, ' + payload.stone + ' stone');
         }
       } else if (msg.topic === 'game.event.ledger') {
         let payload;
@@ -983,7 +1095,7 @@
         ctx.fillStyle = '#c9d6cd';
         ctx.font = '10px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(id, sx, sy + 18);
+        ctx.fillText(id + (meta && meta.hp !== undefined ? ' (' + meta.hp + 'hp)' : ''), sx, sy + 18);
       } else {
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);
@@ -1116,14 +1228,16 @@
     if (e.key === 'Escape') {
       setSelectedUnit(null);
       setSpawnArmed(false);
-      setFoundCityArmed(false);
       setRoadArmed(false);
+      attackArmed = false;
+      btnAttack.classList.remove('armed');
       selectedCityId = null;
       hudSelectedCity.textContent = 'none';
     }
     if (e.key === 's' || e.key === 'S') setSpawnArmed(!spawnArmed);
-    if (e.key === 'f' || e.key === 'F') setFoundCityArmed(!foundCityArmed);
+    if (e.key === 'f' || e.key === 'F') foundCityWithSelectedUnit();
     if (e.key === 'r' || e.key === 'R') setRoadArmed(!roadArmed);
+    if (e.key === 'a' || e.key === 'A') setAttackArmed(!attackArmed);
     if (e.key === 'Delete' || e.key === 'x' || e.key === 'X') despawnSelected();
     if (e.key === 'c' || e.key === 'C') collectFromNearestNode();
   });
