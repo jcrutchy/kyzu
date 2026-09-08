@@ -594,6 +594,13 @@
           }
           showToast(payload.city_id + ' was abandoned - upkeep unpaid too long');
         }
+      } else if (msg.topic === 'game.event.road_removed') {
+        let payload;
+        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
+        catch (e) { return; }
+        if (payload && payload.road_id !== undefined) {
+          roads.delete(payload.road_id);
+        }
       } else if (msg.topic === 'game.event.node_list') {
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }

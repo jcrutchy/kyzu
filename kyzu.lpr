@@ -71,6 +71,23 @@ const
   AiFactionName = 'ai';
   AiTickInterval = 40; // ~2s at 20 ticks/sec - how often it considers spawning a new worker
   AiTargetWorkerCount = 2;
+  // Veterancy: a unit that lands a hit in unit-vs-unit combat gains XP
+  // and eventually levels up, permanently boosting its own Attack/MaxHP
+  // (and healing it by the HP bonus on the level-up itself - a reward
+  // for surviving to level up, not just a higher ceiling a wounded unit
+  // doesn't benefit from). Deliberately scoped to unit-vs-unit only,
+  // not sieging a city - "gets better at fighting soldiers" is a
+  // cleaner story than "gets better at farming population", and it
+  // keeps city_attacked/city_captured's payload shape untouched.
+  // This is exactly the kind of thing a raider-strategy AI controller
+  // can optimize for that a purely passive economy AI never has a
+  // reason to: keeping veterans alive instead of treating units as
+  // disposable.
+  VeterancyXPPerHit = 10;
+  VeterancyXPPerLevel = 30; // XP needed to go from Level to Level+1 is (Level+1) * this
+  VeterancyMaxLevel = 3;
+  VeterancyAttackBonusPerLevel = 5;
+  VeterancyHPBonusPerLevel = 10;
 
 type
   TUnit = record
@@ -81,6 +98,8 @@ type
     Path: TGridPath;
     PathIndex: Integer; // index of the path node the unit is currently departing from
     HP: Integer;    // current hit points, initialized from UnitDefs[UnitType].MaxHP at spawn
+    XP: Integer;     // combat experience - see VeterancyXPPerHit/VeterancyMaxLevel
+    Level: Integer;  // 0 = green, up to VeterancyMaxLevel - boosts effective Attack/MaxHP
   end;
 
   // Static resource nodes - placed once from resource_nodes.json at
@@ -235,11 +254,54 @@ end;
 function LonToGridX(Lon: Double): Integer;
 begin
   Result := Trunc((Lon - (-180.0)) / 360.0 * Grid.Width);
+  // Lon = 180.0 exactly (a legitimate value - the antimeridian itself)
+  // computes to precisely Grid.Width, one past the last valid column.
+  // Every caller already treats an out-of-range GX as a rejectable
+  // "out of bounds" input, but clamping here means the boundary itself
+  // resolves to the last real column instead of a value that's always
+  // one-off from anything valid.
+  if Result >= Grid.Width then Result := Grid.Width - 1;
+  if Result < 0 then Result := 0;
 end;
 
 function LatToGridY(Lat: Double): Integer;
 begin
   Result := Trunc((90.0 - Lat) / 180.0 * Grid.Height);
+  // Same off-by-one at Lat = -90.0 exactly (the south pole).
+  if Result >= Grid.Height then Result := Grid.Height - 1;
+  if Result < 0 then Result := 0;
+end;
+
+// The grid is toroidal in X only - longitude wraps at the ±180° seam,
+// matching kyzu_pathfinding.pas's own wrapping (see its "Toroidal
+// wrapping along the X axis" and heuristic seam-wrap comments).
+// Latitude never wraps; there are real poles up there, not a seam.
+// Returns the SIGNED shorter-way-around delta from AX1 to AX2, so
+// AdvanceUnits can use it as a step direction, not just a magnitude.
+function WrappedDX(AX1, AX2: Double): Double;
+begin
+  Result := AX2 - AX1;
+  if Result > Grid.Width / 2.0 then
+    Result := Result - Grid.Width
+  else if Result < -Grid.Width / 2.0 then
+    Result := Result + Grid.Width;
+end;
+
+// Straight-line grid distance with the same antimeridian wrap applied
+// to the X component. Every proximity/range check in this file
+// (collect radius, attack range, AI node-seeking) should go through
+// this rather than a raw Sqrt(Sqr(dx)+Sqr(dy)) - otherwise a unit and
+// a node/unit/city sitting on opposite sides of the ±180° seam measure
+// as roughly Grid.Width cells apart instead of however close they
+// actually are, even though a unit can genuinely path across that seam
+// (pathfinding already wraps it).
+function WrappedDistance(AX1, AY1, AX2, AY2: Double): Double;
+var
+  dx, dy: Double;
+begin
+  dx := WrappedDX(AX1, AX2);
+  dy := AY2 - AY1;
+  Result := Sqrt(dx * dx + dy * dy);
 end;
 
 // Loads static resource nodes from resource_nodes.json - a flat array of
@@ -526,9 +588,32 @@ var
   U: TUnit;
   Lon, Lat: Double;
   GX, GY: Integer;
+  AlreadyExists: Boolean;
 begin
   UnitID := APayload.Get('unit_id', '');
   if UnitID = '' then Exit;
+
+  // Without this, any client sending an ALREADY-TAKEN unit_id would
+  // silently overwrite that unit in place via AddOrSetValue below -
+  // hijacking its owner, resetting its HP/position, all for free,
+  // bypassing combat entirely. IDs are broadcast openly in every
+  // spawned/position event, so this isn't just a hypothetical
+  // collision - anyone watching the event stream can read an
+  // opponent's exact unit_id and reuse it deliberately. Now that
+  // external, non-browser clients can genuinely connect and issue
+  // commands (not just the map viewer), this stopped being a
+  // theoretical concern.
+  UnitsLock.Enter;
+  try
+    AlreadyExists := Units.ContainsKey(UnitID);
+  finally
+    UnitsLock.Leave;
+  end;
+  if AlreadyExists then
+  begin
+    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"id already in use\"}"}', [UnitID]));
+    Exit;
+  end;
 
   Lon := APayload.Get('lon', 0.0);
   Lat := APayload.Get('lat', 0.0);
@@ -555,6 +640,8 @@ begin
   SetLength(U.Path, 0);
   U.PathIndex := 0;
   U.HP := GetUnitDef(U.UnitType).MaxHP;
+  U.XP := 0;
+  U.Level := 0;
 
   UnitsLock.Enter;
   try
@@ -722,7 +809,7 @@ begin
         Reason := 'unknown node'
       else
       begin
-        Dist := Sqrt(Sqr(U.GX - Node.GX) + Sqr(U.GY - Node.GY));
+        Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
         if Dist > CollectRadiusCells then
           Reason := 'too far'
         else if Node.Amount <= 0 then
@@ -851,6 +938,24 @@ begin
     UnitDef := GetUnitDef(U.UnitType);
     if not UnitDef.CanFoundCity then
       Reason := 'unit type cannot found cities';
+  end;
+
+  // Checked here, BEFORE the unit gets consumed below - a city_id
+  // collision needs to fail before the founding unit is spent, not
+  // after, or a rejected founding would still cost the player their
+  // settler for nothing. Without this check at all, a colliding id
+  // would silently overwrite an existing city via AddOrSetValue -
+  // instantly "capturing" it for free, resetting its owner and
+  // population, with none of the siege mechanic HandleAttack enforces.
+  if Reason = '' then
+  begin
+    CitiesLock.Enter;
+    try
+      if Cities.ContainsKey(CityID) then
+        Reason := 'city id already in use';
+    finally
+      CitiesLock.Leave;
+    end;
   end;
 
   if Reason = '' then
@@ -1063,6 +1168,45 @@ end;
 // not just left at zero, since a city with zero population isn't
 // meaningfully a city anymore and leaving it around would keep
 // RecomputeDevelopment radiating development from a ghost.
+// Removes every road touching ACityID - called when a city is
+// abandoned, so a dead city doesn't leave roads that RecomputeDevelopment
+// keeps stamping density from forever, and so the road list a fresh
+// viewer requests doesn't dangle a reference to a city that no longer
+// exists. Snapshots under RoadsLock, releases it, then removes and
+// broadcasts per road - keeps each individual RoadsLock hold short
+// rather than one long one spanning network/logging I/O.
+procedure PruneRoadsForCity(const ACityID: string);
+var
+  ToRemove: array of string;
+  Pair: specialize TPair<string, TRoad>;
+  i, Idx: Integer;
+begin
+  RoadsLock.Enter;
+  try
+    SetLength(ToRemove, 0);
+    for Pair in Roads do
+      if (Pair.Value.FromCityID = ACityID) or (Pair.Value.ToCityID = ACityID) then
+      begin
+        SetLength(ToRemove, Length(ToRemove) + 1);
+        ToRemove[High(ToRemove)] := Pair.Key;
+      end;
+  finally
+    RoadsLock.Leave;
+  end;
+
+  for i := 0 to High(ToRemove) do
+  begin
+    RoadsLock.Enter;
+    try
+      Roads.Remove(ToRemove[i]);
+    finally
+      RoadsLock.Leave;
+    end;
+    LogEvent(Format('{"type":"road_removed","road_id":"%s","reason":"city_abandoned"}', [ToRemove[i]]));
+    SendLine(Format('{"topic":"game.event.road_removed","payload":"{\"road_id\":\"%s\",\"reason\":\"city_abandoned\"}"}', [ToRemove[i]]));
+  end;
+end;
+
 procedure ProcessCityUpkeep;
 var
   Keys: array of string;
@@ -1159,6 +1303,7 @@ begin
       end;
       LogEvent(Format('{"type":"city_abandoned","city_id":"%s","previous_owner":"%s"}', [Keys[i], C.Owner]));
       SendLine(Format('{"topic":"game.event.city_abandoned","payload":"{\"city_id\":\"%s\",\"previous_owner\":\"%s\"}"}', [Keys[i], C.Owner]));
+      PruneRoadsForCity(Keys[i]);
     end
     else
     begin
@@ -1284,7 +1429,7 @@ begin
         for NodePair in Nodes do
         begin
           if NodePair.Value.Amount <= 0 then Continue;
-          Dist := Sqrt(Sqr(U.GX - NodePair.Value.GX) + Sqr(U.GY - NodePair.Value.GY));
+          Dist := WrappedDistance(U.GX, U.GY, NodePair.Value.GX, NodePair.Value.GY);
           if Dist < BestDist then
           begin
             BestDist := Dist;
@@ -1303,7 +1448,7 @@ begin
 
     AiUnitTargets.AddOrSetValue(UnitKeys[i], AssignedNodeID);
 
-    Dist := Sqrt(Sqr(U.GX - Node.GX) + Sqr(U.GY - Node.GY));
+    Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
 
     if Dist <= CollectRadiusCells then
     begin
@@ -1342,7 +1487,7 @@ procedure HandleBuildRoad(APayload: TJSONObject);
 var
   RoadID, FromCityID, ToCityID, Actor: string;
   FromCity, ToCity: TCity;
-  Found1, Found2: Boolean;
+  Found1, Found2, RoadIDTaken: Boolean;
   Path: TGridPath;
   R: TRoad;
 begin
@@ -1351,6 +1496,21 @@ begin
   ToCityID := APayload.Get('to_city_id', '');
   Actor := APayload.Get('by', '');
   if (RoadID = '') or (FromCityID = '') or (ToCityID = '') then Exit;
+
+  // Same reasoning as the unit_id/city_id checks in HandleSpawn/
+  // HandleFoundCity - without this, a colliding road_id would silently
+  // overwrite an existing road's endpoints/path via AddOrSetValue.
+  RoadsLock.Enter;
+  try
+    RoadIDTaken := Roads.ContainsKey(RoadID);
+  finally
+    RoadsLock.Leave;
+  end;
+  if RoadIDTaken then
+  begin
+    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"id already in use\"}"}', [RoadID]));
+    Exit;
+  end;
 
   CitiesLock.Enter;
   try
@@ -1571,6 +1731,25 @@ begin
           DeltaJSON := DeltaJSON + Format('{"gx":%d,"gy":%d,"d":%d}', [Cell.GX, Cell.GY, Cell.Level]);
         end;
       end;
+
+      // A cell that was previously developed but has NO current
+      // contribution at all - a city shrank away from it, was captured
+      // down to nothing, was abandoned, or a road touching it was
+      // removed - never appears in Contrib above, so the loop over
+      // Contrib alone can never tell a connected viewer it faded. That
+      // viewer would otherwise keep rendering the cell at its last
+      // known peak density forever, since nothing ever says otherwise.
+      for Pair in Density do
+      begin
+        if Contrib.ContainsKey(Pair.Key) then Continue;
+        if Pair.Value.Level >= DevelopmentBroadcastThreshold then
+        begin
+          if not First then DeltaJSON := DeltaJSON + ',';
+          First := False;
+          DeltaJSON := DeltaJSON + Format('{"gx":%d,"gy":%d,"d":0}', [Pair.Value.GX, Pair.Value.GY]);
+        end;
+      end;
+
       Density.Free;
       Density := NewDensity;
     finally
@@ -1625,7 +1804,7 @@ var
   AttackerID, TargetUnitID, TargetCityID, Actor, Reason, PrevOwner: string;
   Attacker, TargetUnit: TUnit;
   AttackerDef: TUnitDef;
-  AttackerFound, TargetUnitFound, TargetCityFound: Boolean;
+  AttackerFound, TargetUnitFound, TargetCityFound, LeveledUp: Boolean;
   TargetCity: TCity;
   Dist: Double;
   Damage, NewHP, NewPop: Integer;
@@ -1673,21 +1852,56 @@ begin
       Reason := 'cannot attack your own faction'
     else
     begin
-      Dist := Sqrt(Sqr(Attacker.GX - TargetUnit.GX) + Sqr(Attacker.GY - TargetUnit.GY));
+      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetUnit.GX, TargetUnit.GY);
       if Dist > AttackRangeCells then
         Reason := 'too far';
     end;
 
     if Reason = '' then
     begin
-      Damage := AttackerDef.Attack;
+      // Effective damage includes the attacker's veterancy bonus - a
+      // Level 2 soldier hits harder than a fresh one of the same type.
+      Damage := AttackerDef.Attack + Attacker.Level * VeterancyAttackBonusPerLevel;
       NewHP := TargetUnit.HP - Damage;
       if NewHP < 0 then NewHP := 0;
 
-      LogEvent(Format('{"type":"unit_attacked","attacker_unit_id":"%s","target_unit_id":"%s","by":"%s","damage":%d,"remaining_hp":%d}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP]));
-      SendLine(Format('{"topic":"game.event.unit_attacked","payload":"{\"attacker_unit_id\":\"%s\",\"target_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"remaining_hp\":%d}"}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP]));
+      // Veterancy: any landed hit grants XP, win or lose, dead or
+      // alive on the target's side - the attacker did the fighting
+      // regardless of outcome. Scoped to unit-vs-unit only (see
+      // VeterancyXPPerHit's comment) so this branch is the only place
+      // that ever touches XP/Level.
+      Attacker.XP := Attacker.XP + VeterancyXPPerHit;
+      LeveledUp := False;
+      while (Attacker.Level < VeterancyMaxLevel) and
+            (Attacker.XP >= (Attacker.Level + 1) * VeterancyXPPerLevel) do
+      begin
+        Attacker.XP := Attacker.XP - (Attacker.Level + 1) * VeterancyXPPerLevel;
+        Inc(Attacker.Level);
+        Inc(Attacker.HP, VeterancyHPBonusPerLevel); // heals on level-up, not just a higher ceiling a wounded unit wouldn't feel
+        LeveledUp := True;
+      end;
+      UnitsLock.Enter;
+      try
+        Units.AddOrSetValue(AttackerID, Attacker);
+      finally
+        UnitsLock.Leave;
+      end;
+
+      LogEvent(Format('{"type":"unit_attacked","attacker_unit_id":"%s","target_unit_id":"%s","by":"%s","damage":%d,"remaining_hp":%d,"attacker_xp":%d,"attacker_level":%d}',
+        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
+      SendLine(Format('{"topic":"game.event.unit_attacked","payload":"{\"attacker_unit_id\":\"%s\",\"target_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"remaining_hp\":%d,\"attacker_xp\":%d,\"attacker_level\":%d}"}',
+        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
+
+      if LeveledUp then
+      begin
+        // Notification-only - fully redundant with the attacker_xp/
+        // attacker_level fields already in unit_attacked above, so
+        // replay never needs to handle this one specially. It exists
+        // purely so a dashboard or map viewer can flag the moment
+        // distinctly rather than noticing it by comparing two numbers.
+        SendLine(Format('{"topic":"game.event.unit_leveled_up","payload":"{\"unit_id\":\"%s\",\"level\":%d,\"hp\":%d}"}',
+          [AttackerID, Attacker.Level, Attacker.HP]));
+      end;
 
       if NewHP <= 0 then
       begin
@@ -1731,7 +1945,14 @@ begin
       Reason := 'already yours'
     else
     begin
-      Dist := Sqrt(Sqr(Attacker.GX - TargetCity.GX) + Sqr(Attacker.GY - TargetCity.GY));
+      // TargetCity.GX/GY are the raw cell (no +0.5) - unlike a unit's
+      // GX/GY, which is always a cell CENTER. Comparing against the
+      // raw cell made the effective range asymmetric depending on
+      // which direction the attacker approached from (a city dead
+      // east could be out of range while the same distance to the
+      // west was in range) - +0.5 puts both sides of the comparison
+      // on the same cell-center footing.
+      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetCity.GX + 0.5, TargetCity.GY + 0.5);
       if Dist > AttackRangeCells then
         Reason := 'too far';
     end;
@@ -1789,7 +2010,9 @@ var
   Obj: TJSONObject;
   Topic: string;
   PayloadData: TJSONData;
+  ParsedPayload: TJSONData;
 begin
+  ParsedPayload := nil;
   try
     Data := GetJSON(ALine);
   except
@@ -1801,6 +2024,25 @@ begin
     Obj := TJSONObject(Data);
     Topic := Obj.Get('topic', '');
     PayloadData := Obj.Find('payload');
+
+    // A payload sent as a JSON STRING (rather than a nested object) is
+    // accepted too, not just silently dropped. This server's OWN
+    // outgoing events use exactly that shape
+    // ({"topic":"...","payload":"{\"...\":...}"}), so a client that
+    // mirrors that convention when sending commands would otherwise
+    // have every command go nowhere with nothing to explain why.
+    if Assigned(PayloadData) and (PayloadData.JSONType = jtString) then
+    begin
+      try
+        ParsedPayload := GetJSON(PayloadData.AsString);
+        if ParsedPayload.JSONType = jtObject then
+          PayloadData := ParsedPayload;
+      except
+        // Not parseable as JSON after all - leave PayloadData as the
+        // original string; every Handle* below already requires
+        // jtObject and will just no-op on it, same as today.
+      end;
+    end;
 
     if Topic = 'game.cmd.ping' then
       SendLine('{"topic":"game.event.pong","payload":"{}"}')
@@ -1855,6 +2097,7 @@ begin
     // add more topic handlers here as the command set grows
   finally
     Data.Free;
+    if Assigned(ParsedPayload) then ParsedPayload.Free;
   end;
 end;
 
@@ -1889,55 +2132,73 @@ begin
 
   for i := 0 to High(Keys) do
   begin
+    // The read (TryGetValue), the movement computation, and the write
+    // back (AddOrSetValue) are ALL held under one UnitsLock acquisition
+    // now, rather than three separate ones with the actual computation
+    // happening lock-free in between. That gap used to let a command
+    // arriving on TStdinReaderThread for this exact unit - a move
+    // (new path assigned, then silently overwritten back to the stale
+    // one this loop iteration already had in hand), a despawn, or a
+    // death from HandleAttack (Units.Remove, then this iteration's
+    // finishing AddOrSetValue would resurrect it right back into
+    // existence) - slip in between this loop's read and its write and
+    // get silently clobbered or undone. Holding the lock for the whole
+    // step closes that window entirely rather than trying to detect it
+    // after the fact.
     UnitsLock.Enter;
     try
       if not Units.TryGetValue(Keys[i], U) then Continue;
-    finally
-      UnitsLock.Leave;
-    end;
 
-    if (Length(U.Path) = 0) or (U.PathIndex >= High(U.Path)) then
-      Continue; // idle - nothing to advance, nothing to broadcast
+      if (Length(U.Path) = 0) or (U.PathIndex >= High(U.Path)) then
+        Continue; // idle - nothing to advance, nothing to broadcast
 
-    TargetX := U.Path[U.PathIndex + 1].X;
-    TargetY := U.Path[U.PathIndex + 1].Y;
-    StepCost := CellMoveCost(Grid, Config, TargetX, TargetY);
-    if StepCost <= 0 then StepCost := 1; // shouldn't happen, path was validated - stay safe rather than divide by zero
-    MoveAmount := (BaseSpeed * GetUnitDef(U.UnitType).SpeedMultiplier) / StepCost;
+      TargetX := U.Path[U.PathIndex + 1].X;
+      TargetY := U.Path[U.PathIndex + 1].Y;
+      StepCost := CellMoveCost(Grid, Config, TargetX, TargetY);
+      if StepCost <= 0 then StepCost := 1; // shouldn't happen, path was validated - stay safe rather than divide by zero
+      MoveAmount := (BaseSpeed * GetUnitDef(U.UnitType).SpeedMultiplier) / StepCost;
 
-    DX := (TargetX + 0.5) - U.GX;
-    DY := (TargetY + 0.5) - U.GY;
-    Dist := Sqrt(DX * DX + DY * DY);
+      // WrappedDX (not a plain subtraction) - a path can legitimately
+      // cross the ±180° antimeridian seam (kyzu_pathfinding.pas
+      // supports it), and a raw (TargetX + 0.5) - U.GX would compute a
+      // delta of roughly -Grid.Width instead of the true short step of
+      // ~1 cell, sending the unit on a hundreds-of-ticks trip in
+      // reverse around the entire planet instead of one step forward.
+      DX := WrappedDX(U.GX, TargetX + 0.5);
+      DY := (TargetY + 0.5) - U.GY;
+      Dist := Sqrt(DX * DX + DY * DY);
 
-    if Dist <= MoveAmount then
-    begin
-      U.GX := TargetX + 0.5;
-      U.GY := TargetY + 0.5;
-      Inc(U.PathIndex);
-      LogEvent(Format('{"type":"waypoint","unit_id":"%s","path_index":%d}', [Keys[i], U.PathIndex]));
-
-      if U.PathIndex >= High(U.Path) then
+      if Dist <= MoveAmount then
       begin
-        SetLength(U.Path, 0); // arrived - unit goes idle, stops generating traffic
-        LogEvent(Format('{"type":"arrived","unit_id":"%s"}', [Keys[i]]));
-        SendLine(Format('{"topic":"game.event.arrived","payload":"{\"unit_id\":\"%s\"}"}', [Keys[i]]));
-      end;
-    end
-    else
-    begin
-      U.GX := U.GX + (DX / Dist) * MoveAmount;
-      U.GY := U.GY + (DY / Dist) * MoveAmount;
-    end;
+        U.GX := TargetX + 0.5;
+        U.GY := TargetY + 0.5;
+        Inc(U.PathIndex);
+        LogEvent(Format('{"type":"waypoint","unit_id":"%s","path_index":%d}', [Keys[i], U.PathIndex]));
 
-    UnitsLock.Enter;
-    try
+        if U.PathIndex >= High(U.Path) then
+        begin
+          SetLength(U.Path, 0); // arrived - unit goes idle, stops generating traffic
+          LogEvent(Format('{"type":"arrived","unit_id":"%s"}', [Keys[i]]));
+          SendLine(Format('{"topic":"game.event.arrived","payload":"{\"unit_id\":\"%s\"}"}', [Keys[i]]));
+        end;
+      end
+      else
+      begin
+        U.GX := U.GX + (DX / Dist) * MoveAmount;
+        U.GY := U.GY + (DY / Dist) * MoveAmount;
+        // A step whose wrapped delta pointed across the seam can walk
+        // U.GX slightly outside [0, Grid.Width) - wrap it back in.
+        if U.GX < 0 then U.GX := U.GX + Grid.Width
+        else if U.GX >= Grid.Width then U.GX := U.GX - Grid.Width;
+      end;
+
       Units.AddOrSetValue(Keys[i], U);
+
+      SendLine(Format('{"topic":"game.event.position","payload":"{\"unit_id\":\"%s\",\"lon\":%.4f,\"lat\":%.4f}"}',
+        [Keys[i], GridToLon(U.GX), GridToLat(U.GY)]));
     finally
       UnitsLock.Leave;
     end;
-
-    SendLine(Format('{"topic":"game.event.position","payload":"{\"unit_id\":\"%s\",\"lon\":%.4f,\"lat\":%.4f}"}',
-      [Keys[i], GridToLon(U.GX), GridToLat(U.GY)]));
   end;
 end;
 
@@ -1951,7 +2212,7 @@ end;
 procedure ReplayEventLog(const AFilename: string);
 var
   F: TextFile;
-  Line, EventType, UnitID, NodeID, ByActor, LedgerKey, CityID, RoadID, TargetUnitID: string;
+  Line, EventType, UnitID, NodeID, ByActor, LedgerKey, CityID, RoadID, TargetUnitID, AttackerUnitID: string;
   Data: TJSONData;
   Obj: TJSONObject;
   U: TUnit;
@@ -2012,6 +2273,12 @@ begin
           // Old log lines predating combat won't have "hp" - fall back
           // to the type's current MaxHP, same as a live spawn would.
           U.HP := Obj.Get('hp', GetUnitDef(U.UnitType).MaxHP);
+          // Explicitly reset (not left to whatever the previous loop
+          // iteration's reused U record happened to hold) - XP/Level
+          // for a freshly spawned unit are always 0 regardless of what
+          // some earlier unit in this same replay pass leveled up to.
+          U.XP := 0;
+          U.Level := 0;
           Units.AddOrSetValue(UnitID, U);
         end
         else if EventType = 'path_found' then
@@ -2189,6 +2456,19 @@ begin
           // 'despawned' event immediately after it in the log (see
           // HandleAttack), which the existing 'despawned' branch above
           // already handles - no special-casing needed here.
+
+          // The ATTACKER's XP/Level are carried in this same event
+          // (see HandleAttack) rather than a separate one, so restore
+          // them here too. Old log lines predating veterancy simply
+          // won't have these fields - Obj.Get's defaults leave an
+          // already-replayed attacker's XP/Level untouched in that case.
+          AttackerUnitID := Obj.Get('attacker_unit_id', '');
+          if (AttackerUnitID <> '') and Units.TryGetValue(AttackerUnitID, U) then
+          begin
+            U.XP := Obj.Get('attacker_xp', U.XP);
+            U.Level := Obj.Get('attacker_level', U.Level);
+            Units.AddOrSetValue(AttackerUnitID, U);
+          end;
         end
         else if EventType = 'city_attacked' then
         begin
@@ -2246,6 +2526,12 @@ begin
           CityID := Obj.Get('city_id', '');
           if CityID <> '' then
             Cities.Remove(CityID);
+        end
+        else if EventType = 'road_removed' then
+        begin
+          RoadID := Obj.Get('road_id', '');
+          if RoadID <> '' then
+            Roads.Remove(RoadID);
         end;
 
         Inc(EventCount);
@@ -2282,7 +2568,23 @@ begin
     if Eof(Input) then Break; // stdin closed - bridge is gone, VDRX will restart us
     ReadLn(Line);
     if Line <> '' then
-      DispatchIncoming(Line);
+    begin
+      // DispatchIncoming's own try/except only covers the initial JSON
+      // parse - a Handle* procedure raising anything else (a bad cast,
+      // an unexpected nil, a range-check error) would previously
+      // propagate all the way out of Execute uncaught. TThread swallows
+      // an unhandled exception silently and just stops calling Execute
+      // ever again - the tick loop keeps running and broadcasting state
+      // as if nothing happened, but the server is now permanently deaf
+      // to every future command with no crash, no log line, and no
+      // visible symptom until someone notices commands stopped working.
+      try
+        DispatchIncoming(Line);
+      except
+        on E: Exception do
+          LogDiag('DispatchIncoming raised ' + E.ClassName + ': ' + E.Message + ' - line ignored, reader continues');
+      end;
+    end;
   end;
 end;
 
@@ -2292,6 +2594,16 @@ var
   EventLogExisted: Boolean;
 
 begin
+  // Format('%.4f', ...) and similar formatting throughout this file are
+  // locale-sensitive in Free Pascal - on any machine whose regional
+  // settings use a comma decimal separator (most of continental Europe,
+  // among others), every "lon":%.4f would render as "lon":21,0000,
+  // producing invalid JSON on every single event this server emits, and
+  // GetJSON would fail to parse it back on the next replay. Every
+  // number in this protocol is meant to be plain JSON regardless of
+  // what machine it runs on, so the separator is pinned here before
+  // anything else runs.
+  DefaultFormatSettings.DecimalSeparator := '.';
   Tick := 0;
   OutputLock := TCriticalSection.Create;
   UnitsLock := TCriticalSection.Create;

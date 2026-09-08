@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>kyzu — faction dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0a0e0c;
+    font-family: "IBM Plex Mono", "Consolas", monospace;
+    color: #c9d6cd;
+  }
+  #topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 16px; background: #0f1512; border-bottom: 1px solid #1c2620;
+  }
+  #topbar h1 { font-size: 14px; color: #5ee6a8; margin: 0; font-weight: normal; letter-spacing: 0.5px; }
+  #topbar .dim { color: #5c6b62; font-size: 12px; }
+  #wsUrlInput {
+    background: #0f1512; border: 1px solid #1c2620; color: #c9d6cd;
+    font-family: inherit; font-size: 12px; padding: 4px 8px; width: 220px;
+  }
+  #connectBtn {
+    background: #0f1512; border: 1px solid #1c2620; color: #5ee6a8;
+    font-family: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  }
+  #connectBtn:hover { border-color: #2c5c46; }
+  .wsdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e65e5e; margin-right: 6px; }
+  .wsdot.up { background: #5ee6a8; }
+  #tickDisplay { color: #5c6b62; font-size: 12px; margin-left: auto; }
+
+  #main { display: flex; height: calc(100% - 45px); }
+  #statsPane { flex: 1; overflow-y: auto; padding: 16px; }
+  #logPane {
+    width: 380px; border-left: 1px solid #1c2620; background: #0d1210;
+    display: flex; flex-direction: column;
+  }
+  #logHeader { padding: 8px 12px; font-size: 11px; color: #5c6b62; border-bottom: 1px solid #1c2620; }
+  #logFeed { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 11px; line-height: 1.6; }
+  #logFeed .entry { color: #5c6b62; margin-bottom: 2px; word-break: break-word; }
+  #logFeed .entry .t { color: #3d4a43; }
+  #logFeed .entry.combat { color: #e65e5e; }
+  #logFeed .entry.growth { color: #5ee6a8; }
+  #logFeed .entry.milestone { color: #ffd166; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    text-align: left; padding: 8px 10px; color: #5c6b62; font-weight: normal;
+    border-bottom: 1px solid #1c2620; white-space: nowrap;
+  }
+  td { padding: 8px 10px; border-bottom: 1px solid #121815; white-space: nowrap; }
+  tr:hover td { background: #0f1512; }
+  .factionName { font-weight: bold; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .barCell { width: 140px; }
+  .bar { height: 6px; background: #1c2620; border-radius: 3px; overflow: hidden; }
+  .bar > div { height: 100%; }
+  .empty { color: #3d4a43; padding: 40px; text-align: center; font-size: 12px; }
+  .section-title { color: #5c6b62; font-size: 11px; margin: 20px 0 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .section-title:first-child { margin-top: 0; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="wsdot" id="wsdot"></div>
+  <h1>kyzu // faction dashboard</h1>
+  <input id="wsUrlInput" value="ws://127.0.0.1:8181" spellcheck="false">
+  <button id="connectBtn">connect</button>
+  <span class="dim" id="statusText">disconnected</span>
+  <span id="tickDisplay">tick: -</span>
+</div>
+
+<div id="main">
+  <div id="statsPane">
+    <div id="factionTableWrap"><div class="empty">not connected</div></div>
+  </div>
+  <div id="logPane">
+    <div id="logHeader">live event feed</div>
+    <div id="logFeed"></div>
+  </div>
+</div>
+
+<script>
+  // ── Connection - identical protocol to the map viewer
+  // (sys.auth -> subscribe -> receive {topic,payload}), just a
+  // different renderer on top. This page has NO relationship to
+  // kyzu.lpr beyond being another bus subscriber - it could be
+  // running on a different machine entirely. ──
+  let ws = null;
+  const wsdot = document.getElementById('wsdot');
+  const statusText = document.getElementById('statusText');
+  const tickDisplay = document.getElementById('tickDisplay');
+  const connectBtn = document.getElementById('connectBtn');
+  const wsUrlInput = document.getElementById('wsUrlInput');
+  const AUTH_TOKEN = 'dashboard';
+
+  function setStatus(connected, text) {
+    wsdot.classList.toggle('up', connected);
+    statusText.textContent = text;
+  }
+
+  function connect() {
+    if (ws) { try { ws.close(); } catch (e) {} }
+    const url = wsUrlInput.value.trim();
+    setStatus(false, 'connecting...');
+    ws = new WebSocket(url);
+
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ method: 'sys.auth', token: AUTH_TOKEN }));
+    });
+
+    ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+
+      if (msg.event === 'auth.ok') {
+        setStatus(true, 'connected as ' + msg.source);
+        ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
+        return;
+      }
+
+      if (!msg.topic) return;
+      handleMessage(msg);
+    });
+
+    ws.addEventListener('close', () => {
+      setStatus(false, 'disconnected - retrying in 3s');
+      setTimeout(connect, 3000);
+    });
+
+    ws.addEventListener('error', () => {
+      setStatus(false, 'connection error');
+    });
+  }
+
+  connectBtn.addEventListener('click', connect);
+  wsUrlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+
+  // ── World model - rebuilt entirely from the event stream, same
+  // principle as the map viewer and the raider bot: this page has no
+  // other source of truth. ──
+  const units = new Map();    // unit_id -> {owner, unitType, level}
+  const cities = new Map();   // city_id -> {owner, population}
+  const roads = new Set();    // road_id (count only, dashboard doesn't need paths)
+
+  function faction(owner) {
+    const key = owner || '(unowned)';
+    if (!stats.has(key)) {
+      stats.set(key, {
+        collected: {}, spent: {},
+        kills: 0, deaths: 0,
+        citiesFounded: 0, citiesCaptured: 0, citiesLost: 0,
+        veteranLevelUps: 0
+      });
+    }
+    return stats.get(key);
+  }
+  const stats = new Map(); // owner -> running counters not derivable from current snapshot alone (kills, totals collected, etc.)
+
+  // A kill needs correlating two events (the hit that reduced HP to 0,
+  // and the despawn that follows it) - tracked briefly here between
+  // the two.
+  const pendingKillCredit = new Map(); // target_unit_id -> attacker owner
+
+  function logEntry(text, cls) {
+    const feed = document.getElementById('logFeed');
+    const div = document.createElement('div');
+    div.className = 'entry' + (cls ? ' ' + cls : '');
+    const time = new Date().toLocaleTimeString();
+    div.innerHTML = '<span class="t">' + time + '</span> ' + text;
+    feed.appendChild(div);
+    // Cap the feed so this tab doesn't grow without bound over a long
+    // session - keep the most recent 300 entries.
+    while (feed.children.length > 300) feed.removeChild(feed.firstChild);
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  function payloadOf(msg) {
+    let p = msg.payload;
+    if (typeof p === 'string') {
+      try { p = JSON.parse(p); } catch (e) { return null; }
+    }
+    return p;
+  }
+
+  function handleMessage(msg) {
+    const topic = msg.topic;
+
+    if (topic === 'game.tick') {
+      const p = payloadOf(msg);
+      if (p) tickDisplay.textContent = 'tick: ' + p.tick;
+      return; // too frequent to log or re-render stats on every single tick
+    }
+
+    const payload = payloadOf(msg);
+    if (!payload) return;
+
+    let dirty = true;
+
+    switch (topic) {
+      case 'game.event.spawned':
+        units.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', level: 0 });
+        break;
+
+      case 'game.event.despawned': {
+        const u = units.get(payload.unit_id);
+        units.delete(payload.unit_id);
+        const credit = pendingKillCredit.get(payload.unit_id);
+        if (credit !== undefined) {
+          faction(credit).kills++;
+          if (u) faction(u.owner).deaths++;
+          pendingKillCredit.delete(payload.unit_id);
+          logEntry('<b>' + (u ? u.owner : '?') + '</b> unit destroyed by <b>' + credit + '</b>', 'combat');
+        }
+        break;
+      }
+
+      case 'game.event.unit_attacked':
+        if (payload.remaining_hp === 0) {
+          pendingKillCredit.set(payload.target_unit_id, payload.by || '');
+        }
+        {
+          const attacker = units.get(payload.attacker_unit_id);
+          if (attacker && payload.attacker_level !== undefined) attacker.level = payload.attacker_level;
+        }
+        logEntry(payload.attacker_unit_id + ' hit ' + payload.target_unit_id + ' for ' + payload.damage, 'combat');
+        break;
+
+      case 'game.event.unit_leveled_up': {
+        const u = units.get(payload.unit_id);
+        if (u) {
+          u.level = payload.level;
+          faction(u.owner).veteranLevelUps++;
+          logEntry('<b>' + u.owner + '</b> unit reached veterancy level ' + payload.level, 'milestone');
+        }
+        break;
+      }
+
+      case 'game.event.city_founded':
+        cities.set(payload.city_id, { owner: payload.owner || '', population: payload.population || 0 });
+        faction(payload.owner || '').citiesFounded++;
+        logEntry('<b>' + (payload.owner || '(unowned)') + '</b> founded ' + payload.city_id, 'growth');
+        break;
+
+      case 'game.event.city_grew': {
+        const c = cities.get(payload.city_id);
+        if (c) c.population = payload.population;
+        break;
+      }
+
+      case 'game.event.city_captured': {
+        const c = cities.get(payload.city_id) || {};
+        const prevOwner = c.owner || payload.previous_owner || '';
+        c.owner = payload.new_owner;
+        c.population = payload.population;
+        cities.set(payload.city_id, c);
+        faction(payload.new_owner).citiesCaptured++;
+        faction(prevOwner).citiesLost++;
+        logEntry('<b>' + payload.new_owner + '</b> captured ' + payload.city_id + ' from <b>' + (prevOwner || '(unowned)') + '</b>', 'combat');
+        break;
+      }
+
+      case 'game.event.city_attacked':
+        logEntry(payload.city_id + ' under siege - ' + payload.population_remaining + ' population left', 'combat');
+        break;
+
+      case 'game.event.city_population_decayed': {
+        const c = cities.get(payload.city_id);
+        if (c) c.population = payload.population;
+        break;
+      }
+
+      case 'game.event.city_abandoned': {
+        const c = cities.get(payload.city_id);
+        cities.delete(payload.city_id);
+        if (c) faction(c.owner).citiesLost++;
+        logEntry('<b>' + (c ? c.owner : '?') + '</b> abandoned ' + payload.city_id, 'combat');
+        break;
+      }
+
+      case 'game.event.road_built':
+        roads.add(payload.road_id);
+        break;
+      case 'game.event.road_removed':
+        roads.delete(payload.road_id);
+        break;
+
+      case 'game.event.collected': {
+        const f = faction(payload.by || '');
+        f.collected[payload.resource_type] = (f.collected[payload.resource_type] || 0) + payload.amount;
+        break;
+      }
+
+      case 'game.event.city_growth_spent':
+      case 'game.event.city_upkeep_spent': {
+        const f = faction(payload.owner || '');
+        if (payload.wood) f.spent.wood = (f.spent.wood || 0) + payload.wood;
+        if (payload.stone) f.spent.stone = (f.spent.stone || 0) + payload.stone;
+        break;
+      }
+
+      // node_list/city_list/road_list/development_* are bulk snapshots
+      // meant for a freshly-connecting map viewer, not incremental
+      // events - the dashboard only needs the incremental stream above
+      // to keep accurate running counters, so those are deliberately
+      // left unhandled here rather than trying to reconcile a full
+      // snapshot against running totals that only make sense as deltas.
+      default:
+        dirty = false;
+    }
+
+    if (dirty) renderStats();
+  }
+
+  function fmtNum(n) {
+    return (n || 0).toLocaleString();
+  }
+
+  function hashColor(str, fallback) {
+    if (!str) return fallback;
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+    return 'hsl(' + (hash % 360) + ', 70%, 60%)';
+  }
+
+  function renderStats() {
+    // Derive current-snapshot figures (population, unit counts, city
+    // counts) fresh from `units`/`cities` every render rather than
+    // tracking them incrementally - unlike kills/collected/spent,
+    // these have a well-defined CURRENT value that's cheap to
+    // recompute and impossible to get subtly wrong via incremental
+    // add/remove bookkeeping.
+    const factionNames = new Set(stats.keys());
+    for (const u of units.values()) factionNames.add(u.owner || '(unowned)');
+    for (const c of cities.values()) factionNames.add(c.owner || '(unowned)');
+    factionNames.delete('(unowned)'); // shown separately would be noise - unowned cities/units aren't "a faction" competing
+
+    const rows = [];
+    let maxPop = 1;
+    for (const name of factionNames) {
+      const s = faction(name);
+      let population = 0, cityCount = 0;
+      for (const c of cities.values()) if ((c.owner || '(unowned)') === name) { population += c.population; cityCount++; }
+
+      const unitCounts = {};
+      let unitTotal = 0, maxLevel = 0;
+      for (const u of units.values()) {
+        if ((u.owner || '(unowned)') !== name) continue;
+        unitCounts[u.unitType] = (unitCounts[u.unitType] || 0) + 1;
+        unitTotal++;
+        if (u.level > maxLevel) maxLevel = u.level;
+      }
+
+      maxPop = Math.max(maxPop, population);
+      rows.push({ name, population, cityCount, unitCounts, unitTotal, maxLevel, s });
+    }
+
+    rows.sort((a, b) => b.population - a.population);
+
+    const wrap = document.getElementById('factionTableWrap');
+    if (rows.length === 0) {
+      wrap.innerHTML = '<div class="empty">waiting for game activity...</div>';
+      return;
+    }
+
+    let html = '<table><thead><tr>' +
+      '<th>faction</th><th class="num">pop</th><th class="barCell"></th>' +
+      '<th class="num">cities</th><th class="num">units</th><th>unit types</th>' +
+      '<th class="num">top lvl</th><th class="num">kills</th><th class="num">deaths</th>' +
+      '<th class="num">captured</th><th class="num">lost</th>' +
+      '<th>collected</th><th>spent</th>' +
+      '</tr></thead><tbody>';
+
+    for (const r of rows) {
+      const color = hashColor(r.name, '#5ee6a8');
+      const barPct = Math.round((r.population / maxPop) * 100);
+      const typesStr = Object.entries(r.unitCounts).map(([t, n]) => t + ':' + n).join(' ') || '-';
+      const collectedStr = Object.entries(r.s.collected).map(([t, n]) => t + ':' + fmtNum(n)).join(' ') || '-';
+      const spentStr = Object.entries(r.s.spent).map(([t, n]) => t + ':' + fmtNum(n)).join(' ') || '-';
+
+      html += '<tr>' +
+        '<td class="factionName" style="color:' + color + '">' + r.name + '</td>' +
+        '<td class="num">' + fmtNum(r.population) + '</td>' +
+        '<td class="barCell"><div class="bar"><div style="width:' + barPct + '%;background:' + color + '"></div></div></td>' +
+        '<td class="num">' + r.cityCount + '</td>' +
+        '<td class="num">' + r.unitTotal + '</td>' +
+        '<td class="dim">' + typesStr + '</td>' +
+        '<td class="num">' + r.maxLevel + '</td>' +
+        '<td class="num">' + r.s.kills + '</td>' +
+        '<td class="num">' + r.s.deaths + '</td>' +
+        '<td class="num">' + r.s.citiesCaptured + '</td>' +
+        '<td class="num">' + r.s.citiesLost + '</td>' +
+        '<td class="dim">' + collectedStr + '</td>' +
+        '<td class="dim">' + spentStr + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  }
+
+  connect();
+</script>
+</body>
+</html>
