@@ -9,85 +9,11 @@ uses
   SysUtils, Classes, Math, SyncObjs, Generics.Collections, fpjson, jsonparser,
   kyzu_bakeconfig, kyzu_pathfinding;
 
-const
-  // Grid cells per tick at move_cost=1.0 - first-pass tuning value, same
-  // spirit as the move_cost numbers themselves: adjust once actual
-  // gameplay pacing is something to judge against, not before.
-  BaseSpeed = 0.15;
-  // How close (in grid cells) a unit must be to a node to collect from
-  // it, and how much a single collect command takes - both first-pass
-  // tuning values, same spirit as BaseSpeed above.
-  CollectRadiusCells = 1.5;
-  CollectAmountPerAction = 10;
-  // City/development tuning - first-pass values, same spirit as BaseSpeed.
-  CityInitialPopulation = 10;
-  CityGrowthAmount = 1;         // population gained per growth step
-  // First-pass growth recipe, hardcoded to the "wood"/"stone" resource
-  // types resource_nodes.json actually seeds - if new resource types get
-  // added that cities should consume instead of (or alongside) these,
-  // this is the place to extend. An unowned city (Owner = '') has no
-  // ledger to charge and keeps growing on the timer alone, same as
-  // before this feature existed.
-  CityGrowthWoodCost = 5;
-  CityGrowthStoneCost = 2;
-  CityGrowthTicks = 40;         // ticks between growth steps (~2s @ 20 ticks/sec)
-  CityMaxPopulation = 5000;
-  DevelopmentRadiusCells = 12;  // max distance a mature city's density reaches
-  DevelopmentUpdateTicks = 20;  // recompute/broadcast interval (~1s)
-  RoadDevelopmentRadiusCells = 2;
-  DevelopmentBroadcastThreshold = 2; // ignore sub-threshold quantized changes
-  // Combat tuning - first-pass values, same spirit as BaseSpeed. Reuses
-  // CollectRadiusCells' distance idiom rather than inventing a separate
-  // one, since "close enough to act on" means the same thing here as it
-  // does for collecting.
-  AttackRangeCells = 1.5;
-  // A city's Population doubles as its defense pool - no separate HP
-  // field needed. Deliberate: a captured city being freshly decimated
-  // ties combat back into the same growth loop everything else already
-  // feeds, rather than adding a third parallel numeric resource.
-  SiegeDamagePerAttack = 20;
-  CityCaptureResetPopulation = 10; // population the city starts at under its new owner
-  // Upkeep runs on its OWN clock (LastUpkeepTick), deliberately separate
-  // from LastGrowthTick - if it shared the growth clock, a city stalled
-  // on an unaffordable growth cost would get re-charged upkeep every
-  // single tick until growth became affordable, since growth's "stall
-  // and retry immediately" behavior never advances that shared clock.
-  // An unowned city has no ledger to charge and never decays, same
-  // "nobody to charge" exemption growth already uses.
-  CityUpkeepTicks = 60;  // ~3s at 20 ticks/sec - a bit slower than growth's cadence, decay shouldn't feel twitchy
-  CityUpkeepCost = 1;    // wood per upkeep cycle - cheap; decay signals a genuinely empty stockpile, not routine friction
-  // Waived entirely if the city has a road to another city under the
-  // same owner - infrastructure sustains it instead of raw stockpile,
-  // which is what actually gives roads a reason to exist beyond decor.
-  CityDecayAmount = 5;   // population lost per unpaid upkeep cycle
-  // A single autonomous AI faction, driven entirely from the tick loop
-  // via internal calls into HandleSpawn/HandleMove/HandleCollect - it
-  // plays by exactly the same rules a human faction does (ownership
-  // checks, movement costs, node depletion), just issuing its own
-  // commands instead of a client's. It needs an owned city to already
-  // exist (seeded via cities.json) - it never bootstraps one for
-  // itself, keeping its logic scoped to "run an economy", not "start
-  // a civilization from nothing".
-  AiFactionName = 'ai';
-  AiTickInterval = 40; // ~2s at 20 ticks/sec - how often it considers spawning a new worker
-  AiTargetWorkerCount = 2;
-  // Veterancy: a unit that lands a hit in unit-vs-unit combat gains XP
-  // and eventually levels up, permanently boosting its own Attack/MaxHP
-  // (and healing it by the HP bonus on the level-up itself - a reward
-  // for surviving to level up, not just a higher ceiling a wounded unit
-  // doesn't benefit from). Deliberately scoped to unit-vs-unit only,
-  // not sieging a city - "gets better at fighting soldiers" is a
-  // cleaner story than "gets better at farming population", and it
-  // keeps city_attacked/city_captured's payload shape untouched.
-  // This is exactly the kind of thing a raider-strategy AI controller
-  // can optimize for that a purely passive economy AI never has a
-  // reason to: keeping veterans alive instead of treating units as
-  // disposable.
-  VeterancyXPPerHit = 10;
-  VeterancyXPPerLevel = 30; // XP needed to go from Level to Level+1 is (Level+1) * this
-  VeterancyMaxLevel = 3;
-  VeterancyAttackBonusPerLevel = 5;
-  VeterancyHPBonusPerLevel = 10;
+// All former first-pass tuning constants (Balance.BaseSpeed, growth/upkeep
+// costs, combat ranges, veterancy thresholds, etc.) now live in the
+// Balance global (TGameBalance, loaded from game_balance.json) rather
+// than as compile-time const values here - see the type's own comment
+// for what stayed in code vs what moved to config.
 
 type
   TUnit = record
@@ -98,8 +24,8 @@ type
     Path: TGridPath;
     PathIndex: Integer; // index of the path node the unit is currently departing from
     HP: Integer;    // current hit points, initialized from UnitDefs[UnitType].MaxHP at spawn
-    XP: Integer;     // combat experience - see VeterancyXPPerHit/VeterancyMaxLevel
-    Level: Integer;  // 0 = green, up to VeterancyMaxLevel - boosts effective Attack/MaxHP
+    XP: Integer;     // combat experience - see Balance.VeterancyXPPerHit/Balance.VeterancyMaxLevel
+    Level: Integer;  // 0 = green, up to Balance.VeterancyMaxLevel - boosts effective Attack/MaxHP
   end;
 
   // Static resource nodes - placed once from resource_nodes.json at
@@ -169,6 +95,65 @@ type
     Attack: Integer;
   end;
 
+  // One line of a resource cost - "5 wood", "2 stone". Growth and
+  // upkeep costs are both just lists of these rather than fixed
+  // wood/stone fields, so a NEW resource type (anything seeded in
+  // resource_nodes.json) can be made part of either cost purely by
+  // editing game_balance.json - no code change, no recompile.
+  TResourceCost = record
+    ResourceType: string;
+    Amount: Integer;
+  end;
+  TResourceCostList = array of TResourceCost;
+
+  // Every first-pass tuning number in the game, loaded once at startup
+  // from game_balance.json (see LoadGameBalance) with defaults that
+  // exactly match what used to be hardcoded const values - editing the
+  // JSON and restarting the server is now how you rebalance the game,
+  // not editing this source file. What's deliberately NOT in here: the
+  // actual mechanics (why upkeep runs on its own clock, how damage is
+  // computed, the density falloff shape) - those are relationships
+  // between numbers, not the numbers themselves, and turning THOSE
+  // into data would mean building a small rules/expression engine,
+  // not a config file. This only externalizes the inputs to formulas
+  // that stay in code.
+  TGameBalance = record
+    BaseSpeed: Double;
+    CollectRadiusCells: Double;
+    CollectAmountPerAction: Integer;
+
+    CityInitialPopulation: Integer;
+    CityGrowthAmount: Integer;
+    CityGrowthTicks: Integer;
+    CityMaxPopulation: Integer;
+    CityGrowthCost: TResourceCostList;
+
+    DevelopmentRadiusCells: Double;
+    DevelopmentMinRadiusCells: Double;
+    DevelopmentUpdateTicks: Integer;
+    RoadDevelopmentRadiusCells: Integer; // used as a raw FOR-loop bound (see RecomputeDevelopment) - must stay a whole number of cells, unlike the other *Cells fields which are fractional distance thresholds
+    RoadDevelopmentPeak: Double;
+    DevelopmentBroadcastThreshold: Integer;
+
+    AttackRangeCells: Double;
+    SiegeDamagePerAttack: Integer;
+    CityCaptureResetPopulation: Integer;
+
+    CityUpkeepTicks: Integer;
+    CityUpkeepCost: TResourceCostList;
+    CityDecayAmount: Integer;
+
+    AiFactionName: string;
+    AiTickInterval: Integer;
+    AiTargetWorkerCount: Integer;
+
+    VeterancyXPPerHit: Integer;
+    VeterancyXPPerLevel: Integer;
+    VeterancyMaxLevel: Integer;
+    VeterancyAttackBonusPerLevel: Integer;
+    VeterancyHPBonusPerLevel: Integer;
+  end;
+
 // StdErr is buffered by default and only auto-flushes on a clean, natural
 // exit - a forceful kill (VDRX's normal way of stopping this process)
 // loses anything not explicitly flushed. Confirmed by direct test: an
@@ -198,6 +183,7 @@ var
   Roads: specialize TDictionary<string, TRoad>;
   Density: specialize TDictionary<string, TDensityCell>; // key: "<gx>,<gy>" - sparse, untouched cells are simply absent
   UnitDefs: specialize TDictionary<string, TUnitDef>; // key: TypeID - static registry, loaded once at startup
+  Balance: TGameBalance; // every tunable number in the game - see LoadGameBalance
   // unit_id -> node_id, the AI's memory of which node each of its
   // workers is currently headed for/working. Touched ONLY from RunAI,
   // which itself only ever runs on the single main tick-loop thread -
@@ -396,6 +382,163 @@ begin
     Result := DefaultUnitDef;
 end;
 
+// Every value here is exactly what used to be a hardcoded const in
+// this file - used both as the compiled-in fallback when
+// game_balance.json is missing/malformed, and as the starting point
+// LoadGameBalance overrides field-by-field, so a config file that only
+// sets a handful of keys still gets sane values for everything else.
+function DefaultGameBalance: TGameBalance;
+begin
+  Result.BaseSpeed := 0.15;
+  Result.CollectRadiusCells := 1.5;
+  Result.CollectAmountPerAction := 10;
+
+  Result.CityInitialPopulation := 10;
+  Result.CityGrowthAmount := 1;
+  Result.CityGrowthTicks := 40;
+  Result.CityMaxPopulation := 5000;
+  SetLength(Result.CityGrowthCost, 2);
+  Result.CityGrowthCost[0].ResourceType := 'wood';
+  Result.CityGrowthCost[0].Amount := 5;
+  Result.CityGrowthCost[1].ResourceType := 'stone';
+  Result.CityGrowthCost[1].Amount := 2;
+
+  Result.DevelopmentRadiusCells := 12;
+  Result.DevelopmentMinRadiusCells := 3;
+  Result.DevelopmentUpdateTicks := 20;
+  Result.RoadDevelopmentRadiusCells := 2;
+  Result.RoadDevelopmentPeak := 60.0;
+  Result.DevelopmentBroadcastThreshold := 2;
+
+  Result.AttackRangeCells := 1.5;
+  Result.SiegeDamagePerAttack := 20;
+  Result.CityCaptureResetPopulation := 10;
+
+  Result.CityUpkeepTicks := 60;
+  SetLength(Result.CityUpkeepCost, 1);
+  Result.CityUpkeepCost[0].ResourceType := 'wood';
+  Result.CityUpkeepCost[0].Amount := 1;
+  Result.CityDecayAmount := 5;
+
+  Result.AiFactionName := 'ai';
+  Result.AiTickInterval := 40;
+  Result.AiTargetWorkerCount := 2;
+
+  Result.VeterancyXPPerHit := 10;
+  Result.VeterancyXPPerLevel := 30;
+  Result.VeterancyMaxLevel := 3;
+  Result.VeterancyAttackBonusPerLevel := 5;
+  Result.VeterancyHPBonusPerLevel := 10;
+end;
+
+// Parses a JSON array of {"resource_type":"...", "amount":N} objects -
+// shared by both CityGrowthCost and CityUpkeepCost, since a growth
+// recipe and an upkeep bill are the same shape of thing.
+function ParseResourceCostList(AArr: TJSONArray): TResourceCostList;
+var
+  i: Integer;
+  Obj: TJSONObject;
+begin
+  SetLength(Result, AArr.Count);
+  for i := 0 to AArr.Count - 1 do
+  begin
+    Obj := TJSONObject(AArr.Items[i]);
+    Result[i].ResourceType := Obj.Get('resource_type', '');
+    Result[i].Amount := Obj.Get('amount', 0);
+  end;
+end;
+
+// Loads game_balance.json at startup, starting from DefaultGameBalance
+// and overriding only the keys actually present - same tolerant,
+// non-fatal pattern as LoadResourceNodes/LoadCities/LoadUnitTypes. A
+// missing, malformed, or partial file just means some or all values
+// fall back to exactly what used to be hardcoded, so this can never
+// make the server refuse to start.
+function LoadGameBalance(const AFilename: string): TGameBalance;
+var
+  Data: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+  F: TextFile;
+  Line, JSONText: string;
+begin
+  Result := DefaultGameBalance;
+
+  if not FileExists(AFilename) then
+  begin
+    LogDiag('No game_balance.json at ' + AFilename + ' - using built-in defaults for every value.');
+    Exit;
+  end;
+
+  JSONText := '';
+  AssignFile(F, AFilename);
+  Reset(F);
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      JSONText := JSONText + Line;
+    end;
+  finally
+    CloseFile(F);
+  end;
+
+  try
+    Data := GetJSON(JSONText);
+  except
+    LogDiag('game_balance.json is not valid JSON - using built-in defaults for every value.');
+    Exit;
+  end;
+
+  try
+    if Data.JSONType <> jtObject then Exit;
+    Obj := TJSONObject(Data);
+
+    Result.BaseSpeed := Obj.Get('base_speed', Result.BaseSpeed);
+    Result.CollectRadiusCells := Obj.Get('collect_radius_cells', Result.CollectRadiusCells);
+    Result.CollectAmountPerAction := Obj.Get('collect_amount_per_action', Result.CollectAmountPerAction);
+
+    Result.CityInitialPopulation := Obj.Get('city_initial_population', Result.CityInitialPopulation);
+    Result.CityGrowthAmount := Obj.Get('city_growth_amount', Result.CityGrowthAmount);
+    Result.CityGrowthTicks := Obj.Get('city_growth_ticks', Result.CityGrowthTicks);
+    Result.CityMaxPopulation := Obj.Get('city_max_population', Result.CityMaxPopulation);
+    Arr := TJSONArray(Obj.Find('city_growth_cost'));
+    if Assigned(Arr) and (Arr.JSONType = jtArray) then
+      Result.CityGrowthCost := ParseResourceCostList(Arr);
+
+    Result.DevelopmentRadiusCells := Obj.Get('development_radius_cells', Result.DevelopmentRadiusCells);
+    Result.DevelopmentMinRadiusCells := Obj.Get('development_min_radius_cells', Result.DevelopmentMinRadiusCells);
+    Result.DevelopmentUpdateTicks := Obj.Get('development_update_ticks', Result.DevelopmentUpdateTicks);
+    Result.RoadDevelopmentRadiusCells := Obj.Get('road_development_radius_cells', Result.RoadDevelopmentRadiusCells);
+    Result.RoadDevelopmentPeak := Obj.Get('road_development_peak', Result.RoadDevelopmentPeak);
+    Result.DevelopmentBroadcastThreshold := Obj.Get('development_broadcast_threshold', Result.DevelopmentBroadcastThreshold);
+
+    Result.AttackRangeCells := Obj.Get('attack_range_cells', Result.AttackRangeCells);
+    Result.SiegeDamagePerAttack := Obj.Get('siege_damage_per_attack', Result.SiegeDamagePerAttack);
+    Result.CityCaptureResetPopulation := Obj.Get('city_capture_reset_population', Result.CityCaptureResetPopulation);
+
+    Result.CityUpkeepTicks := Obj.Get('city_upkeep_ticks', Result.CityUpkeepTicks);
+    Arr := TJSONArray(Obj.Find('city_upkeep_cost'));
+    if Assigned(Arr) and (Arr.JSONType = jtArray) then
+      Result.CityUpkeepCost := ParseResourceCostList(Arr);
+    Result.CityDecayAmount := Obj.Get('city_decay_amount', Result.CityDecayAmount);
+
+    Result.AiFactionName := Obj.Get('ai_faction_name', Result.AiFactionName);
+    Result.AiTickInterval := Obj.Get('ai_tick_interval', Result.AiTickInterval);
+    Result.AiTargetWorkerCount := Obj.Get('ai_target_worker_count', Result.AiTargetWorkerCount);
+
+    Result.VeterancyXPPerHit := Obj.Get('veterancy_xp_per_hit', Result.VeterancyXPPerHit);
+    Result.VeterancyXPPerLevel := Obj.Get('veterancy_xp_per_level', Result.VeterancyXPPerLevel);
+    Result.VeterancyMaxLevel := Obj.Get('veterancy_max_level', Result.VeterancyMaxLevel);
+    Result.VeterancyAttackBonusPerLevel := Obj.Get('veterancy_attack_bonus_per_level', Result.VeterancyAttackBonusPerLevel);
+    Result.VeterancyHPBonusPerLevel := Obj.Get('veterancy_hp_bonus_per_level', Result.VeterancyHPBonusPerLevel);
+
+    LogDiag('Loaded game_balance.json.');
+  finally
+    Data.Free;
+  end;
+end;
+
 // Loads unit type definitions from unit_types.json at startup - same
 // tolerant, non-fatal loading pattern as LoadResourceNodes/LoadCities. A
 // missing or malformed file just means every unit type falls back to
@@ -520,7 +663,7 @@ begin
       C.Owner := Obj.Get('owner', '');
       C.GX := LonToGridX(Obj.Get('lon', 0.0));
       C.GY := LatToGridY(Obj.Get('lat', 0.0));
-      C.Population := Obj.Get('population', CityInitialPopulation);
+      C.Population := Obj.Get('population', Balance.CityInitialPopulation);
       C.LastGrowthTick := 0;
       C.LastUpkeepTick := 0;
       Cities.AddOrSetValue(C.ID, C);
@@ -810,7 +953,7 @@ begin
       else
       begin
         Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
-        if Dist > CollectRadiusCells then
+        if Dist > Balance.CollectRadiusCells then
           Reason := 'too far'
         else if Node.Amount <= 0 then
           Reason := 'depleted'
@@ -820,7 +963,7 @@ begin
           // more per action via CollectMultiplier - the gate above
           // (CanCollect) decides WHO can collect at all, this decides
           // how much a type that can collect actually gets.
-          Taken := Round(CollectAmountPerAction * UnitDef.CollectMultiplier);
+          Taken := Round(Balance.CollectAmountPerAction * UnitDef.CollectMultiplier);
           if Taken > Node.Amount then Taken := Node.Amount;
           Node.Amount := Node.Amount - Taken;
           Nodes.AddOrSetValue(NodeID, Node);
@@ -996,7 +1139,7 @@ begin
   C.Owner := Owner;
   C.GX := GX;
   C.GY := GY;
-  C.Population := CityInitialPopulation;
+  C.Population := Balance.CityInitialPopulation;
   C.LastGrowthTick := Tick;
   C.LastUpkeepTick := Tick;
 
@@ -1014,14 +1157,90 @@ begin
 end;
 
 // Grows every city's population by a fixed step once every
-// CityGrowthTicks ticks - simple time-based growth for a first pass,
-// same tuning-constant spirit as BaseSpeed. An OWNED city's growth now
-// also costs CityGrowthWoodCost/CityGrowthStoneCost out of its owner's
+// Balance.CityGrowthTicks ticks - simple time-based growth for a first pass,
+// same tuning-constant spirit as Balance.BaseSpeed. An OWNED city's growth now
+// also costs Balance.CityGrowthCost out of its owner's
 // ledger - ties resource collection back into this loop instead of
 // population climbing for free forever. An unowned (neutral/seed) city
 // has nobody to charge and keeps growing on the timer alone. Called
 // once per tick from the main loop; the per-city interval check keeps
 // it a no-op for idle cities rather than a busy poll.
+
+// True if AOwner's ledger currently holds at least ACosts' amount of
+// EVERY resource type it lists - checked as one atomic pass under
+// LedgerLock so a concurrent collect/spend can't be observed mid-check
+// (all-or-nothing, same guarantee the old fixed wood+stone check had).
+// An empty cost list is trivially always affordable.
+function CanAffordCost(const AOwner: string; const ACosts: TResourceCostList): Boolean;
+var
+  i, Total: Integer;
+begin
+  Result := True;
+  if Length(ACosts) = 0 then Exit;
+  LedgerLock.Enter;
+  try
+    for i := 0 to High(ACosts) do
+    begin
+      Total := 0;
+      Ledger.TryGetValue(AOwner + '|' + ACosts[i].ResourceType, Total);
+      if Total < ACosts[i].Amount then
+      begin
+        Result := False;
+        Break;
+      end;
+    end;
+  finally
+    LedgerLock.Leave;
+  end;
+end;
+
+// Deducts every line of ACosts from AOwner's ledger. Caller must have
+// already confirmed CanAffordCost - this doesn't re-check. Clamped at
+// 0 as defense-in-depth (should never actually trigger during live
+// play since CanAffordCost already gated it, but replay reuses this
+// same function and a defensive floor costs nothing here).
+procedure DeductCost(const AOwner: string; const ACosts: TResourceCostList);
+var
+  i, Total: Integer;
+  Key: string;
+begin
+  LedgerLock.Enter;
+  try
+    for i := 0 to High(ACosts) do
+    begin
+      Key := AOwner + '|' + ACosts[i].ResourceType;
+      Total := 0;
+      Ledger.TryGetValue(Key, Total);
+      Total := Total - ACosts[i].Amount;
+      if Total < 0 then Total := 0;
+      Ledger.AddOrSetValue(Key, Total);
+    end;
+  finally
+    LedgerLock.Leave;
+  end;
+end;
+
+// Renders a cost list as a JSON array of {"resource_type":...,"amount":...}
+// objects - the generic shape city_growth_spent/city_upkeep_spent both
+// broadcast now, replacing the old fixed wood/stone fields. Returns
+// PLAIN unescaped JSON (normal quote characters) - callers embedding
+// this into a LogEvent line use it as-is (events.jsonl lines are flat,
+// single-level JSON), while SendLine callers need to
+// StringReplace(..., '"', '\"', ...) the result first, same as every
+// other nested-array payload in this file (see HandleListCities et al).
+function CostsToJSON(const ACosts: TResourceCostList): string;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(ACosts) do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + Format('{"resource_type":"%s","amount":%d}', [ACosts[i].ResourceType, ACosts[i].Amount]);
+  end;
+  Result := Result + ']';
+end;
+
 procedure GrowCities;
 var
   Keys: array of string;
@@ -1029,8 +1248,6 @@ var
   C: TCity;
   Pair: specialize TPair<string, TCity>;
   KeyIdx: Integer;
-  WoodKey, StoneKey: string;
-  WoodTotal, StoneTotal: Integer;
   CanAfford: Boolean;
 begin
   CitiesLock.Enter;
@@ -1055,38 +1272,23 @@ begin
       CitiesLock.Leave;
     end;
 
-    if (C.Population >= CityMaxPopulation) or (Tick - C.LastGrowthTick < CityGrowthTicks) then
+    if (C.Population >= Balance.CityMaxPopulation) or (Tick - C.LastGrowthTick < Balance.CityGrowthTicks) then
       Continue;
 
     CanAfford := True;
-    WoodTotal := 0;
-    StoneTotal := 0;
     if C.Owner <> '' then
     begin
-      WoodKey := C.Owner + '|wood';
-      StoneKey := C.Owner + '|stone';
-      LedgerLock.Enter;
-      try
-        Ledger.TryGetValue(WoodKey, WoodTotal);
-        Ledger.TryGetValue(StoneKey, StoneTotal);
-        CanAfford := (WoodTotal >= CityGrowthWoodCost) and (StoneTotal >= CityGrowthStoneCost);
-        if CanAfford then
-        begin
-          Ledger.AddOrSetValue(WoodKey, WoodTotal - CityGrowthWoodCost);
-          Ledger.AddOrSetValue(StoneKey, StoneTotal - CityGrowthStoneCost);
-        end;
-      finally
-        LedgerLock.Leave;
-      end;
+      CanAfford := CanAffordCost(C.Owner, Balance.CityGrowthCost);
+      if CanAfford then DeductCost(C.Owner, Balance.CityGrowthCost);
     end;
 
     // Not affordable yet - LastGrowthTick is left untouched so this city
     // is simply re-checked next tick rather than waiting a full
-    // CityGrowthTicks interval once resources finally show up.
+    // Balance.CityGrowthTicks interval once resources finally show up.
     if not CanAfford then Continue;
 
-    C.Population := C.Population + CityGrowthAmount;
-    if C.Population > CityMaxPopulation then C.Population := CityMaxPopulation;
+    C.Population := C.Population + Balance.CityGrowthAmount;
+    if C.Population > Balance.CityMaxPopulation then C.Population := Balance.CityMaxPopulation;
     C.LastGrowthTick := Tick;
 
     CitiesLock.Enter;
@@ -1096,12 +1298,13 @@ begin
       CitiesLock.Leave;
     end;
 
-    if C.Owner <> '' then
+    if (C.Owner <> '') and (Length(Balance.CityGrowthCost) > 0) then
     begin
-      LogEvent(Format('{"type":"city_growth_spent","city_id":"%s","owner":"%s","wood":%d,"stone":%d}',
-        [Keys[i], C.Owner, CityGrowthWoodCost, CityGrowthStoneCost]));
-      SendLine(Format('{"topic":"game.event.city_growth_spent","payload":"{\"city_id\":\"%s\",\"owner\":\"%s\",\"wood\":%d,\"stone\":%d}"}',
-        [Keys[i], C.Owner, CityGrowthWoodCost, CityGrowthStoneCost]));
+      LogEvent(Format('{"type":"city_growth_spent","city_id":"%s","owner":"%s","costs":%s}',
+        [Keys[i], C.Owner, CostsToJSON(Balance.CityGrowthCost)]));
+      SendLine('{"topic":"game.event.city_growth_spent","payload":"{\"city_id\":\"' + Keys[i] +
+        '\",\"owner\":\"' + C.Owner + '\",\"costs\":' +
+        StringReplace(CostsToJSON(Balance.CityGrowthCost), '"', '\"', [rfReplaceAll]) + '}"}');
     end;
 
     LogEvent(Format('{"type":"city_grew","city_id":"%s","population":%d}', [Keys[i], C.Population]));
@@ -1160,9 +1363,9 @@ begin
 end;
 
 // Runs on its own clock (LastUpkeepTick), independent of growth - see
-// the CityUpkeepTicks comment for why sharing the growth clock would
+// the Balance.CityUpkeepTicks comment for why sharing the growth clock would
 // misbehave. A road-connected city's upkeep is free (infrastructure
-// sustains it); an isolated owned city must pay CityUpkeepCost wood
+// sustains it); an isolated owned city must pay its Balance.CityUpkeepCost
 // out of its owner's ledger or its population decays. Population
 // hitting zero abandons the city entirely - it's removed from Cities,
 // not just left at zero, since a city with zero population isn't
@@ -1214,8 +1417,6 @@ var
   C: TCity;
   Pair: specialize TPair<string, TCity>;
   KeyIdx: Integer;
-  WoodKey: string;
-  WoodTotal: Integer;
   Connected, Paid: Boolean;
   NewPop: Integer;
 begin
@@ -1243,7 +1444,7 @@ begin
 
     // Unowned cities have no ledger to charge and never decay, same
     // exemption GrowCities gives them.
-    if (C.Owner = '') or (Tick - C.LastUpkeepTick < CityUpkeepTicks) then
+    if (C.Owner = '') or (Tick - C.LastUpkeepTick < Balance.CityUpkeepTicks) then
       Continue;
 
     Connected := IsCityRoadConnected(Keys[i], C.Owner);
@@ -1261,17 +1462,8 @@ begin
       Continue;
     end;
 
-    WoodKey := C.Owner + '|wood';
-    WoodTotal := 0;
-    LedgerLock.Enter;
-    try
-      Ledger.TryGetValue(WoodKey, WoodTotal);
-      Paid := WoodTotal >= CityUpkeepCost;
-      if Paid then
-        Ledger.AddOrSetValue(WoodKey, WoodTotal - CityUpkeepCost);
-    finally
-      LedgerLock.Leave;
-    end;
+    Paid := CanAffordCost(C.Owner, Balance.CityUpkeepCost);
+    if Paid then DeductCost(C.Owner, Balance.CityUpkeepCost);
 
     C.LastUpkeepTick := Tick;
 
@@ -1283,15 +1475,21 @@ begin
       finally
         CitiesLock.Leave;
       end;
-      LogEvent(Format('{"type":"city_upkeep_spent","city_id":"%s","owner":"%s","wood":%d}', [Keys[i], C.Owner, CityUpkeepCost]));
-      SendLine(Format('{"topic":"game.event.city_upkeep_spent","payload":"{\"city_id\":\"%s\",\"owner\":\"%s\",\"wood\":%d}"}', [Keys[i], C.Owner, CityUpkeepCost]));
+      if Length(Balance.CityUpkeepCost) > 0 then
+      begin
+        LogEvent(Format('{"type":"city_upkeep_spent","city_id":"%s","owner":"%s","costs":%s}',
+          [Keys[i], C.Owner, CostsToJSON(Balance.CityUpkeepCost)]));
+        SendLine('{"topic":"game.event.city_upkeep_spent","payload":"{\"city_id\":\"' + Keys[i] +
+          '\",\"owner\":\"' + C.Owner + '\",\"costs\":' +
+          StringReplace(CostsToJSON(Balance.CityUpkeepCost), '"', '\"', [rfReplaceAll]) + '}"}');
+      end;
       Continue;
     end;
 
     // Couldn't pay - decay instead. An empty stockpile is the actual
-    // signal here (CityUpkeepCost is deliberately cheap), so this
-    // should be rare for an actively-collecting player.
-    NewPop := C.Population - CityDecayAmount;
+    // signal here (upkeep costs are deliberately cheap by default), so
+    // this should be rare for an actively-collecting player.
+    NewPop := C.Population - Balance.CityDecayAmount;
 
     if NewPop <= 0 then
     begin
@@ -1359,7 +1557,7 @@ begin
   CitiesLock.Enter;
   try
     for CityPair in Cities do
-      if CityPair.Value.Owner = AiFactionName then
+      if CityPair.Value.Owner = Balance.AiFactionName then
       begin
         AiCity := CityPair.Value;
         HasAiCity := True;
@@ -1377,7 +1575,7 @@ begin
     KeyIdx := 0;
     for UnitPair in Units do
     begin
-      if (UnitPair.Value.Owner = AiFactionName) and (UnitPair.Value.UnitType = 'worker') then
+      if (UnitPair.Value.Owner = Balance.AiFactionName) and (UnitPair.Value.UnitType = 'worker') then
         Inc(WorkerCount);
       UnitKeys[KeyIdx] := UnitPair.Key;
       Inc(KeyIdx);
@@ -1386,11 +1584,11 @@ begin
     UnitsLock.Leave;
   end;
 
-  if (Tick mod AiTickInterval = 0) and (WorkerCount < AiTargetWorkerCount) then
+  if (Tick mod Balance.AiTickInterval = 0) and (WorkerCount < Balance.AiTargetWorkerCount) then
   begin
     NewUnitID := 'ai_w_' + IntToStr(Tick) + '_' + IntToStr(WorkerCount);
     PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"worker"}',
-      [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AiFactionName]);
+      [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), Balance.AiFactionName]);
     PayloadData := GetJSON(PayloadStr);
     try
       HandleSpawn(TJSONObject(PayloadData));
@@ -1408,7 +1606,7 @@ begin
       UnitsLock.Leave;
     end;
 
-    if (U.Owner <> AiFactionName) or (U.UnitType <> 'worker') then Continue;
+    if (U.Owner <> Balance.AiFactionName) or (U.UnitType <> 'worker') then Continue;
 
     if not AiUnitTargets.TryGetValue(UnitKeys[i], AssignedNodeID) then
       AssignedNodeID := '';
@@ -1450,9 +1648,9 @@ begin
 
     Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
 
-    if Dist <= CollectRadiusCells then
+    if Dist <= Balance.CollectRadiusCells then
     begin
-      PayloadStr := Format('{"unit_id":"%s","node_id":"%s","by":"%s"}', [UnitKeys[i], AssignedNodeID, AiFactionName]);
+      PayloadStr := Format('{"unit_id":"%s","node_id":"%s","by":"%s"}', [UnitKeys[i], AssignedNodeID, Balance.AiFactionName]);
       PayloadData := GetJSON(PayloadStr);
       try
         HandleCollect(TJSONObject(PayloadData));
@@ -1468,7 +1666,7 @@ begin
       TargetLon := GridToLon(Node.GX);
       TargetLat := GridToLat(Node.GY);
       PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-        [UnitKeys[i], TargetLon, TargetLat, AiFactionName]);
+        [UnitKeys[i], TargetLon, TargetLat, Balance.AiFactionName]);
       PayloadData := GetJSON(PayloadStr);
       try
         HandleMove(TJSONObject(PayloadData));
@@ -1617,7 +1815,7 @@ begin
 end;
 
 // Recomputes the whole density field from Cities+Roads every
-// DevelopmentUpdateTicks ticks. A full recompute (not incremental
+// Balance.DevelopmentUpdateTicks ticks. A full recompute (not incremental
 // deltas) is cheap at this map's scale and can never drift from what
 // actually exists. Density itself is NEVER logged to events.jsonl -
 // it's a deterministic function of city population + road paths at any
@@ -1644,7 +1842,12 @@ begin
     try
       for C in Cities.Values do
       begin
-        radius := Min(DevelopmentRadiusCells, Round(3 + DevelopmentRadiusCells * (C.Population / CityMaxPopulation)));
+        // Both Min() args are Double now (Balance fields), so the
+        // whole expression is computed in Double space and Round()ed
+        // once at the end into the Integer `radius` this loop needs -
+        // Min() has no mixed Double/Integer overload to fall back on.
+        radius := Round(Min(Balance.DevelopmentRadiusCells,
+          Balance.DevelopmentMinRadiusCells + Balance.DevelopmentRadiusCells * (C.Population / Balance.CityMaxPopulation)));
         for gy := C.GY - radius to C.GY + radius do
           for gx := C.GX - radius to C.GX + radius do
           begin
@@ -1656,7 +1859,7 @@ begin
             // Squared falloff gives a denser core with a softer edge,
             // rather than a linear cone - reads more like an actual
             // urban footprint on the map.
-            val := falloff * falloff * (C.Population / CityMaxPopulation) * 255.0;
+            val := falloff * falloff * (C.Population / Balance.CityMaxPopulation) * 255.0;
             key := DensityKey(gx, gy);
             if Contrib.TryGetValue(key, Cell) then
             begin
@@ -1685,15 +1888,15 @@ begin
     try
       for R in Roads.Values do
         for i := 0 to High(R.Path) do
-          for gy := R.Path[i].Y - RoadDevelopmentRadiusCells to R.Path[i].Y + RoadDevelopmentRadiusCells do
-            for gx := R.Path[i].X - RoadDevelopmentRadiusCells to R.Path[i].X + RoadDevelopmentRadiusCells do
+          for gy := R.Path[i].Y - Balance.RoadDevelopmentRadiusCells to R.Path[i].Y + Balance.RoadDevelopmentRadiusCells do
+            for gx := R.Path[i].X - Balance.RoadDevelopmentRadiusCells to R.Path[i].X + Balance.RoadDevelopmentRadiusCells do
             begin
               if (gx < 0) or (gx >= Grid.Width) or (gy < 0) or (gy >= Grid.Height) then Continue;
               dx := gx - R.Path[i].X; dy := gy - R.Path[i].Y;
               dist := Sqrt(dx * dx + dy * dy);
-              if dist > RoadDevelopmentRadiusCells then Continue;
-              falloff := 1.0 - (dist / RoadDevelopmentRadiusCells);
-              val := falloff * 60.0; // a modest fixed contribution, well below a mature city's peak
+              if dist > Balance.RoadDevelopmentRadiusCells then Continue;
+              falloff := 1.0 - (dist / Balance.RoadDevelopmentRadiusCells);
+              val := falloff * Balance.RoadDevelopmentPeak;
               key := DensityKey(gx, gy);
               if Contrib.TryGetValue(key, Cell) then
               begin
@@ -1724,7 +1927,7 @@ begin
         NewDensity.Add(Pair.Key, Cell);
         OldCell.Level := 0;
         Density.TryGetValue(Pair.Key, OldCell);
-        if Abs(Integer(Cell.Level) - Integer(OldCell.Level)) >= DevelopmentBroadcastThreshold then
+        if Abs(Integer(Cell.Level) - Integer(OldCell.Level)) >= Balance.DevelopmentBroadcastThreshold then
         begin
           if not First then DeltaJSON := DeltaJSON + ',';
           First := False;
@@ -1742,7 +1945,7 @@ begin
       for Pair in Density do
       begin
         if Contrib.ContainsKey(Pair.Key) then Continue;
-        if Pair.Value.Level >= DevelopmentBroadcastThreshold then
+        if Pair.Value.Level >= Balance.DevelopmentBroadcastThreshold then
         begin
           if not First then DeltaJSON := DeltaJSON + ',';
           First := False;
@@ -1795,7 +1998,7 @@ end;
 
 // Handles both unit-vs-unit and unit-vs-city combat, distinguished by
 // which of target_unit_id/target_city_id the payload sets. A city's
-// Population doubles as its defense pool (see SiegeDamagePerAttack's
+// Population doubles as its defense pool (see Balance.SiegeDamagePerAttack's
 // comment) - hitting a city just decrements it the same way an
 // attacker's damage decrements a unit's HP, and capture is simply what
 // happens when that pool bottoms out, mirroring death for units.
@@ -1853,7 +2056,7 @@ begin
     else
     begin
       Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetUnit.GX, TargetUnit.GY);
-      if Dist > AttackRangeCells then
+      if Dist > Balance.AttackRangeCells then
         Reason := 'too far';
     end;
 
@@ -1861,23 +2064,23 @@ begin
     begin
       // Effective damage includes the attacker's veterancy bonus - a
       // Level 2 soldier hits harder than a fresh one of the same type.
-      Damage := AttackerDef.Attack + Attacker.Level * VeterancyAttackBonusPerLevel;
+      Damage := AttackerDef.Attack + Attacker.Level * Balance.VeterancyAttackBonusPerLevel;
       NewHP := TargetUnit.HP - Damage;
       if NewHP < 0 then NewHP := 0;
 
       // Veterancy: any landed hit grants XP, win or lose, dead or
       // alive on the target's side - the attacker did the fighting
       // regardless of outcome. Scoped to unit-vs-unit only (see
-      // VeterancyXPPerHit's comment) so this branch is the only place
+      // Balance.VeterancyXPPerHit's comment) so this branch is the only place
       // that ever touches XP/Level.
-      Attacker.XP := Attacker.XP + VeterancyXPPerHit;
+      Attacker.XP := Attacker.XP + Balance.VeterancyXPPerHit;
       LeveledUp := False;
-      while (Attacker.Level < VeterancyMaxLevel) and
-            (Attacker.XP >= (Attacker.Level + 1) * VeterancyXPPerLevel) do
+      while (Attacker.Level < Balance.VeterancyMaxLevel) and
+            (Attacker.XP >= (Attacker.Level + 1) * Balance.VeterancyXPPerLevel) do
       begin
-        Attacker.XP := Attacker.XP - (Attacker.Level + 1) * VeterancyXPPerLevel;
+        Attacker.XP := Attacker.XP - (Attacker.Level + 1) * Balance.VeterancyXPPerLevel;
         Inc(Attacker.Level);
-        Inc(Attacker.HP, VeterancyHPBonusPerLevel); // heals on level-up, not just a higher ceiling a wounded unit wouldn't feel
+        Inc(Attacker.HP, Balance.VeterancyHPBonusPerLevel); // heals on level-up, not just a higher ceiling a wounded unit wouldn't feel
         LeveledUp := True;
       end;
       UnitsLock.Enter;
@@ -1953,19 +2156,19 @@ begin
       // west was in range) - +0.5 puts both sides of the comparison
       // on the same cell-center footing.
       Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetCity.GX + 0.5, TargetCity.GY + 0.5);
-      if Dist > AttackRangeCells then
+      if Dist > Balance.AttackRangeCells then
         Reason := 'too far';
     end;
 
     if Reason = '' then
     begin
-      NewPop := TargetCity.Population - SiegeDamagePerAttack;
+      NewPop := TargetCity.Population - Balance.SiegeDamagePerAttack;
 
       if NewPop <= 0 then
       begin
         PrevOwner := TargetCity.Owner;
         TargetCity.Owner := Attacker.Owner;
-        TargetCity.Population := CityCaptureResetPopulation;
+        TargetCity.Population := Balance.CityCaptureResetPopulation;
         TargetCity.LastGrowthTick := Tick;
         TargetCity.LastUpkeepTick := Tick; // fresh upkeep clock too - no back-charged upkeep from being conquered
 
@@ -1992,9 +2195,9 @@ begin
         end;
 
         LogEvent(Format('{"type":"city_attacked","city_id":"%s","attacker_unit_id":"%s","by":"%s","damage":%d,"population_remaining":%d}',
-          [TargetCityID, AttackerID, Actor, SiegeDamagePerAttack, NewPop]));
+          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
         SendLine(Format('{"topic":"game.event.city_attacked","payload":"{\"city_id\":\"%s\",\"attacker_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"population_remaining\":%d}"}',
-          [TargetCityID, AttackerID, Actor, SiegeDamagePerAttack, NewPop]));
+          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
       end;
       Exit;
     end;
@@ -2156,7 +2359,7 @@ begin
       TargetY := U.Path[U.PathIndex + 1].Y;
       StepCost := CellMoveCost(Grid, Config, TargetX, TargetY);
       if StepCost <= 0 then StepCost := 1; // shouldn't happen, path was validated - stay safe rather than divide by zero
-      MoveAmount := (BaseSpeed * GetUnitDef(U.UnitType).SpeedMultiplier) / StepCost;
+      MoveAmount := (Balance.BaseSpeed * GetUnitDef(U.UnitType).SpeedMultiplier) / StepCost;
 
       // WrappedDX (not a plain subtraction) - a path can legitimately
       // cross the ±180° antimeridian seam (kyzu_pathfinding.pas
@@ -2220,7 +2423,7 @@ var
   C: TCity;
   R: TRoad;
   Lon, Lat: Double;
-  PathArr, PointArr: TJSONArray;
+  PathArr, PointArr, CostsArr: TJSONArray;
   GridPath: TGridPath;
   i, PathIdx, EventCount, CollectedAmount, CurrentTotal: Integer;
 begin
@@ -2373,7 +2576,7 @@ begin
           C.Owner := Obj.Get('owner', '');
           C.GX := LonToGridX(Obj.Get('lon', 0.0));
           C.GY := LatToGridY(Obj.Get('lat', 0.0));
-          C.Population := Obj.Get('population', CityInitialPopulation);
+          C.Population := Obj.Get('population', Balance.CityInitialPopulation);
           // Tick itself resets to 0 on every restart already (see the
           // main block), so a city's growth clock resets alongside it -
           // same precedent as everything else tick-based here, rather
@@ -2398,29 +2601,14 @@ begin
           // an owned city's growth step spends resources (see
           // GrowCities), so replay has to apply the same deduction or a
           // continued events.jsonl would leave the ledger overstated
-          // relative to a server that kept running live.
+          // relative to a server that kept running live. Reuses the
+          // exact same DeductCost live spending goes through, applied
+          // to the "costs" array this event now carries (generic, not
+          // fixed wood/stone fields).
           ByActor := Obj.Get('owner', '');
-          if ByActor <> '' then
-          begin
-            LedgerLock.Enter;
-            try
-              LedgerKey := ByActor + '|wood';
-              CurrentTotal := 0;
-              Ledger.TryGetValue(LedgerKey, CurrentTotal);
-              CurrentTotal := CurrentTotal - Obj.Get('wood', 0);
-              if CurrentTotal < 0 then CurrentTotal := 0;
-              Ledger.AddOrSetValue(LedgerKey, CurrentTotal);
-
-              LedgerKey := ByActor + '|stone';
-              CurrentTotal := 0;
-              Ledger.TryGetValue(LedgerKey, CurrentTotal);
-              CurrentTotal := CurrentTotal - Obj.Get('stone', 0);
-              if CurrentTotal < 0 then CurrentTotal := 0;
-              Ledger.AddOrSetValue(LedgerKey, CurrentTotal);
-            finally
-              LedgerLock.Leave;
-            end;
-          end;
+          CostsArr := TJSONArray(Obj.Find('costs'));
+          if (ByActor <> '') and Assigned(CostsArr) then
+            DeductCost(ByActor, ParseResourceCostList(CostsArr));
         end
         else if EventType = 'road_built' then
         begin
@@ -2497,20 +2685,9 @@ begin
           // replay the same way a live upkeep payment does, so a
           // continued events.jsonl doesn't leave the ledger overstated.
           ByActor := Obj.Get('owner', '');
-          if ByActor <> '' then
-          begin
-            LedgerLock.Enter;
-            try
-              LedgerKey := ByActor + '|wood';
-              CurrentTotal := 0;
-              Ledger.TryGetValue(LedgerKey, CurrentTotal);
-              CurrentTotal := CurrentTotal - Obj.Get('wood', 0);
-              if CurrentTotal < 0 then CurrentTotal := 0;
-              Ledger.AddOrSetValue(LedgerKey, CurrentTotal);
-            finally
-              LedgerLock.Leave;
-            end;
-          end;
+          CostsArr := TJSONArray(Obj.Find('costs'));
+          if (ByActor <> '') and Assigned(CostsArr) then
+            DeductCost(ByActor, ParseResourceCostList(CostsArr));
         end
         else if EventType = 'city_population_decayed' then
         begin
@@ -2625,6 +2802,9 @@ begin
   LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
 
+  LogDiag('Loading game_balance.json ...');
+  Balance := LoadGameBalance(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'game_balance.json');
+
   LogDiag('Loading ' + Config.MovementGridPath + ' ...');
   Grid := LoadMovementGrid(Config.MovementGridPath);
   LogDiag('Movement grid: ' + IntToStr(Grid.Width) + ' x ' + IntToStr(Grid.Height));
@@ -2684,7 +2864,7 @@ begin
     GrowCities;
     ProcessCityUpkeep;
     RunAI;
-    if Tick mod DevelopmentUpdateTicks = 0 then
+    if Tick mod Balance.DevelopmentUpdateTicks = 0 then
       RecomputeDevelopment;
     Sleep(50); // ~20 ticks/sec target loop pacing
   end;

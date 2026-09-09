@@ -1,0 +1,41 @@
+{
+  "base_speed": 0.15,
+  "collect_radius_cells": 1.5,
+  "collect_amount_per_action": 10,
+
+  "city_initial_population": 10,
+  "city_growth_amount": 1,
+  "city_growth_ticks": 40,
+  "city_max_population": 5000,
+  "city_growth_cost": [
+    {"resource_type": "wood", "amount": 5},
+    {"resource_type": "stone", "amount": 2}
+  ],
+
+  "development_radius_cells": 12,
+  "development_min_radius_cells": 3,
+  "development_update_ticks": 20,
+  "road_development_radius_cells": 2,
+  "road_development_peak": 60.0,
+  "development_broadcast_threshold": 2,
+
+  "attack_range_cells": 1.5,
+  "siege_damage_per_attack": 20,
+  "city_capture_reset_population": 10,
+
+  "city_upkeep_ticks": 60,
+  "city_upkeep_cost": [
+    {"resource_type": "wood", "amount": 1}
+  ],
+  "city_decay_amount": 5,
+
+  "ai_faction_name": "ai",
+  "ai_tick_interval": 40,
+  "ai_target_worker_count": 2,
+
+  "veterancy_xp_per_hit": 10,
+  "veterancy_xp_per_level": 30,
+  "veterancy_max_level": 3,
+  "veterancy_attack_bonus_per_level": 5,
+  "veterancy_hp_bonus_per_level": 10
+}

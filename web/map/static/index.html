@@ -569,8 +569,10 @@
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
-        if (payload && payload.owner === factionInput.value) {
-          myLedger.wood = Math.max(0, (myLedger.wood || 0) - (payload.wood || 0));
+        if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+          for (const c of payload.costs) {
+            myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+          }
           renderStash();
         }
       } else if (msg.topic === 'game.event.city_population_decayed') {
@@ -628,11 +630,13 @@
         let payload;
         try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
         catch (e) { return; }
-        if (payload && payload.owner === factionInput.value) {
-          myLedger.wood = Math.max(0, (myLedger.wood || 0) - (payload.wood || 0));
-          myLedger.stone = Math.max(0, (myLedger.stone || 0) - (payload.stone || 0));
+        if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+          for (const c of payload.costs) {
+            myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+          }
           renderStash();
-          showToast('city ' + payload.city_id + ' grew - spent ' + payload.wood + ' wood, ' + payload.stone + ' stone');
+          const costStr = payload.costs.map(c => c.amount + ' ' + c.resource_type).join(', ');
+          showToast('city ' + payload.city_id + ' grew - spent ' + costStr);
         }
       } else if (msg.topic === 'game.event.ledger') {
         let payload;

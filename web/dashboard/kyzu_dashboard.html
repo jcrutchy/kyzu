@@ -296,8 +296,11 @@
       case 'game.event.city_growth_spent':
       case 'game.event.city_upkeep_spent': {
         const f = faction(payload.owner || '');
-        if (payload.wood) f.spent.wood = (f.spent.wood || 0) + payload.wood;
-        if (payload.stone) f.spent.stone = (f.spent.stone || 0) + payload.stone;
+        if (Array.isArray(payload.costs)) {
+          for (const c of payload.costs) {
+            f.spent[c.resource_type] = (f.spent[c.resource_type] || 0) + c.amount;
+          }
+        }
         break;
       }
 

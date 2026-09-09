@@ -200,3 +200,7 @@
 {"type":"city_grew","city_id":"city_beta","population":69}
 {"type":"city_grew","city_id":"city_alpha","population":90}
 {"type":"city_grew","city_id":"city_beta","population":70}
+{"type":"city_grew","city_id":"city_alpha","population":91}
+{"type":"city_grew","city_id":"city_beta","population":71}
+{"type":"city_grew","city_id":"city_alpha","population":92}
+{"type":"city_grew","city_id":"city_beta","population":72}
