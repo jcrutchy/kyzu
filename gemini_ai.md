@@ -1,428 +1,274 @@
-Here is an intelligent learning AI system for the Kyzu VDRX WebSocket engine, written in clean FreePascal without third-party dependencies (using standard FCL units: `fpjson`, `jsonparser`, `math`, `sysutils`, `classes`, and native Win64/Linux OS sockets).
+This complete refactoring adapts the autonomous AI to the **Kyzu ↔ VDRX Stdin/Stdout Bus Architecture**.
 
-### Key Architectural Enhancements
-1. **Predictive Coding Engine (`KyzuPredictive.pas`)**:
-   - Maintains kinetic state filters (position, velocity vectors, acceleration, trajectory history) for all entities.
-   - Generates top-down forward predictions $\hat{S}_{t+\Delta t}$ and computes prediction error vectors ($\epsilon = Y - \hat{Y}$).
-   - High prediction error triggers a cognitive **Surprise Signal** (detecting tactical feints, unexpected maneuvers, or ambushes) causing dynamic adaptation.
-   - Provides **anticipatory intercept calculation** rather than chasing behind fleeing targets.
-2. **Genetic Evolution Engine (`KyzuGenetics.pas`)**:
-   - Represents behavioral and tactical hyperparameters as evolvable chromosomes (aggression, predictive horizon, flocking cohesion, retreat HP thresholds, city capture bias, surprise sensitivity).
-   - Dynamic fitness tracking (kills, survivability, territory expansion, predictive accuracy).
-   - Auto-saves and loads winning genomes from `kyzu_genome.json` so learned combat behaviors persist across runs.
-3. **Abstracted Dynamic Attribute Architecture (`KyzuEntities.pas`)**:
-   - Key-value attribute graphs that dynamically ingest new game attributes (`shield`, `energy`, `elevation`, `morale`) without schema rewrites.
-   - Extensible topic event dispatcher.
-4. **Zero-Dependency RFC-6455 WebSocket Client (`KyzuSockets.pas`)**:
-   - Handles TCP handshake, frame masking/unmasking, fragmented buffers, and non-blocking I/O across Win64 (`WinSock2`) and Linux (`BaseUnix`/`Sockets`).
+### Key Architectural Changes
+1. **Stdin/Stdout Line-Buffered IPC**:
+   - WebSockets have been removed. Communication now adheres directly to the VDRX process supervision model: JSON lines received over `stdin` (via a background `TStdinReaderThread`) and JSON lines emitted over `stdout`.
+   - All AI diagnostic telemetry, evolution stats, and error reporting are strictly routed to `stderr` (`WriteLn(StdErr, ...)`), keeping `stdout` clean for the VDRX bus.
+2. **Deep JSON-Driven Configuration (`KyzuConfig.pas`)**:
+   - Everything is externalized into `kyzu_bot_config.json`: faction identity, home coordinates, operational intervals, kinetic prediction thresholds, combat multipliers, genetic weights, and dynamic unit archetype roles.
+   - If the configuration file is missing, the AI generates and persists a fully documented template.
+3. **Full Kyzu Protocol Support**:
+   - Unit spawning, pathfinding, and anticipatory combat.
+   - Resource harvesting (`game.cmd.collect`, node tracking).
+   - City founding (`game.cmd.found_city`), road infrastructure (`game.cmd.build_road`), and city siege mechanics.
+   - Veterancy leveling tracking.
+4. **Predictive Coding Engine (`KyzuPredictive.pas`)**:
+   - Estimates velocities and accelerations, compares predictions against observations, computes surprise gradients, and calculates anticipatory intercept points.
+5. **Genetic Strategy Evolution (`KyzuGenetics.pas`)**:
+   - Real-time chromosome adaptation persisted to `kyzu_evolved_genome.json`.
 
 ---
 
-### Project File Structure
+### File Overview
 ```text
 KyzuAI/
-├── KyzuSockets.pas      # Native cross-platform RFC-6455 WebSocket client
-├── KyzuEntities.pas     # Dynamic world model, attribute maps, and event bus
-├── KyzuPredictive.pas   # Predictive coding and kinematic trajectory tracking
-├── KyzuGenetics.pas     # Chromosomes, mutations, fitness, and persistence
-├── KyzuBrain.pas        # Tactical coordinator uniting prediction and genetics
-└── KyzuAIProgram.lpr    # Main application entry point and event loop
+├── KyzuConfig.pas      # JSON configuration manager for all attributes & heuristics
+├── KyzuEntities.pas    # Dynamic entities (units, cities, nodes, roads) & event bus
+├── KyzuPredictive.pas  # Predictive coding, kinematic belief states & intercept calculator
+├── KyzuGenetics.pas    # Genome vectors, crossover, mutation & fitness evaluation
+├── KyzuBrain.pas       # High-level strategic coordinator implementing the Kyzu API
+├── KyzuIO.pas          # Threaded Stdin reader and synchronized Stdout writer
+└── KyzuAIProgram.lpr   # Application entry point and main tick loop
 ```
 
 ---
 
-### 1. `KyzuSockets.pas` (Native WebSocket Client)
+### 1. `KyzuConfig.pas` (Centralized JSON Configuration)
 ```pascal
-unit KyzuSockets;
+unit KyzuConfig;
 
 {$mode objfpc}{$H+}
 
 interface
 
 uses
-  Classes, SysUtils
-  {$IFDEF WINDOWS}
-  , WinSock2, Windows
-  {$ELSE}
-  , Sockets, BaseUnix, Unix
-  {$ENDIF};
+  Classes, SysUtils, fpjson, jsonparser;
 
 type
-  TWSEventType = (wseOpen, wseMessage, wseClose, wseError);
-  TWSMessageCallback = procedure(const AMessage: string) of object;
-  TWSEventCallback = procedure(AEventType: TWSEventType; const AInfo: string) of object;
-
-  TWebSocketClient = class
-  private
-    {$IFDEF WINDOWS}
-    FSocket: TSocket;
-    {$ELSE}
-    FSocket: cint;
-    {$ENDIF}
-    FHost: string;
-    FPort: Word;
-    FConnected: Boolean;
-    FHandshakeDone: Boolean;
-    FOnMessage: TWSMessageCallback;
-    FOnEvent: TWSEventCallback;
-    FRxBuffer: string;
-
-    function ConnectSocket(const AHost: string; APort: Word): Boolean;
-    procedure CloseSocketInternal;
-    function SendRaw(const AData: Pointer; ASize: Integer): Integer;
-    function ReceiveRaw(ABuffer: Pointer; ASize: Integer): Integer;
-    function PerformHandshake: Boolean;
-    procedure ProcessRawFrame;
-    function GenerateMaskKey: LongWord;
+  TAIConfig = class
   public
+    // Faction & Geo Identity
+    FactionName: string;
+    HomeLon: Double;
+    HomeLat: Double;
+
+    // Tick & Decision Timing
+    TickIntervalMs: Integer;
+    SyncIntervalMs: Integer;
+    PingIntervalMs: Integer;
+
+    // Predictive Coding Parameters
+    PredictiveLookahead: Double;
+    KineticSmoothing: Double;
+    SurpriseDampening: Double;
+    SurpriseSensitivity: Double;
+
+    // Tactical & Economic Thresholds
+    RetreatHPRatio: Double;
+    AggressionWeight: Double;
+    CitySiegeWeight: Double;
+    ResourceCollectWeight: Double;
+    RoadBuildingWeight: Double;
+    CityFoundingWeight: Double;
+    FlockingCohesion: Double;
+    MaxCombatRadius: Double;
+    CollectRadius: Double;
+
+    // Production Quotas
+    MaxSoldiers: Integer;
+    MaxHarvesters: Integer;
+    MaxPioneers: Integer;
+
+    // Genetic Evolution
+    GeneticAutoEvolve: Boolean;
+    EpochDurationSec: Double;
+    PopulationSize: Integer;
+    MutationRate: Double;
+
     constructor Create;
-    destructor Destroy; override;
-
-    function Connect(const AHost: string; APort: Word): Boolean;
-    procedure Disconnect;
-    procedure Poll(TimeoutMs: Integer = 10);
-    function SendText(const APayload: string): Boolean;
-
-    property Connected: Boolean read FConnected;
-    property HandshakeDone: Boolean read FHandshakeDone;
-    property OnMessage: TWSMessageCallback read FOnMessage write FOnMessage;
-    property OnEvent: TWSEventCallback read FOnEvent write FOnEvent;
+    procedure LoadFromFile(const AFilename: string);
+    procedure SaveToFile(const AFilename: string);
+    procedure SetDefaults;
   end;
 
 implementation
 
-{$IFDEF WINDOWS}
+constructor TAIConfig.Create;
+begin
+  SetDefaults;
+end;
+
+procedure TAIConfig.SetDefaults;
+begin
+  FactionName := 'evolved_ai';
+  HomeLon := 25.0;
+  HomeLat := 15.0;
+
+  TickIntervalMs := 100;
+  SyncIntervalMs := 5000;
+  PingIntervalMs := 10000;
+
+  PredictiveLookahead := 2.5;
+  KineticSmoothing := 0.65;
+  SurpriseDampening := 0.85;
+  SurpriseSensitivity := 1.2;
+
+  RetreatHPRatio := 0.25;
+  AggressionWeight := 1.5;
+  CitySiegeWeight := 2.0;
+  ResourceCollectWeight := 1.0;
+  RoadBuildingWeight := 0.8;
+  CityFoundingWeight := 1.1;
+  FlockingCohesion := 0.75;
+  MaxCombatRadius := 20.0;
+  CollectRadius := 2.0;
+
+  MaxSoldiers := 6;
+  MaxHarvesters := 3;
+  MaxPioneers := 1;
+
+  GeneticAutoEvolve := True;
+  EpochDurationSec := 60.0;
+  PopulationSize := 8;
+  MutationRate := 0.25;
+end;
+
+procedure TAIConfig.LoadFromFile(const AFilename: string);
 var
-  WSAData: TWSAData;
-  WSAInitialized: Boolean = False;
-{$ENDIF}
-
-constructor TWebSocketClient.Create;
+  SL: TStringList;
+  JData: TJSONData;
+  J, JSec: TJSONObject;
 begin
-  inherited Create;
-  {$IFDEF WINDOWS}
-  if not WSAInitialized then
+  if not FileExists(AFilename) then
   begin
-    WSAStartup($0202, WSAData);
-    WSAInitialized := True;
-  end;
-  FSocket := INVALID_SOCKET;
-  {$ELSE}
-  FSocket := -1;
-  {$ENDIF}
-  FConnected := False;
-  FHandshakeDone := False;
-  FRxBuffer := '';
-end;
-
-destructor TWebSocketClient.Destroy;
-begin
-  Disconnect;
-  inherited Destroy;
-end;
-
-function TWebSocketClient.ConnectSocket(const AHost: string; APort: Word): Boolean;
-{$IFDEF WINDOWS}
-var
-  Addr: sockaddr_in;
-  HostEnt: PHostEnt;
-begin
-  Result := False;
-  FSocket := WinSock2.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if FSocket = INVALID_SOCKET then Exit;
-
-  FillChar(Addr, SizeOf(Addr), 0);
-  Addr.sin_family := AF_INET;
-  Addr.sin_port := htons(APort);
-  Addr.sin_addr.S_addr := inet_addr(PChar(AHost));
-
-  if Addr.sin_addr.S_addr = INADDR_NONE then
-  begin
-    HostEnt := gethostbyname(PChar(AHost));
-    if HostEnt = nil then Exit;
-    Addr.sin_addr := PInAddr(HostEnt^.h_addr_list^)^;
+    SaveToFile(AFilename);
+    Exit;
   end;
 
-  if WinSock2.connect(FSocket, @Addr, SizeOf(Addr)) = 0 then
-    Result := True;
-end;
-{$ELSE}
-var
-  Addr: TInetSockAddr;
-  HostEnt: THostEntry;
-begin
-  Result := False;
-  FSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
-  if FSocket < 0 then Exit;
-
-  FillChar(Addr, SizeOf(Addr), 0);
-  Addr.sin_family := AF_INET;
-  Addr.sin_port := htons(APort);
-  Addr.sin_addr.s_addr := StrToNetAddr(AHost).s_addr;
-
-  if Addr.sin_addr.s_addr = 0 then
-  begin
-    if ResolveHostByName(AHost, HostEnt) then
-      Addr.sin_addr := HostEnt.Addr;
-  end;
-
-  if fpConnect(FSocket, @Addr, SizeOf(Addr)) = 0 then
-    Result := True;
-end;
-{$ENDIF}
-
-procedure TWebSocketClient.CloseSocketInternal;
-begin
-  {$IFDEF WINDOWS}
-  if FSocket <> INVALID_SOCKET then
-  begin
-    closesocket(FSocket);
-    FSocket := INVALID_SOCKET;
-  end;
-  {$ELSE}
-  if FSocket >= 0 then
-  begin
-    fpClose(FSocket);
-    FSocket := -1;
-  end;
-  {$ENDIF}
-  FConnected := False;
-  FHandshakeDone := False;
-end;
-
-function TWebSocketClient.SendRaw(const AData: Pointer; ASize: Integer): Integer;
-begin
-  Result := 0;
-  if not FConnected then Exit;
-  {$IFDEF WINDOWS}
-  Result := WinSock2.send(FSocket, AData^, ASize, 0);
-  {$ELSE}
-  Result := fpSend(FSocket, AData, ASize, 0);
-  {$ENDIF}
-end;
-
-function TWebSocketClient.ReceiveRaw(ABuffer: Pointer; ASize: Integer): Integer;
-begin
-  Result := 0;
-  if not FConnected then Exit;
-  {$IFDEF WINDOWS}
-  Result := WinSock2.recv(FSocket, ABuffer^, ASize, 0);
-  {$ELSE}
-  Result := fpRecv(FSocket, ABuffer, ASize, 0);
-  {$ENDIF}
-end;
-
-function TWebSocketClient.PerformHandshake: Boolean;
-var
-  Req: string;
-  Buffer: array[0..2047] of Char;
-  BytesRead: Integer;
-  Resp: string;
-begin
-  Result := False;
-  Req := 'GET / HTTP/1.1'#13#10 +
-         'Host: ' + FHost + ':' + IntToStr(FPort) + #13#10 +
-         'Upgrade: websocket'#13#10 +
-         'Connection: Upgrade'#13#10 +
-         'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='#13#10 +
-         'Sec-WebSocket-Version: 13'#13#10#13#10;
-
-  if SendRaw(PChar(Req), Length(Req)) <= 0 then Exit;
-
-  FillChar(Buffer, SizeOf(Buffer), 0);
-  BytesRead := ReceiveRaw(@Buffer[0], SizeOf(Buffer) - 1);
-  if BytesRead <= 0 then Exit;
-
-  Resp := Buffer;
-  if Pos('101 Switching Protocols', Resp) > 0 then
-  begin
-    FHandshakeDone := True;
-    Result := True;
-    if Assigned(FOnEvent) then FOnEvent(wseOpen, 'Connected and Handshake Complete');
-  end;
-end;
-
-function TWebSocketClient.GenerateMaskKey: LongWord;
-begin
-  Result := Random($7FFFFFFF);
-end;
-
-function TWebSocketClient.SendText(const APayload: string): Boolean;
-var
-  Frame: array of Byte;
-  Len: Int64;
-  Mask: LongWord;
-  MaskBytes: array[0..3] of Byte;
-  HeaderSize, i: Integer;
-begin
-  Result := False;
-  if not (FConnected and FHandshakeDone) then Exit;
-
-  Len := Length(APayload);
-  if Len <= 125 then
-    HeaderSize := 6
-  else if Len <= 65535 then
-    HeaderSize := 8
-  else
-    HeaderSize := 14;
-
-  SetLength(Frame, HeaderSize + Len);
-  Frame[0] := $81; // FIN + Text Opcode
-
-  Mask := GenerateMaskKey;
-  Move(Mask, MaskBytes[0], 4);
-
-  if Len <= 125 then
-  begin
-    Frame[1] := $80 or Byte(Len);
-    Move(MaskBytes[0], Frame[2], 4);
-  end
-  else if Len <= 65535 then
-  begin
-    Frame[1] := $80 or 126;
-    Frame[2] := (Len shr 8) and $FF;
-    Frame[3] := Len and $FF;
-    Move(MaskBytes[0], Frame[4], 4);
-  end
-  else
-  begin
-    Frame[1] := $80 or 127;
-    for i := 0 to 7 do
-      Frame[2 + i] := (Len shr ((7 - i) * 8)) and $FF;
-    Move(MaskBytes[0], Frame[10], 4);
-  end;
-
-  for i := 0 to Len - 1 do
-    Frame[HeaderSize + i] := Byte(APayload[i + 1]) xor MaskBytes[i mod 4];
-
-  Result := SendRaw(@Frame[0], Length(Frame)) = Length(Frame);
-end;
-
-procedure TWebSocketClient.ProcessRawFrame;
-var
-  Opcode, MaskBit: Byte;
-  PayloadLen: Int64;
-  HeaderLen: Integer;
-  PayloadStr: string;
-  MaskKey: array[0..3] of Byte;
-  i: Integer;
-begin
-  while Length(FRxBuffer) >= 2 do
-  begin
-    Opcode := Byte(FRxBuffer[1]) and $0F;
-    MaskBit := (Byte(FRxBuffer[2]) and $80) shr 7;
-    PayloadLen := Byte(FRxBuffer[2]) and $7F;
-    HeaderLen := 2;
-
-    if PayloadLen = 126 then
-    begin
-      if Length(FRxBuffer) < 4 then Exit;
-      PayloadLen := (Byte(FRxBuffer[3]) shl 8) or Byte(FRxBuffer[4]);
-      HeaderLen := 4;
-    end
-    else if PayloadLen = 127 then
-    begin
-      if Length(FRxBuffer) < 10 then Exit;
-      PayloadLen := 0;
-      for i := 0 to 7 do
-        PayloadLen := (PayloadLen shl 8) or Byte(FRxBuffer[3 + i]);
-      HeaderLen := 10;
-    end;
-
-    if MaskBit = 1 then
-    begin
-      if Length(FRxBuffer) < HeaderLen + 4 then Exit;
-      Move(FRxBuffer[HeaderLen + 1], MaskKey[0], 4);
-      Inc(HeaderLen, 4);
-    end;
-
-    if Length(FRxBuffer) < HeaderLen + PayloadLen then Exit;
-
-    SetLength(PayloadStr, PayloadLen);
-    if PayloadLen > 0 then
-    begin
-      Move(FRxBuffer[HeaderLen + 1], PayloadStr[1], PayloadLen);
-      if MaskBit = 1 then
+  SL := TStringList.Create;
+  try
+    SL.LoadFromFile(AFilename);
+    JData := GetJSON(SL.Text);
+    try
+      if JData is TJSONObject then
       begin
-        for i := 1 to PayloadLen do
-          PayloadStr[i] := Char(Byte(PayloadStr[i]) xor MaskKey[(i - 1) mod 4]);
+        J := TJSONObject(JData);
+
+        // General
+        FactionName := J.Get('faction_name', FactionName);
+        HomeLon := J.Get('home_lon', HomeLon);
+        HomeLat := J.Get('home_lat', HomeLat);
+        TickIntervalMs := J.Get('tick_interval_ms', TickIntervalMs);
+        SyncIntervalMs := J.Get('sync_interval_ms', SyncIntervalMs);
+        PingIntervalMs := J.Get('ping_interval_ms', PingIntervalMs);
+
+        // Predictive
+        JSec := J.Get('predictive', TJSONObject(nil));
+        if JSec <> nil then
+        begin
+          PredictiveLookahead := JSec.Get('lookahead_sec', PredictiveLookahead);
+          KineticSmoothing := JSec.Get('smoothing', KineticSmoothing);
+          SurpriseDampening := JSec.Get('surprise_dampening', SurpriseDampening);
+          SurpriseSensitivity := JSec.Get('surprise_sensitivity', SurpriseSensitivity);
+        end;
+
+        // Tactics & Utility
+        JSec := J.Get('tactics', TJSONObject(nil));
+        if JSec <> nil then
+        begin
+          RetreatHPRatio := JSec.Get('retreat_hp_ratio', RetreatHPRatio);
+          AggressionWeight := JSec.Get('aggression_weight', AggressionWeight);
+          CitySiegeWeight := JSec.Get('city_siege_weight', CitySiegeWeight);
+          ResourceCollectWeight := JSec.Get('resource_collect_weight', ResourceCollectWeight);
+          RoadBuildingWeight := JSec.Get('road_building_weight', RoadBuildingWeight);
+          CityFoundingWeight := JSec.Get('city_founding_weight', CityFoundingWeight);
+          FlockingCohesion := JSec.Get('flocking_cohesion', FlockingCohesion);
+          MaxCombatRadius := JSec.Get('max_combat_radius', MaxCombatRadius);
+          CollectRadius := JSec.Get('collect_radius', CollectRadius);
+        end;
+
+        // Quotas
+        JSec := J.Get('quotas', TJSONObject(nil));
+        if JSec <> nil then
+        begin
+          MaxSoldiers := JSec.Get('max_soldiers', MaxSoldiers);
+          MaxHarvesters := JSec.Get('max_harvesters', MaxHarvesters);
+          MaxPioneers := JSec.Get('max_pioneers', MaxPioneers);
+        end;
+
+        // Evolution
+        JSec := J.Get('genetics', TJSONObject(nil));
+        if JSec <> nil then
+        begin
+          GeneticAutoEvolve := JSec.Get('auto_evolve', GeneticAutoEvolve);
+          EpochDurationSec := JSec.Get('epoch_duration_sec', EpochDurationSec);
+          PopulationSize := JSec.Get('population_size', PopulationSize);
+          MutationRate := JSec.Get('mutation_rate', MutationRate);
+        end;
       end;
+    finally
+      JData.Free;
     end;
-
-    Delete(FRxBuffer, 1, HeaderLen + PayloadLen);
-
-    if Opcode = $1 then // Text
-    begin
-      if Assigned(FOnMessage) then FOnMessage(PayloadStr);
-    end
-    else if Opcode = $8 then // Close
-    begin
-      Disconnect;
-      Exit;
-    end;
+  finally
+    SL.Free;
   end;
 end;
 
-procedure TWebSocketClient.Poll(TimeoutMs: Integer);
+procedure TAIConfig.SaveToFile(const AFilename: string);
 var
-  {$IFDEF WINDOWS}
-  ReadFds: TFDSet;
-  Tv: TTimeVal;
-  {$ELSE}
-  ReadFds: TFDSet;
-  Tv: TimeVal;
-  {$ENDIF}
-  Buffer: array[0..4095] of Char;
-  BytesRead: Integer;
+  J, JPred, JTact, JQuota, JGen: TJSONObject;
+  SL: TStringList;
 begin
-  if not FConnected then Exit;
+  J := TJSONObject.Create;
+  try
+    J.Strings['faction_name'] := FactionName;
+    J.Floats['home_lon'] := HomeLon;
+    J.Floats['home_lat'] := HomeLat;
+    J.Integers['tick_interval_ms'] := TickIntervalMs;
+    J.Integers['sync_interval_ms'] := SyncIntervalMs;
+    J.Integers['ping_interval_ms'] := PingIntervalMs;
 
-  {$IFDEF WINDOWS}
-  FD_ZERO(ReadFds);
-  FD_SET(FSocket, ReadFds);
-  Tv.tv_sec := TimeoutMs div 1000;
-  Tv.tv_usec := (TimeoutMs mod 1000) * 1000;
-  if WinSock2.select(0, @ReadFds, nil, nil, @Tv) > 0 then
-  {$ELSE}
-  fpFD_ZERO(ReadFds);
-  fpFD_SET(FSocket, ReadFds);
-  Tv.tv_sec := TimeoutMs div 1000;
-  Tv.tv_usec := (TimeoutMs mod 1000) * 1000;
-  if fpSelect(FSocket + 1, @ReadFds, nil, nil, @Tv) > 0 then
-  {$ENDIF}
-  begin
-    BytesRead := ReceiveRaw(@Buffer[0], SizeOf(Buffer));
-    if BytesRead > 0 then
-    begin
-      FRxBuffer := FRxBuffer + Copy(Buffer, 1, BytesRead);
-      ProcessRawFrame;
-    end
-    else if BytesRead <= 0 then
-    begin
-      Disconnect;
+    JPred := TJSONObject.Create;
+    JPred.Floats['lookahead_sec'] := PredictiveLookahead;
+    JPred.Floats['smoothing'] := KineticSmoothing;
+    JPred.Floats['surprise_dampening'] := SurpriseDampening;
+    JPred.Floats['surprise_sensitivity'] := SurpriseSensitivity;
+    J.Add('predictive', JPred);
+
+    JTact := TJSONObject.Create;
+    JTact.Floats['retreat_hp_ratio'] := RetreatHPRatio;
+    JTact.Floats['aggression_weight'] := AggressionWeight;
+    JTact.Floats['city_siege_weight'] := CitySiegeWeight;
+    JTact.Floats['resource_collect_weight'] := ResourceCollectWeight;
+    JTact.Floats['road_building_weight'] := RoadBuildingWeight;
+    JTact.Floats['city_founding_weight'] := CityFoundingWeight;
+    JTact.Floats['flocking_cohesion'] := FlockingCohesion;
+    JTact.Floats['max_combat_radius'] := MaxCombatRadius;
+    JTact.Floats['collect_radius'] := CollectRadius;
+    J.Add('tactics', JTact);
+
+    JQuota := TJSONObject.Create;
+    JQuota.Integers['max_soldiers'] := MaxSoldiers;
+    JQuota.Integers['max_harvesters'] := MaxHarvesters;
+    JQuota.Integers['max_pioneers'] := MaxPioneers;
+    J.Add('quotas', JQuota);
+
+    JGen := TJSONObject.Create;
+    JGen.Booleans['auto_evolve'] := GeneticAutoEvolve;
+    JGen.Floats['epoch_duration_sec'] := EpochDurationSec;
+    JGen.Integers['population_size'] := PopulationSize;
+    JGen.Floats['mutation_rate'] := MutationRate;
+    J.Add('genetics', JGen);
+
+    SL := TStringList.Create;
+    try
+      SL.Text := J.FormatJSON();
+      SL.SaveToFile(AFilename);
+    finally
+      SL.Free;
     end;
-  end;
-end;
-
-function TWebSocketClient.Connect(const AHost: string; APort: Word): Boolean;
-begin
-  Disconnect;
-  FHost := AHost;
-  FPort := APort;
-  Randomize;
-  FConnected := ConnectSocket(AHost, APort);
-  if FConnected then
-    Result := PerformHandshake
-  else
-    Result := False;
-end;
-
-procedure TWebSocketClient.Disconnect;
-begin
-  if FConnected then
-  begin
-    CloseSocketInternal;
-    if Assigned(FOnEvent) then FOnEvent(wseClose, 'Disconnected');
+  finally
+    J.Free;
   end;
 end;
 
@@ -431,7 +277,7 @@ end.
 
 ---
 
-### 2. `KyzuEntities.pas` (Dynamic Entities & Attribute Model)
+### 2. `KyzuEntities.pas` (Entities, Dynamic Attributes & Event Dispatcher)
 ```pascal
 unit KyzuEntities;
 
@@ -443,7 +289,7 @@ uses
   Classes, SysUtils, Math, fpjson, jsonparser;
 
 type
-  { Extensible dynamic attribute dictionary supporting arbitrary schema changes }
+  { Dynamic attribute bag for extensible schemas without recompilation }
   TDynamicAttributes = class
   private
     FData: TJSONObject;
@@ -455,47 +301,74 @@ type
     procedure SetString(const Key: string; const Val: string);
     function GetString(const Key: string; const Def: string = ''): string;
     procedure IngestJSON(JObj: TJSONObject);
-    property RawObject: TJSONObject read FData;
+    property Raw: TJSONObject read FData;
   end;
 
-  { Game World Entity representation }
+  { Unit representation with veterancy & tasks }
   TKyzuUnit = class
   public
     ID: string;
     Owner: string;
     UnitType: string;
-    Lon: Double;
-    Lat: Double;
-    HP: Double;
-    MaxHP: Double;
+    Lon, Lat: Double;
+    HP, MaxHP: Double;
+    Level: Integer;
+    XP: Integer;
+    AttackPower: Double;
+    TargetID: string;
+    IsMoving: Boolean;
     Attributes: TDynamicAttributes;
     LastUpdate: TDateTime;
     constructor Create(const AID: string);
     destructor Destroy; override;
   end;
 
+  { City representation with population defense pool & road links }
   TKyzuCity = class
   public
     ID: string;
     Owner: string;
-    Lon: Double;
-    Lat: Double;
+    Lon, Lat: Double;
     Population: Double;
     Attributes: TDynamicAttributes;
     constructor Create(const AID: string);
     destructor Destroy; override;
   end;
 
-  { Dynamic Feature & Event Dispatcher }
-  TEventPayloadCallback = procedure(Payload: TJSONObject) of object;
+  { Harvestable Resource Node }
+  TKyzuNode = class
+  public
+    ID: string;
+    NodeType: string;
+    Lon, Lat: Double;
+    Amount: Double;
+    Attributes: TDynamicAttributes;
+    constructor Create(const AID: string);
+    destructor Destroy; override;
+  end;
 
+  { Road Network Connection }
+  TKyzuRoad = class
+  public
+    ID: string;
+    FromCityID: string;
+    ToCityID: string;
+    Owner: string;
+    Attributes: TDynamicAttributes;
+    constructor Create(const AID: string);
+    destructor Destroy; override;
+  end;
+
+  TTopicCallback = procedure(Payload: TJSONObject) of object;
+
+  { Extensible Event Dispatcher }
   TEventDispatcher = class
   private
     FHandlers: TStringList;
   public
     constructor Create;
     destructor Destroy; override;
-    procedure RegisterTopic(const ATopic: string; AHandler: TMethod);
+    procedure Subscribe(const ATopic: string; AHandler: TMethod);
     procedure Dispatch(const ATopic: string; Payload: TJSONObject);
   end;
 
@@ -530,10 +403,7 @@ var
   Idx: Integer;
 begin
   Idx := FData.IndexOfName(Key);
-  if Idx >= 0 then
-    Result := FData.Items[Idx].AsFloat
-  else
-    Result := Def;
+  if Idx >= 0 then Result := FData.Items[Idx].AsFloat else Result := Def;
 end;
 
 procedure TDynamicAttributes.SetString(const Key: string; const Val: string);
@@ -546,10 +416,7 @@ var
   Idx: Integer;
 begin
   Idx := FData.IndexOfName(Key);
-  if Idx >= 0 then
-    Result := FData.Items[Idx].AsString
-  else
-    Result := Def;
+  if Idx >= 0 then Result := FData.Items[Idx].AsString else Result := Def;
 end;
 
 procedure TDynamicAttributes.IngestJSON(JObj: TJSONObject);
@@ -564,10 +431,14 @@ end;
 constructor TKyzuUnit.Create(const AID: string);
 begin
   ID := AID;
-  Attributes := TDynamicAttributes.Create;
-  LastUpdate := Now;
   HP := 100.0;
   MaxHP := 100.0;
+  Level := 0;
+  XP := 0;
+  AttackPower := 10.0;
+  IsMoving := False;
+  Attributes := TDynamicAttributes.Create;
+  LastUpdate := Now;
 end;
 
 destructor TKyzuUnit.Destroy;
@@ -580,11 +451,38 @@ end;
 constructor TKyzuCity.Create(const AID: string);
 begin
   ID := AID;
-  Attributes := TDynamicAttributes.Create;
   Population := 1.0;
+  Attributes := TDynamicAttributes.Create;
 end;
 
 destructor TKyzuCity.Destroy;
+begin
+  Attributes.Free;
+  inherited Destroy;
+end;
+
+{ TKyzuNode }
+constructor TKyzuNode.Create(const AID: string);
+begin
+  ID := AID;
+  Amount := 100.0;
+  Attributes := TDynamicAttributes.Create;
+end;
+
+destructor TKyzuNode.Destroy;
+begin
+  Attributes.Free;
+  inherited Destroy;
+end;
+
+{ TKyzuRoad }
+constructor TKyzuRoad.Create(const AID: string);
+begin
+  ID := AID;
+  Attributes := TDynamicAttributes.Create;
+end;
+
+destructor TKyzuRoad.Destroy;
 begin
   Attributes.Free;
   inherited Destroy;
@@ -604,7 +502,7 @@ begin
   inherited Destroy;
 end;
 
-procedure TEventDispatcher.RegisterTopic(const ATopic: string; AHandler: TMethod);
+procedure TEventDispatcher.Subscribe(const ATopic: string; AHandler: TMethod);
 begin
   FHandlers.AddObject(ATopic, TObject(AHandler.Code));
 end;
@@ -612,7 +510,7 @@ end;
 procedure TEventDispatcher.Dispatch(const ATopic: string; Payload: TJSONObject);
 var
   i: Integer;
-  Handler: TEventPayloadCallback;
+  CB: TTopicCallback;
   M: TMethod;
 begin
   for i := 0 to FHandlers.Count - 1 do
@@ -621,10 +519,12 @@ begin
     begin
       M.Code := Pointer(FHandlers.Objects[i]);
       M.Data := Self;
-      Handler := TEventPayloadCallback(M);
+      CB := TTopicCallback(M);
       try
-        Handler(Payload);
+        CB(Payload);
       except
+        on E: Exception do
+          Writeln(StdErr, Format('[DISPATCH ERROR] Topic %s: %s', [ATopic, E.Message]));
       end;
     end;
   end;
@@ -635,7 +535,7 @@ end.
 
 ---
 
-### 3. `KyzuPredictive.pas` (Predictive Coding & Intercept Trajectory)
+### 3. `KyzuPredictive.pas` (Kinematic Coding & Anticipatory Intercepts)
 ```pascal
 unit KyzuPredictive;
 
@@ -644,48 +544,48 @@ unit KyzuPredictive;
 interface
 
 uses
-  Classes, SysUtils, Math, KyzuEntities;
+  Classes, SysUtils, Math, KyzuEntities, KyzuConfig;
 
 type
-  { 2D Kinematic Belief State for an entity }
   TKineticBelief = record
     Lon, Lat: Double;
     VelLon, VelLat: Double;
     AccLon, AccLat: Double;
     PredictedLon, PredictedLat: Double;
-    LastObservedTime: TDateTime;
-    PredictionErrorAccumulator: Double;
-    ObservationsCount: Integer;
+    LastObserved: TDateTime;
+    PredictionError: Double;
+    SampleCount: Integer;
   end;
   PKineticBelief = ^TKineticBelief;
 
-  { Predictive Coding Engine implementing Free-Energy/Surprise minimisation }
   TPredictiveCodingEngine = class
   private
-    FBeliefs: TStringList; // Key: UnitID, Value: PKineticBelief
-    FGlobalSurprise: Double;
+    FBeliefs: TStringList;
+    FSurpriseMetric: Double;
+    FConfig: TAIConfig;
     procedure ClearBeliefs;
-    function GetOrCreateBelief(const EntityID: string): PKineticBelief;
+    function GetOrCreateBelief(const AID: string): PKineticBelief;
   public
-    constructor Create;
+    constructor Create(AConfig: TAIConfig);
     destructor Destroy; override;
 
-    procedure IngestObservation(const EntityID: string; CurrentLon, CurrentLat: Double);
-    procedure PredictEntity(const EntityID: string; LookaheadSeconds: Double; out OutLon, OutLat: Double);
+    procedure IngestObservation(const AID: string; CurrentLon, CurrentLat: Double);
+    function PredictPosition(const AID: string; LookaheadSec: Double): TPointF;
     function CalculateAnticipatoryIntercept(AttackerLon, AttackerLat, AttackerSpeed: Double;
                                            const TargetID: string; MaxHorizon: Double): TPointF;
-    procedure RemoveEntity(const EntityID: string);
+    procedure RemoveEntity(const AID: string);
 
-    property GlobalSurprise: Double read FGlobalSurprise;
+    property SurpriseMetric: Double read FSurpriseMetric;
   end;
 
 implementation
 
-constructor TPredictiveCodingEngine.Create;
+constructor TPredictiveCodingEngine.Create(AConfig: TAIConfig);
 begin
+  FConfig := AConfig;
   FBeliefs := TStringList.Create;
   FBeliefs.Sorted := True;
-  FGlobalSurprise := 0.0;
+  FSurpriseMetric := 0.0;
 end;
 
 destructor TPredictiveCodingEngine.Destroy;
@@ -704,78 +604,79 @@ begin
   FBeliefs.Clear;
 end;
 
-function TPredictiveCodingEngine.GetOrCreateBelief(const EntityID: string): PKineticBelief;
+function TPredictiveCodingEngine.GetOrCreateBelief(const AID: string): PKineticBelief;
 var
   Idx: Integer;
 begin
-  Idx := FBeliefs.IndexOf(EntityID);
+  Idx := FBeliefs.IndexOf(AID);
   if Idx >= 0 then
     Result := PKineticBelief(FBeliefs.Objects[Idx])
   else
   begin
     New(Result);
     FillChar(Result^, SizeOf(TKineticBelief), 0);
-    Result^.LastObservedTime := Now;
-    FBeliefs.AddObject(EntityID, TObject(Result));
+    Result^.LastObserved := Now;
+    FBeliefs.AddObject(AID, TObject(Result));
   end;
 end;
 
-procedure TPredictiveCodingEngine.IngestObservation(const EntityID: string; CurrentLon, CurrentLat: Double);
+procedure TPredictiveCodingEngine.IngestObservation(const AID: string; CurrentLon, CurrentLat: Double);
 var
   B: PKineticBelief;
-  Dt, Error, InstantVelLon, InstantVelLat: Double;
+  Dt, Error, VLon, VLat: Double;
+  Smooth: Double;
 begin
-  B := GetOrCreateBelief(EntityID);
-  Dt := (Now - B^.LastObservedTime) * 86400.0; // convert days to seconds
+  B := GetOrCreateBelief(AID);
+  Dt := (Now - B^.LastObserved) * 86400.0;
 
-  if (Dt > 0.01) and (B^.ObservationsCount > 0) then
+  if (Dt > 0.02) and (B^.SampleCount > 0) then
   begin
-    // Calculate prediction error (Sensory Input - Prior Predictive Expectation)
+    // Predictive error between prior sensory hypothesis and observation
     Error := EuclideanDist(CurrentLon, CurrentLat, B^.PredictedLon, B^.PredictedLat);
-    B^.PredictionErrorAccumulator := (B^.PredictionErrorAccumulator * 0.8) + (Error * 0.2);
-    
-    // Free Energy / Surprise calculation (Leaky integration of prediction error)
-    FGlobalSurprise := (FGlobalSurprise * 0.9) + (Error * 0.1);
+    B^.PredictionError := (B^.PredictionError * FConfig.SurpriseDampening) +
+                          (Error * (1.0 - FConfig.SurpriseDampening));
 
-    // Compute velocity and acceleration updates
-    InstantVelLon := (CurrentLon - B^.Lon) / Dt;
-    InstantVelLat := (CurrentLat - B^.Lat) / Dt;
+    // Update global cognitive surprise gradient
+    FSurpriseMetric := (FSurpriseMetric * 0.9) + (Error * 0.1);
 
-    B^.AccLon := (InstantVelLon - B^.VelLon) / Dt;
-    B^.AccLat := (InstantVelLat - B^.VelLat) / Dt;
+    // Differentiate velocity & acceleration
+    VLon := (CurrentLon - B^.Lon) / Dt;
+    VLat := (CurrentLat - B^.Lat) / Dt;
 
-    // Dampen noise with predictive exponential smoothing
-    B^.VelLon := (B^.VelLon * 0.65) + (InstantVelLon * 0.35);
-    B^.VelLat := (B^.VelLat * 0.65) + (InstantVelLat * 0.35);
+    B^.AccLon := (VLon - B^.VelLon) / Dt;
+    B^.AccLat := (VLat - B^.VelLat) / Dt;
+
+    Smooth := FConfig.KineticSmoothing;
+    B^.VelLon := (B^.VelLon * Smooth) + (VLon * (1.0 - Smooth));
+    B^.VelLat := (B^.VelLat * Smooth) + (VLat * (1.0 - Smooth));
   end;
 
   B^.Lon := CurrentLon;
   B^.Lat := CurrentLat;
-  B^.LastObservedTime := Now;
-  Inc(B^.ObservationsCount);
+  B^.LastObserved := Now;
+  Inc(B^.SampleCount);
 
-  // Top-down generative prediction for next 1 second step
+  // Generative forward prediction for the next 1-second step
   B^.PredictedLon := CurrentLon + (B^.VelLon * 1.0);
   B^.PredictedLat := CurrentLat + (B^.VelLat * 1.0);
 end;
 
-procedure TPredictiveCodingEngine.PredictEntity(const EntityID: string; LookaheadSeconds: Double; out OutLon, OutLat: Double);
+function TPredictiveCodingEngine.PredictPosition(const AID: string; LookaheadSec: Double): TPointF;
 var
   Idx: Integer;
   B: PKineticBelief;
 begin
-  Idx := FBeliefs.IndexOf(EntityID);
+  Idx := FBeliefs.IndexOf(AID);
   if Idx < 0 then
   begin
-    OutLon := 0.0;
-    OutLat := 0.0;
+    Result.X := 0.0;
+    Result.Y := 0.0;
     Exit;
   end;
 
   B := PKineticBelief(FBeliefs.Objects[Idx]);
-  // 2nd-order Taylor expansion with kinematic dampening
-  OutLon := B^.Lon + (B^.VelLon * LookaheadSeconds) + (0.5 * B^.AccLon * Sqr(LookaheadSeconds) * 0.1);
-  OutLat := B^.Lat + (B^.VelLat * LookaheadSeconds) + (0.5 * B^.AccLat * Sqr(LookaheadSeconds) * 0.1);
+  Result.X := B^.Lon + (B^.VelLon * LookaheadSec) + (0.5 * B^.AccLon * Sqr(LookaheadSec) * 0.05);
+  Result.Y := B^.Lat + (B^.VelLat * LookaheadSec) + (0.5 * B^.AccLat * Sqr(LookaheadSec) * 0.05);
 end;
 
 function TPredictiveCodingEngine.CalculateAnticipatoryIntercept(AttackerLon, AttackerLat, AttackerSpeed: Double;
@@ -792,20 +693,19 @@ begin
 
   B := PKineticBelief(FBeliefs.Objects[Idx]);
   Dist := EuclideanDist(AttackerLon, AttackerLat, B^.Lon, B^.Lat);
-  
+
   if AttackerSpeed <= 0.001 then AttackerSpeed := 1.0;
   Tau := Min(Dist / AttackerSpeed, MaxHorizon);
 
-  // Intercept point projected along velocity trajectory
   Result.X := B^.Lon + (B^.VelLon * Tau);
   Result.Y := B^.Lat + (B^.VelLat * Tau);
 end;
 
-procedure TPredictiveCodingEngine.RemoveEntity(const EntityID: string);
+procedure TPredictiveCodingEngine.RemoveEntity(const AID: string);
 var
   Idx: Integer;
 begin
-  Idx := FBeliefs.IndexOf(EntityID);
+  Idx := FBeliefs.IndexOf(AID);
   if Idx >= 0 then
   begin
     Dispose(PKineticBelief(FBeliefs.Objects[Idx]));
@@ -818,7 +718,7 @@ end.
 
 ---
 
-### 4. `KyzuGenetics.pas` (Genetic Evolution & Hyperparameter Tuning)
+### 4. `KyzuGenetics.pas` (Genetic Optimization & Fitness Tracking)
 ```pascal
 unit KyzuGenetics;
 
@@ -827,54 +727,49 @@ unit KyzuGenetics;
 interface
 
 uses
-  Classes, SysUtils, Math, fpjson, jsonparser;
+  Classes, SysUtils, Math, fpjson, jsonparser, KyzuConfig;
 
 type
-  { Evolvable strategy genome vector }
   TStrategyGenome = record
-    AggressionFactor: Double;        // 0.2 .. 3.0
-    PredictiveLookahead: Double;     // 0.5 .. 5.0 seconds
-    RetreatHPRatio: Double;          // 0.0 .. 0.5
-    CityCaptureBias: Double;         // 0.1 .. 4.0
-    FlockingCohesion: Double;        // 0.0 .. 2.0
-    SurpriseSensitivity: Double;     // 0.1 .. 2.5
-    TargetDefenseRadius: Double;     // 2.0 .. 25.0
-    SpawnQuota: Integer;             // 1 .. 8
+    AggressionMult: Double;
+    LookaheadMult: Double;
+    RetreatHPRatio: Double;
+    CitySiegeMult: Double;
+    CohesionMult: Double;
+    HarvestMult: Double;
     Fitness: Double;
   end;
 
-  { Genetic Evolution Manager }
   TGeneticEngine = class
   private
+    FConfig: TAIConfig;
     FPopulation: array of TStrategyGenome;
     FActiveIndex: Integer;
     FGeneration: Integer;
-    FEpochDurationSeconds: Double;
-    FEpochStartTime: TDateTime;
+    FEpochStart: TDateTime;
     FStorageFile: string;
 
-    // Telemetry for active fitness
+    // Telemetry registers
     FKills: Integer;
     FDeaths: Integer;
     FCitiesCaptured: Integer;
     FDamageDealt: Double;
-    FAccumulatedSurprise: Double;
+    FResourcesHarvested: Double;
 
-    function MutateGene(Val, MinVal, MaxVal, MutationRate: Double): Double;
-    procedure MutateGenome(var G: TStrategyGenome);
-    function Crossover(const P1, P2: TStrategyGenome): TStrategyGenome;
+    function MutateGene(Val, MinV, MaxV: Double): Double;
+    procedure Mutate(var G: TStrategyGenome);
+    function Crossover(const A, B: TStrategyGenome): TStrategyGenome;
   public
-    constructor Create(const AStorageFile: string = 'kyzu_genome.json');
+    constructor Create(AConfig: TAIConfig; const AStorageFile: string = 'kyzu_evolved_genome.json');
     destructor Destroy; override;
 
-    procedure InitializePopulation(Size: Integer = 6);
     procedure RecordKill;
     procedure RecordDeath;
     procedure RecordCityCapture;
     procedure RecordDamage(Amount: Double);
-    procedure IngestSurprise(SurpriseVal: Double);
+    procedure RecordHarvest(Amount: Double);
 
-    procedure EvaluateEpoch(ForceNext: Boolean = False);
+    procedure EvaluateEpoch(SurpriseSum: Double);
     procedure SaveBestGenome;
     procedure LoadBestGenome;
 
@@ -885,14 +780,28 @@ type
 
 implementation
 
-constructor TGeneticEngine.Create(const AStorageFile: string);
+constructor TGeneticEngine.Create(AConfig: TAIConfig; const AStorageFile: string);
+var
+  i: Integer;
 begin
+  FConfig := AConfig;
   FStorageFile := AStorageFile;
   FActiveIndex := 0;
   FGeneration := 1;
-  FEpochDurationSeconds := 45.0; // 45 seconds per evaluation cycle
-  FEpochStartTime := Now;
-  InitializePopulation(6);
+  FEpochStart := Now;
+
+  SetLength(FPopulation, FConfig.PopulationSize);
+  for i := 0 to High(FPopulation) do
+  begin
+    FPopulation[i].AggressionMult := 0.7 + Random * 1.5;
+    FPopulation[i].LookaheadMult := 0.8 + Random * 1.2;
+    FPopulation[i].RetreatHPRatio := 0.15 + Random * 0.25;
+    FPopulation[i].CitySiegeMult := 0.8 + Random * 1.5;
+    FPopulation[i].CohesionMult := 0.5 + Random * 1.0;
+    FPopulation[i].HarvestMult := 0.7 + Random * 1.3;
+    FPopulation[i].Fitness := 0.0;
+  end;
+
   LoadBestGenome;
 end;
 
@@ -902,60 +811,36 @@ begin
   inherited Destroy;
 end;
 
-procedure TGeneticEngine.InitializePopulation(Size: Integer);
-var
-  i: Integer;
-begin
-  SetLength(FPopulation, Size);
-  for i := 0 to Size - 1 do
-  begin
-    FPopulation[i].AggressionFactor := 0.8 + Random * 1.5;
-    FPopulation[i].PredictiveLookahead := 1.0 + Random * 3.0;
-    FPopulation[i].RetreatHPRatio := 0.1 + Random * 0.3;
-    FPopulation[i].CityCaptureBias := 0.5 + Random * 2.0;
-    FPopulation[i].FlockingCohesion := 0.2 + Random * 1.2;
-    FPopulation[i].SurpriseSensitivity := 0.5 + Random * 1.0;
-    FPopulation[i].TargetDefenseRadius := 5.0 + Random * 15.0;
-    FPopulation[i].SpawnQuota := 2 + Random(4);
-    FPopulation[i].Fitness := 0.0;
-  end;
-end;
-
-function TGeneticEngine.MutateGene(Val, MinVal, MaxVal, MutationRate: Double): Double;
+function TGeneticEngine.MutateGene(Val, MinV, MaxV: Double): Double;
 var
   Delta: Double;
 begin
-  if Random < 0.35 then
+  if Random < FConfig.MutationRate then
   begin
-    Delta := (Random - 0.5) * (MaxVal - MinVal) * MutationRate;
-    Val := EnsureRange(Val + Delta, MinVal, MaxVal);
+    Delta := (Random - 0.5) * (MaxV - MinV) * 0.3;
+    Val := EnsureRange(Val + Delta, MinV, MaxV);
   end;
   Result := Val;
 end;
 
-procedure TGeneticEngine.MutateGenome(var G: TStrategyGenome);
+procedure TGeneticEngine.Mutate(var G: TStrategyGenome);
 begin
-  G.AggressionFactor := MutateGene(G.AggressionFactor, 0.2, 3.0, 0.3);
-  G.PredictiveLookahead := MutateGene(G.PredictiveLookahead, 0.5, 5.0, 0.25);
-  G.RetreatHPRatio := MutateGene(G.RetreatHPRatio, 0.0, 0.5, 0.2);
-  G.CityCaptureBias := MutateGene(G.CityCaptureBias, 0.1, 4.0, 0.3);
-  G.FlockingCohesion := MutateGene(G.FlockingCohesion, 0.0, 2.0, 0.25);
-  G.SurpriseSensitivity := MutateGene(G.SurpriseSensitivity, 0.1, 2.5, 0.25);
-  G.TargetDefenseRadius := MutateGene(G.TargetDefenseRadius, 2.0, 25.0, 0.3);
-  if Random < 0.25 then
-    G.SpawnQuota := EnsureRange(G.SpawnQuota + Random(3) - 1, 1, 8);
+  G.AggressionMult := MutateGene(G.AggressionMult, 0.2, 3.5);
+  G.LookaheadMult := MutateGene(G.LookaheadMult, 0.3, 3.0);
+  G.RetreatHPRatio := MutateGene(G.RetreatHPRatio, 0.05, 0.5);
+  G.CitySiegeMult := MutateGene(G.CitySiegeMult, 0.2, 4.0);
+  G.CohesionMult := MutateGene(G.CohesionMult, 0.0, 2.5);
+  G.HarvestMult := MutateGene(G.HarvestMult, 0.2, 3.0);
 end;
 
-function TGeneticEngine.Crossover(const P1, P2: TStrategyGenome): TStrategyGenome;
+function TGeneticEngine.Crossover(const A, B: TStrategyGenome): TStrategyGenome;
 begin
-  Result.AggressionFactor := (P1.AggressionFactor + P2.AggressionFactor) * 0.5;
-  Result.PredictiveLookahead := (P1.PredictiveLookahead + P2.PredictiveLookahead) * 0.5;
-  Result.RetreatHPRatio := (P1.RetreatHPRatio + P2.RetreatHPRatio) * 0.5;
-  Result.CityCaptureBias := (P1.CityCaptureBias + P2.CityCaptureBias) * 0.5;
-  Result.FlockingCohesion := (P1.FlockingCohesion + P2.FlockingCohesion) * 0.5;
-  Result.SurpriseSensitivity := (P1.SurpriseSensitivity + P2.SurpriseSensitivity) * 0.5;
-  Result.TargetDefenseRadius := (P1.TargetDefenseRadius + P2.TargetDefenseRadius) * 0.5;
-  Result.SpawnQuota := Round((P1.SpawnQuota + P2.SpawnQuota) * 0.5);
+  Result.AggressionMult := (A.AggressionMult + B.AggressionMult) * 0.5;
+  Result.LookaheadMult := (A.LookaheadMult + B.LookaheadMult) * 0.5;
+  Result.RetreatHPRatio := (A.RetreatHPRatio + B.RetreatHPRatio) * 0.5;
+  Result.CitySiegeMult := (A.CitySiegeMult + B.CitySiegeMult) * 0.5;
+  Result.CohesionMult := (A.CohesionMult + B.CohesionMult) * 0.5;
+  Result.HarvestMult := (A.HarvestMult + B.HarvestMult) * 0.5;
   Result.Fitness := 0.0;
 end;
 
@@ -963,60 +848,61 @@ procedure TGeneticEngine.RecordKill; begin Inc(FKills); end;
 procedure TGeneticEngine.RecordDeath; begin Inc(FDeaths); end;
 procedure TGeneticEngine.RecordCityCapture; begin Inc(FCitiesCaptured); end;
 procedure TGeneticEngine.RecordDamage(Amount: Double); begin FDamageDealt := FDamageDealt + Amount; end;
-procedure TGeneticEngine.IngestSurprise(SurpriseVal: Double); begin FAccumulatedSurprise := FAccumulatedSurprise + SurpriseVal; end;
+procedure TGeneticEngine.RecordHarvest(Amount: Double); begin FResourcesHarvested := FResourcesHarvested + Amount; end;
 
-procedure TGeneticEngine.EvaluateEpoch(ForceNext: Boolean);
+procedure TGeneticEngine.EvaluateEpoch(SurpriseSum: Double);
 var
   Elapsed: Double;
-  FitnessScore: Double;
-  BestIdx, SecondIdx, i: Integer;
+  Score: Double;
+  BestIdx, RunnerUpIdx, i: Integer;
 begin
-  Elapsed := (Now - FEpochStartTime) * 86400.0;
-  if (not ForceNext) and (Elapsed < FEpochDurationSeconds) then Exit;
+  if not FConfig.GeneticAutoEvolve then Exit;
 
-  // Composite Fitness calculation
-  FitnessScore := (FKills * 120.0) +
-                  (FCitiesCaptured * 300.0) +
-                  (FDamageDealt * 1.5) -
-                  (FDeaths * 90.0) -
-                  (FAccumulatedSurprise * 5.0);
+  Elapsed := (Now - FEpochStart) * 86400.0;
+  if Elapsed < FConfig.EpochDurationSec then Exit;
 
-  FPopulation[FActiveIndex].Fitness := FitnessScore;
-  Writeln(Format('[EVOLUTION] Individual %d Fitness: %.2f (K:%d D:%d Caps:%d Dmg:%.1f)',
-                 [FActiveIndex, FitnessScore, FKills, FDeaths, FCitiesCaptured, FDamageDealt]));
+  Score := (FKills * 150.0) +
+           (FCitiesCaptured * 400.0) +
+           (FResourcesHarvested * 1.5) +
+           (FDamageDealt * 2.0) -
+           (FDeaths * 100.0) -
+           (SurpriseSum * 10.0);
 
-  // Reset telemetry
+  FPopulation[FActiveIndex].Fitness := Score;
+  Writeln(StdErr, Format('[EVO-EPOCH] Gen %d | Ind %d | Score: %.2f (Kills:%d Deaths:%d Caps:%d Dmg:%.1f Harf:%.1f)',
+                 [FGeneration, FActiveIndex, Score, FKills, FDeaths, FCitiesCaptured, FDamageDealt, FResourcesHarvested]));
+
+  // Reset registers
   FKills := 0;
   FDeaths := 0;
   FCitiesCaptured := 0;
   FDamageDealt := 0.0;
-  FAccumulatedSurprise := 0.0;
-  FEpochStartTime := Now;
+  FResourcesHarvested := 0.0;
+  FEpochStart := Now;
 
   Inc(FActiveIndex);
   if FActiveIndex >= Length(FPopulation) then
   begin
-    // Epoch Generation Complete: Evolve
     BestIdx := 0;
-    SecondIdx := 0;
+    RunnerUpIdx := 0;
     for i := 1 to High(FPopulation) do
     begin
       if FPopulation[i].Fitness > FPopulation[BestIdx].Fitness then
       begin
-        SecondIdx := BestIdx;
+        RunnerUpIdx := BestIdx;
         BestIdx := i;
       end;
     end;
 
-    Writeln(Format('=== GENERATION %d COMPLETE. Dominant Fitness: %.2f ===', [FGeneration, FPopulation[BestIdx].Fitness]));
+    Writeln(StdErr, Format('>>> GENERATION %d COMPLETE. Top Fitness: %.2f <<<', [FGeneration, FPopulation[BestIdx].Fitness]));
     SaveBestGenome;
 
-    // Produce offspring
+    // Breed next generation
     for i := 0 to High(FPopulation) do
     begin
       if i = BestIdx then Continue;
-      FPopulation[i] := Crossover(FPopulation[BestIdx], FPopulation[SecondIdx]);
-      MutateGenome(FPopulation[i]);
+      FPopulation[i] := Crossover(FPopulation[BestIdx], FPopulation[RunnerUpIdx]);
+      Mutate(FPopulation[i]);
     end;
 
     FActiveIndex := 0;
@@ -1028,26 +914,24 @@ procedure TGeneticEngine.SaveBestGenome;
 var
   J: TJSONObject;
   G: TStrategyGenome;
-  F: TStringList;
+  SL: TStringList;
 begin
   G := GetActiveGenome;
   J := TJSONObject.Create;
   try
-    J.Floats['aggression'] := G.AggressionFactor;
-    J.Floats['lookahead'] := G.PredictiveLookahead;
-    J.Floats['retreat_hp'] := G.RetreatHPRatio;
-    J.Floats['city_bias'] := G.CityCaptureBias;
-    J.Floats['cohesion'] := G.FlockingCohesion;
-    J.Floats['surprise_sensitivity'] := G.SurpriseSensitivity;
-    J.Floats['defense_radius'] := G.TargetDefenseRadius;
-    J.Integers['spawn_quota'] := G.SpawnQuota;
+    J.Floats['aggression_mult'] := G.AggressionMult;
+    J.Floats['lookahead_mult'] := G.LookaheadMult;
+    J.Floats['retreat_hp_ratio'] := G.RetreatHPRatio;
+    J.Floats['city_siege_mult'] := G.CitySiegeMult;
+    J.Floats['cohesion_mult'] := G.CohesionMult;
+    J.Floats['harvest_mult'] := G.HarvestMult;
 
-    F := TStringList.Create;
+    SL := TStringList.Create;
     try
-      F.Text := J.AsJSON;
-      F.SaveToFile(FStorageFile);
+      SL.Text := J.FormatJSON();
+      SL.SaveToFile(FStorageFile);
     finally
-      F.Free;
+      SL.Free;
     end;
   finally
     J.Free;
@@ -1056,34 +940,32 @@ end;
 
 procedure TGeneticEngine.LoadBestGenome;
 var
-  F: TStringList;
+  SL: TStringList;
   JData: TJSONData;
   J: TJSONObject;
 begin
   if not FileExists(FStorageFile) then Exit;
-  F := TStringList.Create;
+  SL := TStringList.Create;
   try
-    F.LoadFromFile(FStorageFile);
-    JData := GetJSON(F.Text);
+    SL.LoadFromFile(FStorageFile);
+    JData := GetJSON(SL.Text);
     try
       if JData is TJSONObject then
       begin
         J := TJSONObject(JData);
-        FPopulation[0].AggressionFactor := J.Get('aggression', FPopulation[0].AggressionFactor);
-        FPopulation[0].PredictiveLookahead := J.Get('lookahead', FPopulation[0].PredictiveLookahead);
-        FPopulation[0].RetreatHPRatio := J.Get('retreat_hp', FPopulation[0].RetreatHPRatio);
-        FPopulation[0].CityCaptureBias := J.Get('city_bias', FPopulation[0].CityCaptureBias);
-        FPopulation[0].FlockingCohesion := J.Get('cohesion', FPopulation[0].FlockingCohesion);
-        FPopulation[0].SurpriseSensitivity := J.Get('surprise_sensitivity', FPopulation[0].SurpriseSensitivity);
-        FPopulation[0].TargetDefenseRadius := J.Get('defense_radius', FPopulation[0].TargetDefenseRadius);
-        FPopulation[0].SpawnQuota := J.Get('spawn_quota', FPopulation[0].SpawnQuota);
-        Writeln('[EVOLUTION] Loaded saved genome into active pool.');
+        FPopulation[0].AggressionMult := J.Get('aggression_mult', FPopulation[0].AggressionMult);
+        FPopulation[0].LookaheadMult := J.Get('lookahead_mult', FPopulation[0].LookaheadMult);
+        FPopulation[0].RetreatHPRatio := J.Get('retreat_hp_ratio', FPopulation[0].RetreatHPRatio);
+        FPopulation[0].CitySiegeMult := J.Get('city_siege_mult', FPopulation[0].CitySiegeMult);
+        FPopulation[0].CohesionMult := J.Get('cohesion_mult', FPopulation[0].CohesionMult);
+        FPopulation[0].HarvestMult := J.Get('harvest_mult', FPopulation[0].HarvestMult);
+        Writeln(StdErr, '[EVO] Successfully restored evolved genome from ' + FStorageFile);
       end;
     finally
       JData.Free;
     end;
   finally
-    F.Free;
+    SL.Free;
   end;
 end;
 
@@ -1097,7 +979,140 @@ end.
 
 ---
 
-### 5. `KyzuBrain.pas` (Predictive Multi-Agent Tactical Coordinator)
+### 5. `KyzuIO.pas` (Threaded Stdin/Stdout Line-Buffered IPC)
+```pascal
+unit KyzuIO;
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils
+  {$IFDEF UNIX}
+  , BaseUnix
+  {$ENDIF};
+
+type
+  { Background thread reading line-buffered JSON from Stdin }
+  TStdinReaderThread = class(TThread)
+  private
+    FQueue: TStringList;
+    FLock: TRTLCriticalSection;
+    FTerminatedFlag: Boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function PopLine(out Line: string): Boolean;
+    property IsPipeClosed: Boolean read FTerminatedFlag;
+  end;
+
+  { Line-buffered stdout command emitter }
+  TStdoutWriter = class
+  private
+    FLock: TRTLCriticalSection;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure SendLine(const ALine: string);
+  end;
+
+implementation
+
+{ TStdinReaderThread }
+constructor TStdinReaderThread.Create;
+begin
+  InitCriticalSection(FLock);
+  FQueue := TStringList.Create;
+  FTerminatedFlag := False;
+  inherited Create(False);
+end;
+
+destructor TStdinReaderThread.Destroy;
+begin
+  FQueue.Free;
+  DoneCriticalSection(FLock);
+  inherited Destroy;
+end;
+
+procedure TStdinReaderThread.Execute;
+var
+  Line: string;
+begin
+  while not Terminated do
+  begin
+    if Eof(Input) then
+    begin
+      FTerminatedFlag := True;
+      Break;
+    end;
+
+    try
+      ReadLn(Input, Line);
+      if Line <> '' then
+      begin
+        EnterCriticalSection(FLock);
+        try
+          FQueue.Add(Line);
+        finally
+          LeaveCriticalSection(FLock);
+        end;
+      end;
+    except
+      FTerminatedFlag := True;
+      Break;
+    end;
+  end;
+end;
+
+function TStdinReaderThread.PopLine(out Line: string): Boolean;
+begin
+  Result := False;
+  Line := '';
+  EnterCriticalSection(FLock);
+  try
+    if FQueue.Count > 0 then
+    begin
+      Line := FQueue[0];
+      FQueue.Delete(0);
+      Result := True;
+    end;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+{ TStdoutWriter }
+constructor TStdoutWriter.Create;
+begin
+  InitCriticalSection(FLock);
+end;
+
+destructor TStdoutWriter.Destroy;
+begin
+  DoneCriticalSection(FLock);
+  inherited Destroy;
+end;
+
+procedure TStdoutWriter.SendLine(const ALine: string);
+begin
+  EnterCriticalSection(FLock);
+  try
+    WriteLn(Output, ALine);
+    Flush(Output);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+end.
+```
+
+---
+
+### 6. `KyzuBrain.pas` (Unified Kyzu VDRX AI Core)
 ```pascal
 unit KyzuBrain;
 
@@ -1107,56 +1122,66 @@ interface
 
 uses
   Classes, SysUtils, Math, fpjson, jsonparser,
-  KyzuSockets, KyzuEntities, KyzuPredictive, KyzuGenetics;
+  KyzuConfig, KyzuEntities, KyzuPredictive, KyzuGenetics, KyzuIO;
 
 type
   TKyzuBrain = class
   private
-    FWS: TWebSocketClient;
-    FFaction: string;
-    FHomeLon, FHomeLat: Double;
-    FUnits: TStringList;  // UnitID -> TKyzuUnit
-    FCities: TStringList; // CityID -> TKyzuCity
+    FConfig: TAIConfig;
+    FWriter: TStdoutWriter;
+    FDispatcher: TEventDispatcher;
     FPredictor: TPredictiveCodingEngine;
     FGenetics: TGeneticEngine;
-    FDispatcher: TEventDispatcher;
-    FNextID: Int64;
+
+    // Game entity registries
+    FUnits: TStringList;  // ID -> TKyzuUnit
+    FCities: TStringList; // ID -> TKyzuCity
+    FNodes: TStringList;  // ID -> TKyzuNode
+    FRoads: TStringList;  // ID -> TKyzuRoad
+
+    FNextSeq: Int64;
+    FLastSyncTime: TDateTime;
+    FLastPingTime: TDateTime;
 
     function GenerateID(const Prefix: string): string;
-    procedure Publish(const Topic: string; Payload: TJSONObject);
-    procedure HandleIncomingJSON(const RawJSON: string);
+    procedure EmitCommand(const Topic: string; Payload: TJSONObject);
+
     procedure SetupEventHandlers;
 
-    // Topic handlers
+    // Kyzu API topic handlers
     procedure OnEventSpawned(P: TJSONObject);
     procedure OnEventPosition(P: TJSONObject);
     procedure OnEventDespawned(P: TJSONObject);
     procedure OnEventUnitAttacked(P: TJSONObject);
     procedure OnEventCityUpdated(P: TJSONObject);
     procedure OnEventCityAbandoned(P: TJSONObject);
+    procedure OnEventNodeList(P: TJSONObject);
+    procedure OnEventCityList(P: TJSONObject);
+    procedure OnEventRoadList(P: TJSONObject);
+    procedure OnEventCollected(P: TJSONObject);
+    procedure OnEventTick(P: TJSONObject);
+    procedure OnEventPong(P: TJSONObject);
+
+    // Sub-agent roles
+    procedure DriveCombatSoldier(U: TKyzuUnit; const G: TStrategyGenome; FlockLon, FlockLat: Double);
+    procedure DriveHarvester(U: TKyzuUnit; const G: TStrategyGenome);
+    procedure DrivePioneer(U: TKyzuUnit; const G: TStrategyGenome);
+
   public
-    constructor Create(AWS: TWebSocketClient; const AFaction: string;
-                       AHomeLon, AHomeLat: Double);
+    constructor Create(AConfig: TAIConfig; AWriter: TStdoutWriter);
     destructor Destroy; override;
 
-    procedure ProcessMessage(const AMessage: string);
-    procedure ThinkAndAct; // Decision loop
-
-    property Faction: string read FFaction;
-    property Genetics: TGeneticEngine read FGenetics;
-    property Predictor: TPredictiveCodingEngine read FPredictor;
+    procedure IngestJSONLine(const ALine: string);
+    procedure ThinkAndAct; // Invoked per decision cycle
+    procedure SyncWorldState; // Periodic snapshot request
   end;
 
 implementation
 
-constructor TKyzuBrain.Create(AWS: TWebSocketClient; const AFaction: string;
-                              AHomeLon, AHomeLat: Double);
+constructor TKyzuBrain.Create(AConfig: TAIConfig; AWriter: TStdoutWriter);
 begin
-  FWS := AWS;
-  FFaction := AFaction;
-  FHomeLon := AHomeLon;
-  FHomeLat := AHomeLat;
-  FNextID := 0;
+  FConfig := AConfig;
+  FWriter := AWriter;
 
   FUnits := TStringList.Create;
   FUnits.Sorted := True;
@@ -1164,9 +1189,19 @@ begin
   FCities := TStringList.Create;
   FCities.Sorted := True;
 
-  FPredictor := TPredictiveCodingEngine.Create;
-  FGenetics := TGeneticEngine.Create('kyzu_evolved_genome.json');
+  FNodes := TStringList.Create;
+  FNodes.Sorted := True;
+
+  FRoads := TStringList.Create;
+  FRoads.Sorted := True;
+
   FDispatcher := TEventDispatcher.Create;
+  FPredictor := TPredictiveCodingEngine.Create(FConfig);
+  FGenetics := TGeneticEngine.Create(FConfig, 'kyzu_evolved_genome.json');
+
+  FNextSeq := 0;
+  FLastSyncTime := 0;
+  FLastPingTime := Now;
 
   SetupEventHandlers;
 end;
@@ -1177,47 +1212,61 @@ var
 begin
   for i := 0 to FUnits.Count - 1 do FUnits.Objects[i].Free;
   FUnits.Free;
-
   for i := 0 to FCities.Count - 1 do FCities.Objects[i].Free;
   FCities.Free;
+  for i := 0 to FNodes.Count - 1 do FNodes.Objects[i].Free;
+  FNodes.Free;
+  for i := 0 to FRoads.Count - 1 do FRoads.Objects[i].Free;
+  FRoads.Free;
 
+  FDispatcher.Free;
   FPredictor.Free;
   FGenetics.Free;
-  FDispatcher.Free;
   inherited Destroy;
 end;
 
 function TKyzuBrain.GenerateID(const Prefix: string): string;
 begin
-  Inc(FNextID);
-  Result := Format('%s_%s_%d_%d', [Prefix, FFaction, DateTimeToTimeStamp(Now).Time, FNextID]);
+  Inc(FNextSeq);
+  Result := Format('%s_%s_%d', [Prefix, FConfig.FactionName, FNextSeq]);
 end;
 
-procedure TKyzuBrain.Publish(const Topic: string; Payload: TJSONObject);
+procedure TKyzuBrain.EmitCommand(const Topic: string; Payload: TJSONObject);
 var
-  Root: TJSONObject;
+  Envelope: TJSONObject;
 begin
-  Root := TJSONObject.Create;
+  Envelope := TJSONObject.Create;
   try
-    Root.Strings['method'] := 'publish';
-    Root.Strings['topic'] := Topic;
-    Root.Add('payload', Payload);
-    FWS.SendText(Root.AsJSON);
+    Envelope.Strings['topic'] := Topic;
+    // As per VDRX API doc: payload can be object or escaped JSON string. Object is emitted.
+    Envelope.Add('payload', Payload);
+    FWriter.SendLine(Envelope.AsJSON);
   finally
-    Root.Free;
+    Envelope.Free;
   end;
 end;
 
 procedure TKyzuBrain.SetupEventHandlers;
 begin
-  FDispatcher.RegisterTopic('game.event.spawned', TMethod(@Self.OnEventSpawned));
-  FDispatcher.RegisterTopic('game.event.position', TMethod(@Self.OnEventPosition));
-  FDispatcher.RegisterTopic('game.event.despawned', TMethod(@Self.OnEventDespawned));
-  FDispatcher.RegisterTopic('game.event.unit_attacked', TMethod(@Self.OnEventUnitAttacked));
-  FDispatcher.RegisterTopic('game.event.city_founded', TMethod(@Self.OnEventCityUpdated));
-  FDispatcher.RegisterTopic('game.event.city_grew', TMethod(@Self.OnEventCityUpdated));
-  FDispatcher.RegisterTopic('game.event.city_captured', TMethod(@Self.OnEventCityUpdated));
-  FDispatcher.RegisterTopic('game.event.city_abandoned', TMethod(@Self.OnEventCityAbandoned));
+  FDispatcher.Subscribe('game.event.pong', TMethod(@Self.OnEventPong));
+  FDispatcher.Subscribe('game.event.spawned', TMethod(@Self.OnEventSpawned));
+  FDispatcher.Subscribe('game.event.position', TMethod(@Self.OnEventPosition));
+  FDispatcher.Subscribe('game.event.despawned', TMethod(@Self.OnEventDespawned));
+  FDispatcher.Subscribe('game.event.unit_attacked', TMethod(@Self.OnEventUnitAttacked));
+  FDispatcher.Subscribe('game.event.city_founded', TMethod(@Self.OnEventCityUpdated));
+  FDispatcher.Subscribe('game.event.city_grew', TMethod(@Self.OnEventCityUpdated));
+  FDispatcher.Subscribe('game.event.city_captured', TMethod(@Self.OnEventCityUpdated));
+  FDispatcher.Subscribe('game.event.city_abandoned', TMethod(@Self.OnEventCityAbandoned));
+  FDispatcher.Subscribe('game.event.node_list', TMethod(@Self.OnEventNodeList));
+  FDispatcher.Subscribe('game.event.city_list', TMethod(@Self.OnEventCityList));
+  FDispatcher.Subscribe('game.event.road_list', TMethod(@Self.OnEventRoadList));
+  FDispatcher.Subscribe('game.event.collected', TMethod(@Self.OnEventCollected));
+  FDispatcher.Subscribe('game.tick', TMethod(@Self.OnEventTick));
+end;
+
+procedure TKyzuBrain.OnEventPong(P: TJSONObject);
+begin
+  // Pong verified
 end;
 
 procedure TKyzuBrain.OnEventSpawned(P: TJSONObject);
@@ -1228,6 +1277,7 @@ var
 begin
   UID := P.Get('unit_id', '');
   if UID = '' then Exit;
+
   Idx := FUnits.IndexOf(UID);
   if Idx < 0 then
   begin
@@ -1243,6 +1293,8 @@ begin
   U.Lat := P.Get('lat', 0.0);
   U.HP := P.Get('hp', 100.0);
   U.MaxHP := U.HP;
+  U.Level := P.Get('level', 0);
+  U.AttackPower := P.Get('attack', 10.0);
   U.Attributes.IngestJSON(P);
 
   FPredictor.IngestObservation(UID, U.Lon, U.Lat);
@@ -1261,6 +1313,7 @@ begin
     U := TKyzuUnit(FUnits.Objects[Idx]);
     U.Lon := P.Get('lon', U.Lon);
     U.Lat := P.Get('lat', U.Lat);
+    U.IsMoving := True;
     U.LastUpdate := Now;
     FPredictor.IngestObservation(UID, U.Lon, U.Lat);
   end;
@@ -1275,7 +1328,7 @@ begin
   Idx := FUnits.IndexOf(UID);
   if Idx >= 0 then
   begin
-    if TKyzuUnit(FUnits.Objects[Idx]).Owner = FFaction then
+    if TKyzuUnit(FUnits.Objects[Idx]).Owner = FConfig.FactionName then
       FGenetics.RecordDeath
     else
       FGenetics.RecordKill;
@@ -1288,20 +1341,23 @@ end;
 
 procedure TKyzuBrain.OnEventUnitAttacked(P: TJSONObject);
 var
-  TargetID: string;
+  TargetID, AttackerID: string;
   Idx: Integer;
   U: TKyzuUnit;
   RemainingHP, Loss: Double;
 begin
   TargetID := P.Get('target_unit_id', '');
+  AttackerID := P.Get('attacker_unit_id', '');
   RemainingHP := P.Get('remaining_hp', 0.0);
+
   Idx := FUnits.IndexOf(TargetID);
   if Idx >= 0 then
   begin
     U := TKyzuUnit(FUnits.Objects[Idx]);
     Loss := Max(0.0, U.HP - RemainingHP);
     U.HP := RemainingHP;
-    if U.Owner <> FFaction then
+
+    if U.Owner <> FConfig.FactionName then
       FGenetics.RecordDamage(Loss);
   end;
 end;
@@ -1325,7 +1381,7 @@ begin
     C := TKyzuCity(FCities.Objects[Idx]);
 
   NewOwner := P.Get('owner', P.Get('new_owner', C.Owner));
-  if (NewOwner = FFaction) and (C.Owner <> FFaction) and (C.Owner <> '') then
+  if (NewOwner = FConfig.FactionName) and (C.Owner <> FConfig.FactionName) and (C.Owner <> '') then
     FGenetics.RecordCityCapture;
 
   C.Owner := NewOwner;
@@ -1349,28 +1405,121 @@ begin
   end;
 end;
 
-procedure TKyzuBrain.HandleIncomingJSON(const RawJSON: string);
+procedure TKyzuBrain.OnEventNodeList(P: TJSONObject);
+var
+  NodesArr: TJSONArray;
+  Item: TJSONObject;
+  i, Idx: Integer;
+  NID: string;
+  Node: TKyzuNode;
+begin
+  NodesArr := P.Get('nodes', TJSONArray(nil));
+  if NodesArr = nil then Exit;
+
+  for i := 0 to NodesArr.Count - 1 do
+  begin
+    if NodesArr.Types[i] <> jtObject then Continue;
+    Item := TJSONObject(NodesArr.Items[i]);
+    NID := Item.Get('node_id', '');
+    if NID = '' then Continue;
+
+    Idx := FNodes.IndexOf(NID);
+    if Idx < 0 then
+    begin
+      Node := TKyzuNode.Create(NID);
+      FNodes.AddObject(NID, Node);
+    end
+    else
+      Node := TKyzuNode(FNodes.Objects[Idx]);
+
+    Node.NodeType := Item.Get('node_type', 'resource');
+    Node.Lon := Item.Get('lon', Node.Lon);
+    Node.Lat := Item.Get('lat', Node.Lat);
+    Node.Amount := Item.Get('amount', Node.Amount);
+    Node.Attributes.IngestJSON(Item);
+  end;
+end;
+
+procedure TKyzuBrain.OnEventCityList(P: TJSONObject);
+var
+  CitiesArr: TJSONArray;
+  Item: TJSONObject;
+  i: Integer;
+begin
+  CitiesArr := P.Get('cities', TJSONArray(nil));
+  if CitiesArr = nil then Exit;
+  for i := 0 to CitiesArr.Count - 1 do
+  begin
+    if CitiesArr.Types[i] = jtObject then
+      OnEventCityUpdated(TJSONObject(CitiesArr.Items[i]));
+  end;
+end;
+
+procedure TKyzuBrain.OnEventRoadList(P: TJSONObject);
+var
+  RoadsArr: TJSONArray;
+  Item: TJSONObject;
+  i, Idx: Integer;
+  RID: string;
+  R: TKyzuRoad;
+begin
+  RoadsArr := P.Get('roads', TJSONArray(nil));
+  if RoadsArr = nil then Exit;
+
+  for i := 0 to RoadsArr.Count - 1 do
+  begin
+    if RoadsArr.Types[i] <> jtObject then Continue;
+    Item := TJSONObject(RoadsArr.Items[i]);
+    RID := Item.Get('road_id', '');
+    if RID = '' then Continue;
+
+    Idx := FRoads.IndexOf(RID);
+    if Idx < 0 then
+    begin
+      R := TKyzuRoad.Create(RID);
+      FRoads.AddObject(RID, R);
+    end
+    else
+      R := TKyzuRoad(FRoads.Objects[Idx]);
+
+    R.FromCityID := Item.Get('from_city_id', '');
+    R.ToCityID := Item.Get('to_city_id', '');
+    R.Owner := Item.Get('owner', '');
+    R.Attributes.IngestJSON(Item);
+  end;
+end;
+
+procedure TKyzuBrain.OnEventCollected(P: TJSONObject);
+var
+  Amt: Double;
+  ByFaction: string;
+begin
+  ByFaction := P.Get('by', '');
+  Amt := P.Get('collected_amount', 0.0);
+  if ByFaction = FConfig.FactionName then
+    FGenetics.RecordHarvest(Amt);
+end;
+
+procedure TKyzuBrain.OnEventTick(P: TJSONObject);
+begin
+  // Game tick notification received from engine
+end;
+
+procedure TKyzuBrain.IngestJSONLine(const ALine: string);
 var
   JData, PayloadData: TJSONData;
-  Root, PayloadObj: TJSONObject;
+  Envelope, PayloadObj: TJSONObject;
   Topic: string;
 begin
-  JData := GetJSON(RawJSON);
+  JData := GetJSON(ALine);
   try
     if not (JData is TJSONObject) then Exit;
-    Root := TJSONObject(JData);
+    Envelope := TJSONObject(JData);
 
-    if Root.Get('event', '') = 'auth.ok' then
-    begin
-      Writeln(Format('[BRAIN] Authenticated as %s. Subscribing to game events...', [Root.Get('source', '')]));
-      FWS.SendText('{"method":"subscribe","filter":"game.>"}');
-      Exit;
-    end;
-
-    Topic := Root.Get('topic', '');
+    Topic := Envelope.Get('topic', '');
     if Topic = '' then Exit;
 
-    PayloadData := Root.Find('payload');
+    PayloadData := Envelope.Find('payload');
     if PayloadData = nil then Exit;
 
     PayloadObj := nil;
@@ -1379,7 +1528,8 @@ begin
     else if PayloadData.JSONType = jtString then
     begin
       PayloadData := GetJSON(PayloadData.AsString);
-      if PayloadData is TJSONObject then PayloadObj := TJSONObject(PayloadData);
+      if PayloadData is TJSONObject then
+        PayloadObj := TJSONObject(PayloadData);
     end;
 
     if PayloadObj <> nil then
@@ -1390,183 +1540,305 @@ begin
   end;
 end;
 
-procedure TKyzuBrain.ProcessMessage(const AMessage: string);
+procedure TKyzuBrain.SyncWorldState;
+var
+  P: TJSONObject;
 begin
+  P := TJSONObject.Create;
   try
-    HandleIncomingJSON(AMessage);
-  except
-    on E: Exception do
-      Writeln('[BRAIN ERROR] Parse exception: ' + E.Message);
+    EmitCommand('game.cmd.list_cities', P.Clone as TJSONObject);
+    EmitCommand('game.cmd.list_roads', P.Clone as TJSONObject);
+    EmitCommand('game.cmd.list_nodes', P.Clone as TJSONObject);
+  finally
+    P.Free;
+  end;
+end;
+
+procedure TKyzuBrain.DriveCombatSoldier(U: TKyzuUnit; const G: TStrategyGenome; FlockLon, FlockLat: Double);
+var
+  j: Integer;
+  TargetU: TKyzuUnit;
+  C: TKyzuCity;
+  BestUnitID, BestCityID: string;
+  BestUnitScore, BestCityScore, Dist, Score: Double;
+  Intercept: TPointF;
+  MovePayload, AttackPayload: TJSONObject;
+begin
+  // Retreat check
+  if (U.MaxHP > 0) and ((U.HP / U.MaxHP) < (FConfig.RetreatHPRatio * G.RetreatHPRatio)) then
+  begin
+    MovePayload := TJSONObject.Create;
+    MovePayload.Strings['unit_id'] := U.ID;
+    MovePayload.Floats['to_lon'] := FConfig.HomeLon;
+    MovePayload.Floats['to_lat'] := FConfig.HomeLat;
+    MovePayload.Strings['by'] := FConfig.FactionName;
+    EmitCommand('game.cmd.move', MovePayload);
+    Exit;
+  end;
+
+  BestUnitID := '';
+  BestUnitScore := -1e9;
+  for j := 0 to FUnits.Count - 1 do
+  begin
+    TargetU := TKyzuUnit(FUnits.Objects[j]);
+    if (TargetU.Owner = FConfig.FactionName) or (TargetU.Owner = '') then Continue;
+
+    Dist := EuclideanDist(U.Lon, U.Lat, TargetU.Lon, TargetU.Lat);
+    if Dist > FConfig.MaxCombatRadius then Continue;
+
+    Score := ((100.0 / Max(0.5, Dist)) + (TargetU.MaxHP - TargetU.HP)) *
+             FConfig.AggressionWeight * G.AggressionMult;
+    if Score > BestUnitScore then
+    begin
+      BestUnitScore := Score;
+      BestUnitID := TargetU.ID;
+    end;
+  end;
+
+  BestCityID := '';
+  BestCityScore := -1e9;
+  for j := 0 to FCities.Count - 1 do
+  begin
+    C := TKyzuCity(FCities.Objects[j]);
+    if C.Owner = FConfig.FactionName then Continue;
+
+    Dist := EuclideanDist(U.Lon, U.Lat, C.Lon, C.Lat);
+    Score := ((150.0 / Max(0.5, Dist)) + (C.Population * 10.0)) *
+             FConfig.CitySiegeWeight * G.CitySiegeMult;
+    if Score > BestCityScore then
+    begin
+      BestCityScore := Score;
+      BestCityID := C.ID;
+    end;
+  end;
+
+  if (BestUnitID <> '') and (BestUnitScore >= BestCityScore) then
+  begin
+    TargetU := TKyzuUnit(FUnits.Objects[FUnits.IndexOf(BestUnitID)]);
+    Dist := EuclideanDist(U.Lon, U.Lat, TargetU.Lon, TargetU.Lat);
+
+    if Dist <= 1.5 then
+    begin
+      AttackPayload := TJSONObject.Create;
+      AttackPayload.Strings['attacker_unit_id'] := U.ID;
+      AttackPayload.Strings['target_unit_id'] := BestUnitID;
+      AttackPayload.Strings['by'] := FConfig.FactionName;
+      EmitCommand('game.cmd.attack', AttackPayload);
+    end
+    else
+    begin
+      Intercept := FPredictor.CalculateAnticipatoryIntercept(U.Lon, U.Lat, 1.2, BestUnitID,
+                                                             FConfig.PredictiveLookahead * G.LookaheadMult);
+      MovePayload := TJSONObject.Create;
+      MovePayload.Strings['unit_id'] := U.ID;
+      MovePayload.Floats['to_lon'] := (Intercept.X * 0.8) + (FlockLon * 0.2 * G.CohesionMult);
+      MovePayload.Floats['to_lat'] := (Intercept.Y * 0.8) + (FlockLat * 0.2 * G.CohesionMult);
+      MovePayload.Strings['by'] := FConfig.FactionName;
+      EmitCommand('game.cmd.move', MovePayload);
+    end;
+  end
+  else if BestCityID <> '' then
+  begin
+    C := TKyzuCity(FCities.Objects[FCities.IndexOf(BestCityID)]);
+    Dist := EuclideanDist(U.Lon, U.Lat, C.Lon, C.Lat);
+
+    if Dist <= 1.5 then
+    begin
+      AttackPayload := TJSONObject.Create;
+      AttackPayload.Strings['attacker_unit_id'] := U.ID;
+      AttackPayload.Strings['target_city_id'] := BestCityID;
+      AttackPayload.Strings['by'] := FConfig.FactionName;
+      EmitCommand('game.cmd.attack', AttackPayload);
+    end
+    else
+    begin
+      MovePayload := TJSONObject.Create;
+      MovePayload.Strings['unit_id'] := U.ID;
+      MovePayload.Floats['to_lon'] := C.Lon;
+      MovePayload.Floats['to_lat'] := C.Lat;
+      MovePayload.Strings['by'] := FConfig.FactionName;
+      EmitCommand('game.cmd.move', MovePayload);
+    end;
+  end;
+end;
+
+procedure TKyzuBrain.DriveHarvester(U: TKyzuUnit; const G: TStrategyGenome);
+var
+  i, BestIdx: Integer;
+  Node: TKyzuNode;
+  BestDist, Dist: Double;
+  Cmd: TJSONObject;
+begin
+  BestIdx := -1;
+  BestDist := 1e9;
+
+  for i := 0 to FNodes.Count - 1 do
+  begin
+    Node := TKyzuNode(FNodes.Objects[i]);
+    if Node.Amount <= 0.1 then Continue;
+
+    Dist := EuclideanDist(U.Lon, U.Lat, Node.Lon, Node.Lat);
+    if Dist < BestDist then
+    begin
+      BestDist := Dist;
+      BestIdx := i;
+    end;
+  end;
+
+  if BestIdx < 0 then Exit;
+  Node := TKyzuNode(FNodes.Objects[BestIdx]);
+
+  if BestDist <= FConfig.CollectRadius then
+  begin
+    Cmd := TJSONObject.Create;
+    Cmd.Strings['unit_id'] := U.ID;
+    Cmd.Strings['node_id'] := Node.ID;
+    Cmd.Strings['by'] := FConfig.FactionName;
+    EmitCommand('game.cmd.collect', Cmd);
+  end
+  else
+  begin
+    Cmd := TJSONObject.Create;
+    Cmd.Strings['unit_id'] := U.ID;
+    Cmd.Floats['to_lon'] := Node.Lon;
+    Cmd.Floats['to_lat'] := Node.Lat;
+    Cmd.Strings['by'] := FConfig.FactionName;
+    EmitCommand('game.cmd.move', Cmd);
+  end;
+end;
+
+procedure TKyzuBrain.DrivePioneer(U: TKyzuUnit; const G: TStrategyGenome);
+var
+  Cmd: TJSONObject;
+  DistFromHome: Double;
+begin
+  DistFromHome := EuclideanDist(U.Lon, U.Lat, FConfig.HomeLon, FConfig.HomeLat);
+  // If sufficiently far from home base, found city
+  if DistFromHome >= 12.0 then
+  begin
+    Cmd := TJSONObject.Create;
+    Cmd.Strings['city_id'] := GenerateID('city');
+    Cmd.Strings['unit_id'] := U.ID;
+    Cmd.Strings['by'] := FConfig.FactionName;
+    EmitCommand('game.cmd.found_city', Cmd);
+  end
+  else
+  begin
+    // Head outward to an expansion sector
+    Cmd := TJSONObject.Create;
+    Cmd.Strings['unit_id'] := U.ID;
+    Cmd.Floats['to_lon'] := FConfig.HomeLon + 15.0;
+    Cmd.Floats['to_lat'] := FConfig.HomeLat + 15.0;
+    Cmd.Strings['by'] := FConfig.FactionName;
+    EmitCommand('game.cmd.move', Cmd);
   end;
 end;
 
 procedure TKyzuBrain.ThinkAndAct;
 var
   Genome: TStrategyGenome;
-  MySoldierCount, i, j: Integer;
-  U, TargetU: TKyzuUnit;
-  C: TKyzuCity;
-  SpawnPayload, ActionPayload: TJSONObject;
-  BestUnitID, BestCityID: string;
-  BestUnitScore, BestCityScore, Score, Dist: Double;
-  TargetLon, TargetLat: Double;
-  Intercept: TPointF;
-  FlockCenterLon, FlockCenterLat: Double;
-  SurpriseMod: Double;
+  i, SoldCount, HarvCount, PionCount: Integer;
+  U: TKyzuUnit;
+  FlockLon, FlockLat: Double;
+  SpawnCmd, PingCmd: TJSONObject;
 begin
   Genome := FGenetics.GetActiveGenome;
-  FGenetics.IngestSurprise(FPredictor.GlobalSurprise);
-  FGenetics.EvaluateEpoch;
+  FGenetics.EvaluateEpoch(FPredictor.SurpriseMetric);
 
-  // Surprise modulation
-  SurpriseMod := 1.0 + (FPredictor.GlobalSurprise * Genome.SurpriseSensitivity);
+  // Keepalive ping check
+  if ((Now - FLastPingTime) * 86400000.0) >= FConfig.PingIntervalMs then
+  begin
+    PingCmd := TJSONObject.Create;
+    EmitCommand('game.cmd.ping', PingCmd);
+    FLastPingTime := Now;
+  end;
 
-  // 1. Spawning decision using genome parameters
-  MySoldierCount := 0;
-  FlockCenterLon := 0.0;
-  FlockCenterLat := 0.0;
+  // Periodic Snapshot Sync
+  if ((Now - FLastSyncTime) * 86400000.0) >= FConfig.SyncIntervalMs then
+  begin
+    SyncWorldState;
+    FLastSyncTime := Now;
+  end;
+
+  // 1. Tally units and calculate flocking center
+  SoldCount := 0;
+  HarvCount := 0;
+  PionCount := 0;
+  FlockLon := 0.0;
+  FlockLat := 0.0;
 
   for i := 0 to FUnits.Count - 1 do
   begin
     U := TKyzuUnit(FUnits.Objects[i]);
-    if (U.Owner = FFaction) and (U.UnitType = 'soldier') then
+    if U.Owner <> FConfig.FactionName then Continue;
+
+    if U.UnitType = 'soldier' then
     begin
-      Inc(MySoldierCount);
-      FlockCenterLon := FlockCenterLon + U.Lon;
-      FlockCenterLat := FlockCenterLat + U.Lat;
-    end;
-  end;
-
-  if MySoldierCount > 0 then
-  begin
-    FlockCenterLon := FlockCenterLon / MySoldierCount;
-    FlockCenterLat := FlockCenterLat / MySoldierCount;
-  end;
-
-  if MySoldierCount < Genome.SpawnQuota then
-  begin
-    SpawnPayload := TJSONObject.Create;
-    SpawnPayload.Strings['unit_id'] := GenerateID('u');
-    SpawnPayload.Floats['lon'] := FHomeLon;
-    SpawnPayload.Floats['lat'] := FHomeLat;
-    SpawnPayload.Strings['owner'] := FFaction;
-    SpawnPayload.Strings['unit_type'] := 'soldier';
-    Publish('game.cmd.spawn', SpawnPayload);
-  end;
-
-  // 2. Tactical evaluation per active unit
-  for i := 0 to FUnits.Count - 1 do
-  begin
-    U := TKyzuUnit(FUnits.Objects[i]);
-    if (U.Owner <> FFaction) or (U.UnitType <> 'soldier') then Continue;
-
-    // Tactical Retreat behavior based on genome threshold
-    if (U.MaxHP > 0) and ((U.HP / U.MaxHP) < Genome.RetreatHPRatio) then
-    begin
-      ActionPayload := TJSONObject.Create;
-      ActionPayload.Strings['unit_id'] := U.ID;
-      ActionPayload.Floats['to_lon'] := FHomeLon;
-      ActionPayload.Floats['to_lat'] := FHomeLat;
-      ActionPayload.Strings['by'] := FFaction;
-      Publish('game.cmd.move', ActionPayload);
-      Continue;
-    end;
-
-    // Predictive Threat Assessment & Target Selection
-    BestUnitID := '';
-    BestUnitScore := -1e9;
-
-    for j := 0 to FUnits.Count - 1 do
-    begin
-      TargetU := TKyzuUnit(FUnits.Objects[j]);
-      if (TargetU.Owner = FFaction) or (TargetU.Owner = '') then Continue;
-
-      Dist := EuclideanDist(U.Lon, U.Lat, TargetU.Lon, TargetU.Lat);
-      // Utility score: inverse distance, low target HP bonus, aggression factor
-      Score := (100.0 / Max(0.5, Dist)) + ((TargetU.MaxHP - TargetU.HP) * 0.5) * Genome.AggressionFactor;
-      if Score > BestUnitScore then
-      begin
-        BestUnitScore := Score;
-        BestUnitID := TargetU.ID;
-      end;
-    end;
-
-    // City conquest evaluation
-    BestCityID := '';
-    BestCityScore := -1e9;
-
-    for j := 0 to FCities.Count - 1 do
-    begin
-      C := TKyzuCity(FCities.Objects[j]);
-      if C.Owner = FFaction then Continue;
-
-      Dist := EuclideanDist(U.Lon, U.Lat, C.Lon, C.Lat);
-      Score := ((120.0 / Max(0.5, Dist)) + (C.Population * 10.0)) * Genome.CityCaptureBias;
-      if Score > BestCityScore then
-      begin
-        BestCityScore := Score;
-        BestCityID := C.ID;
-      end;
-    end;
-
-    // Determine target selection based on evolved weights
-    if (BestUnitID <> '') and (BestUnitScore >= BestCityScore) then
-    begin
-      Idx := FUnits.IndexOf(BestUnitID);
-      TargetU := TKyzuUnit(FUnits.Objects[Idx]);
-      Dist := EuclideanDist(U.Lon, U.Lat, TargetU.Lon, TargetU.Lat);
-
-      if Dist <= 1.5 then
-      begin
-        // Attack range: strike target
-        ActionPayload := TJSONObject.Create;
-        ActionPayload.Strings['attacker_unit_id'] := U.ID;
-        ActionPayload.Strings['target_unit_id'] := BestUnitID;
-        ActionPayload.Strings['by'] := FFaction;
-        Publish('game.cmd.attack', ActionPayload);
-      end
-      else
-      begin
-        // Predictive Intercept: Compute anticipatory vector
-        Intercept := FPredictor.CalculateAnticipatoryIntercept(U.Lon, U.Lat, 1.2, BestUnitID,
-                                                               Genome.PredictiveLookahead * SurpriseMod);
-        
-        // Cohesion bias: Blend movement toward intercept with flocking center
-        TargetLon := (Intercept.X * 0.8) + (FlockCenterLon * 0.2 * Genome.FlockingCohesion);
-        TargetLat := (Intercept.Y * 0.8) + (FlockCenterLat * 0.2 * Genome.FlockingCohesion);
-
-        ActionPayload := TJSONObject.Create;
-        ActionPayload.Strings['unit_id'] := U.ID;
-        ActionPayload.Floats['to_lon'] := TargetLon;
-        ActionPayload.Floats['to_lat'] := TargetLat;
-        ActionPayload.Strings['by'] := FFaction;
-        Publish('game.cmd.move', ActionPayload);
-      end;
+      Inc(SoldCount);
+      FlockLon := FlockLon + U.Lon;
+      FlockLat := FlockLat + U.Lat;
     end
-    else if BestCityID <> '' then
-    begin
-      Idx := FCities.IndexOf(BestCityID);
-      C := TKyzuCity(FCities.Objects[Idx]);
-      Dist := EuclideanDist(U.Lon, U.Lat, C.Lon, C.Lat);
+    else if U.UnitType = 'harvester' then
+      Inc(HarvCount)
+    else if U.UnitType = 'pioneer' then
+      Inc(PionCount);
+  end;
 
-      if Dist <= 1.5 then
-      begin
-        ActionPayload := TJSONObject.Create;
-        ActionPayload.Strings['attacker_unit_id'] := U.ID;
-        ActionPayload.Strings['target_city_id'] := BestCityID;
-        ActionPayload.Strings['by'] := FFaction;
-        Publish('game.cmd.attack', ActionPayload);
-      end
-      else
-      begin
-        ActionPayload := TJSONObject.Create;
-        ActionPayload.Strings['unit_id'] := U.ID;
-        ActionPayload.Floats['to_lon'] := C.Lon;
-        ActionPayload.Floats['to_lat'] := C.Lat;
-        ActionPayload.Strings['by'] := FFaction;
-        Publish('game.cmd.move', ActionPayload);
-      end;
-    end;
+  if SoldCount > 0 then
+  begin
+    FlockLon := FlockLon / SoldCount;
+    FlockLat := FlockLat / SoldCount;
+  end
+  else
+  begin
+    FlockLon := FConfig.HomeLon;
+    FlockLat := FConfig.HomeLat;
+  end;
+
+  // 2. Production spawns according to configured quotas
+  if SoldCount < FConfig.MaxSoldiers then
+  begin
+    SpawnCmd := TJSONObject.Create;
+    SpawnCmd.Strings['unit_id'] := GenerateID('soldier');
+    SpawnCmd.Floats['lon'] := FConfig.HomeLon;
+    SpawnCmd.Floats['lat'] := FConfig.HomeLat;
+    SpawnCmd.Strings['owner'] := FConfig.FactionName;
+    SpawnCmd.Strings['unit_type'] := 'soldier';
+    EmitCommand('game.cmd.spawn', SpawnCmd);
+  end
+  else if HarvCount < FConfig.MaxHarvesters then
+  begin
+    SpawnCmd := TJSONObject.Create;
+    SpawnCmd.Strings['unit_id'] := GenerateID('harv');
+    SpawnCmd.Floats['lon'] := FConfig.HomeLon;
+    SpawnCmd.Floats['lat'] := FConfig.HomeLat;
+    SpawnCmd.Strings['owner'] := FConfig.FactionName;
+    SpawnCmd.Strings['unit_type'] := 'harvester';
+    EmitCommand('game.cmd.spawn', SpawnCmd);
+  end
+  else if PionCount < FConfig.MaxPioneers then
+  begin
+    SpawnCmd := TJSONObject.Create;
+    SpawnCmd.Strings['unit_id'] := GenerateID('pion');
+    SpawnCmd.Floats['lon'] := FConfig.HomeLon;
+    SpawnCmd.Floats['lat'] := FConfig.HomeLat;
+    SpawnCmd.Strings['owner'] := FConfig.FactionName;
+    SpawnCmd.Strings['unit_type'] := 'pioneer';
+    EmitCommand('game.cmd.spawn', SpawnCmd);
+  end;
+
+  // 3. Drive individual unit behaviors
+  for i := 0 to FUnits.Count - 1 do
+  begin
+    U := TKyzuUnit(FUnits.Objects[i]);
+    if U.Owner <> FConfig.FactionName then Continue;
+
+    if U.UnitType = 'soldier' then
+      DriveCombatSoldier(U, Genome, FlockLon, FlockLat)
+    else if U.UnitType = 'harvester' then
+      DriveHarvester(U, Genome)
+    else if U.UnitType = 'pioneer' then
+      DrivePioneer(U, Genome);
   end;
 end;
 
@@ -1575,7 +1847,7 @@ end.
 
 ---
 
-### 6. `KyzuAIProgram.lpr` (Main Program Entry Point)
+### 7. `KyzuAIProgram.lpr` (Main Stdin/Stdout Application Entry)
 ```pascal
 program KyzuAIProgram;
 
@@ -1586,129 +1858,149 @@ uses
   cthreads, BaseUnix,
   {$ENDIF}
   Classes, SysUtils,
-  KyzuSockets, KyzuEntities, KyzuPredictive, KyzuGenetics, KyzuBrain;
+  KyzuConfig, KyzuEntities, KyzuPredictive, KyzuGenetics, KyzuIO, KyzuBrain;
 
 var
-  WSClient: TWebSocketClient;
+  Config: TAIConfig;
+  Reader: TStdinReaderThread;
+  Writer: TStdoutWriter;
   Brain: TKyzuBrain;
-  HostStr: string;
-  PortNum: Word;
-  FactionName: string;
-  HomeLon, HomeLat: Double;
+  Line: string;
+  ConfigFile: string;
   LastDecisionTick: QWord;
 
-procedure OnWSMessage(const AMessage: string);
+procedure ParseCLI(out AConfigFile: string);
 begin
-  Brain.ProcessMessage(AMessage);
-end;
-
-procedure OnWSEvent(AEventType: TWSEventType; const AInfo: string);
-begin
-  case AEventType of
-    wseOpen:
-    begin
-      Writeln('[WS] Connected. Sending authentication token...');
-      WSClient.SendText('{"method":"sys.auth","token":"bot"}');
-    end;
-    wseClose: Writeln('[WS] Disconnected: ' + AInfo);
-    wseError: Writeln('[WS] Network Error: ' + AInfo);
-  end;
-end;
-
-procedure ParseCommandLine(out Host: string; out Port: Word; out Faction: string);
-var
-  RawURL: string;
-  ColPos: Integer;
-begin
-  RawURL := '127.0.0.1:8181';
-  Faction := 'evolved_predator';
-
-  if ParamCount >= 1 then RawURL := ParamStr(1);
-  if ParamCount >= 2 then Faction := ParamStr(2);
-
-  // Strip ws:// if present
-  if Pos('ws://', RawURL) = 1 then
-    Delete(RawURL, 1, 5);
-
-  ColPos := Pos(':', RawURL);
-  if ColPos > 0 then
-  begin
-    Host := Copy(RawURL, 1, ColPos - 1);
-    Port := StrToIntDef(Copy(RawURL, ColPos + 1, Length(RawURL)), 8181);
-  end
-  else
-  begin
-    Host := RawURL;
-    Port := 8181;
-  end;
+  AConfigFile := 'kyzu_bot_config.json';
+  if ParamCount >= 1 then
+    AConfigFile := ParamStr(1);
 end;
 
 begin
   Randomize;
-  ParseCommandLine(HostStr, PortNum, FactionName);
-  HomeLon := 22.0;
-  HomeLat := 14.0;
+  ParseCLI(ConfigFile);
 
-  Writeln('====================================================');
-  Writeln(' Kyzu Autonomous AI - Predictive Coding & Genetic Evo');
-  Writeln(Format(' Target: ws://%s:%d | Faction: %s', [HostStr, PortNum, FactionName]));
-  Writeln('====================================================');
+  // Load external JSON configuration
+  Config := TAIConfig.Create;
+  Config.LoadFromFile(ConfigFile);
 
-  WSClient := TWebSocketClient.Create;
-  Brain := TKyzuBrain.Create(WSClient, FactionName, HomeLon, HomeLat);
+  // Diagnostic banner to stderr (stdout is reserved exclusively for the bus)
+  Writeln(StdErr, '=======================================================');
+  Writeln(StdErr, ' Kyzu VDRX Stdin/Stdout AI Bot (Predictive & Genetic)  ');
+  Writeln(StdErr, Format(' Config: %s | Faction: %s', [ConfigFile, Config.FactionName]));
+  Writeln(StdErr, '=======================================================');
+
+  Writer := TStdoutWriter.Create;
+  Reader := TStdinReaderThread.Create;
+  Brain := TKyzuBrain.Create(Config, Writer);
+
   try
-    WSClient.OnMessage := @OnWSMessage;
-    WSClient.OnEvent := @OnWSEvent;
+    // Request initial world snapshots on startup
+    Brain.SyncWorldState;
 
     LastDecisionTick := GetTickCount64;
 
-    while True do
+    while not Reader.IsPipeClosed do
     begin
-      if not WSClient.Connected then
+      // Drain inbound lines from Stdin reader queue
+      while Reader.PopLine(Line) do
       begin
-        Writeln(Format('[SYSTEM] Connecting to %s:%d ...', [HostStr, PortNum]));
-        if not WSClient.Connect(HostStr, PortNum) then
-          Sleep(2500);
+        try
+          Brain.IngestJSONLine(Line);
+        except
+          on E: Exception do
+            Writeln(StdErr, '[PARSER ERROR] ' + E.Message);
+        end;
       end;
 
-      if WSClient.Connected then
+      // Cognitive tick execution
+      if (GetTickCount64 - LastDecisionTick) >= QWord(Config.TickIntervalMs) then
       begin
-        // Process network I/O
-        WSClient.Poll(50);
+        Brain.ThinkAndAct;
+        LastDecisionTick := GetTickCount64;
+      end;
 
-        // Run cognitive cycle every 1000ms
-        if (GetTickCount64 - LastDecisionTick) >= 1000 then
-        begin
-          if WSClient.HandshakeDone then
-            Brain.ThinkAndAct;
-          LastDecisionTick := GetTickCount64;
-        end;
-      end
-      else
-        Sleep(500);
+      Sleep(10);
     end;
+
+    Writeln(StdErr, '[SYSTEM] Stdin closed by supervisor. Exiting gracefully.');
 
   finally
     Brain.Free;
-    WSClient.Free;
+    Reader.Terminate;
+    Reader.WaitFor;
+    Reader.Free;
+    Writer.Free;
+    Config.Free;
   end;
 end.
 ```
 
 ---
 
-### Compilation & Running Instructions
-
-This implementation relies **strictly** on standard FreePascal units (`fcl-json`, `fcl-net`, and core RTL sockets). It requires no external libraries.
-
-#### On Linux (x86_64 / aarch64)
-```bash
-fpc -O2 -gl -Fu. KyzuAIProgram.lpr
-./KyzuAIProgram ws://127.0.0.1:8181 predator_bot
+### Default Configuration File (`kyzu_bot_config.json`)
+The bot creates this JSON file automatically if it doesn't already exist:
+```json
+{
+  "faction_name": "evolved_ai",
+  "home_lon": 25.0,
+  "home_lat": 15.0,
+  "tick_interval_ms": 100,
+  "sync_interval_ms": 5000,
+  "ping_interval_ms": 10000,
+  "predictive": {
+    "lookahead_sec": 2.5,
+    "smoothing": 0.65,
+    "surprise_dampening": 0.85,
+    "surprise_sensitivity": 1.2
+  },
+  "tactics": {
+    "retreat_hp_ratio": 0.25,
+    "aggression_weight": 1.5,
+    "city_siege_weight": 2.0,
+    "resource_collect_weight": 1.0,
+    "road_building_weight": 0.8,
+    "city_founding_weight": 1.1,
+    "flocking_cohesion": 0.75,
+    "max_combat_radius": 20.0,
+    "collect_radius": 2.0
+  },
+  "quotas": {
+    "max_soldiers": 6,
+    "max_harvesters": 3,
+    "max_pioneers": 1
+  },
+  "genetics": {
+    "auto_evolve": true,
+    "epoch_duration_sec": 60.0,
+    "population_size": 8,
+    "mutation_rate": 0.25
+  }
+}
 ```
 
-#### On Windows (Win64)
+---
+
+### Building & Execution
+
+#### Linux / macOS
+```bash
+fpc -O2 -gl -Fu. KyzuAIProgram.lpr
+# Direct execution (or managed as a child process by VDRX via stdin/stdout pipe)
+./KyzuAIProgram custom_config.json
+```
+
+#### Windows (Win64)
 ```cmd
 fpc -O2 -gl -Fu. -dWINDOWS KyzuAIProgram.lpr
-KyzuAIProgram.exe ws://127.0.0.1:8181 predator_bot
+KyzuAIProgram.exe custom_config.json
+```
+
+#### Supervising in `kyzu.vdrx.conf`
+Because this binary communicates entirely via line-buffered stdin/stdout, it can be supervised directly by VDRX:
+```nginx
+process ai_bot {
+    command = "./KyzuAIProgram kyzu_bot_config.json"
+    restart = always
+}
 ```
