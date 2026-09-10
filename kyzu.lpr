@@ -93,6 +93,13 @@ type
     // capable or not, can still be damaged/killed BY an attack; Attack
     // only gates who can throw the first punch.
     Attack: Integer;
+    // '' = spawnable by anyone regardless of research (matches every
+    // pre-tech unit type exactly). Non-empty = the spawning faction must
+    // have this TechID in ResearchedTech first - see HandleSpawn. Deliberately
+    // NOT enforced for Owner = '' (unowned/free-for-all spawns): there is
+    // no faction to have researched anything against, same free-for-all
+    // carve-out HandleMove/HandleDespawn already give unowned units.
+    RequiresTech: string;
   end;
 
   // One line of a resource cost - "5 wood", "2 stone". Growth and
@@ -105,6 +112,29 @@ type
     Amount: Integer;
   end;
   TResourceCostList = array of TResourceCost;
+
+  // One entry in tech.json - a researchable upgrade, gated behind its own
+  // prerequisite techs and a resource cost, that unlocks new unit types
+  // once completed. Loaded once into TechDefs at startup, same tolerant
+  // pattern as UnitDefs; TechOrder preserves load order separately since
+  // TDictionary enumeration order isn't something to rely on for "walk
+  // techs in a sensible order" (used by RunAI's research picker).
+  TTechDef = record
+    TechID: string;
+    DisplayName: string;
+    Prerequisites: array of string;
+    Cost: TResourceCostList;
+    ResearchTicks: Integer;
+  end;
+
+  // A faction's in-flight research - one at a time per faction (see
+  // ResearchInProgress, keyed by owner). StartTick resets to 0 alongside
+  // Tick on every restart - see ReplayEventLog's 'research_started'
+  // branch for why that's the same precedent as city clocks.
+  TResearchInProgress = record
+    TechID: string;
+    StartTick: Int64;
+  end;
 
   // Every first-pass tuning number in the game, loaded once at startup
   // from game_balance.json (see LoadGameBalance) with defaults that
@@ -146,12 +176,59 @@ type
     AiFactionName: string;
     AiTickInterval: Integer;
     AiTargetWorkerCount: Integer;
+    // Expansion: how many settlers the AI keeps in flight at once, and
+    // where it's willing to found. AiExpansionSearchRadiusCells bounds
+    // the search around each AI-owned city; AiExpansionMinCityDistanceCells
+    // is the minimum distance a candidate site must keep from EVERY
+    // existing city (any owner) so the AI doesn't found on top of
+    // someone else's back yard.
+    AiTargetSettlerCount: Integer;
+    AiExpansionSearchRadiusCells: Double;
+    AiExpansionMinCityDistanceCells: Double;
+    // Military: how many soldiers the AI keeps up, and how far a soldier
+    // will proactively range from its spawn city looking for a target
+    // before giving up and heading home to garrison.
+    AiTargetSoldierCount: Integer;
+    AiAggressionRangeCells: Double;
+    // Research: whether the AI ever starts research at all. Off by
+    // default (False) in DefaultGameBalance so an existing deployment
+    // with no ai_research_enabled key in game_balance.json sees no
+    // behavior change until the operator opts in.
+    AiResearchEnabled: Boolean;
 
     VeterancyXPPerHit: Integer;
     VeterancyXPPerLevel: Integer;
     VeterancyMaxLevel: Integer;
     VeterancyAttackBonusPerLevel: Integer;
     VeterancyHPBonusPerLevel: Integer;
+  end;
+
+  // One entry in ai_factions.json - a single AI-controlled faction's
+  // identity plus its own copy of every knob RunAI reads. Letting each
+  // faction carry its own numbers (rather than RunAI reaching for the
+  // single shared Balance.Ai* fields directly) is what makes multiple
+  // AI factions with different "personalities" possible - one entry
+  // tuned aggressive (high soldier count, wide aggression range), one
+  // tuned as a builder (more settlers/workers, research always on),
+  // etc, all from JSON with no code change. See LoadAiFactionConfigs
+  // for how a faction entry inherits from Balance.Ai* for any field it
+  // doesn't specify.
+  TAiFactionConfig = record
+    FactionName: string;
+    TickInterval: Integer;
+    TargetWorkerCount: Integer;
+    TargetSettlerCount: Integer;
+    ExpansionSearchRadiusCells: Double;
+    ExpansionMinCityDistanceCells: Double;
+    TargetSoldierCount: Integer;
+    AggressionRangeCells: Double;
+    ResearchEnabled: Boolean;
+    // This faction's position in AiFactionConfigs, used purely to
+    // stagger which tick each faction's decision pass falls on
+    // ((Tick + Offset) mod TickInterval = 0) so N AI factions sharing
+    // the same TickInterval don't all recompute on the exact same
+    // tick - see RunAllAI.
+    Offset: Integer;
   end;
 
 // StdErr is buffered by default and only auto-flushes on a clean, natural
@@ -190,6 +267,30 @@ var
   // unlike every other shared dictionary in this file, it genuinely
   // never needs a lock.
   AiUnitTargets: specialize TDictionary<string, string>;
+  // Every AI-controlled faction currently running, loaded once at
+  // startup from ai_factions.json (or synthesized as a single
+  // Balance.AiFactionName entry if that file is absent - see
+  // LoadAiFactionConfigs). RunAllAI iterates this once per tick.
+  AiFactionConfigs: array of TAiFactionConfig;
+  TechDefs: specialize TDictionary<string, TTechDef>; // key: TechID - static registry, loaded once at startup from tech.json
+  TechOrder: TStringList; // TechIDs in tech.json's own array order - RunAI's research picker walks this rather than the dictionary's unspecified enumeration order
+  ResearchedTech: specialize TDictionary<string, Boolean>; // key: "<owner>|<tech_id>" -> True once completed; absence = not researched
+  ResearchInProgress: specialize TDictionary<string, TResearchInProgress>; // key: owner - one research at a time per faction
+  TechLock: TCriticalSection;
+  // Diplomatic status between two factions, keyed by DiplomacyKey (a
+  // canonical, order-independent "<a>|<b>" - see its own comment).
+  // Absence of a key means the default relationship: neutral. Only
+  // 'war' and 'allied' are ever stored - there's no separate 'neutral'
+  // value, so returning to neutral (accepted peace, broken alliance)
+  // removes the key rather than writing 'neutral' into it.
+  DiplomaticStatus: specialize TDictionary<string, string>;
+  // In-memory only, deliberately never logged to events.jsonl or restored
+  // on replay - an alliance/peace proposal that was sitting unanswered
+  // when the server last stopped is just gone on restart, same as a
+  // human negotiation that never got a reply. Key: "<proposer>|<target>|<kind>",
+  // kind is 'alliance' or 'peace'.
+  PendingProposals: specialize TDictionary<string, Boolean>;
+  DiplomacyLock: TCriticalSection;
   Grid: TMovementGrid;
   Config: TBakeConfig;
   // Moved up from the final var block (originally declared right before
@@ -422,6 +523,12 @@ begin
 
   Result.AiFactionName := 'ai';
   Result.AiTickInterval := 40;
+  Result.AiTargetSettlerCount := 1;
+  Result.AiExpansionSearchRadiusCells := 25;
+  Result.AiExpansionMinCityDistanceCells := 6;
+  Result.AiTargetSoldierCount := 2;
+  Result.AiAggressionRangeCells := 15;
+  Result.AiResearchEnabled := False;
   Result.AiTargetWorkerCount := 2;
 
   Result.VeterancyXPPerHit := 10;
@@ -526,6 +633,12 @@ begin
     Result.AiFactionName := Obj.Get('ai_faction_name', Result.AiFactionName);
     Result.AiTickInterval := Obj.Get('ai_tick_interval', Result.AiTickInterval);
     Result.AiTargetWorkerCount := Obj.Get('ai_target_worker_count', Result.AiTargetWorkerCount);
+    Result.AiTargetSettlerCount := Obj.Get('ai_target_settler_count', Result.AiTargetSettlerCount);
+    Result.AiExpansionSearchRadiusCells := Obj.Get('ai_expansion_search_radius_cells', Result.AiExpansionSearchRadiusCells);
+    Result.AiExpansionMinCityDistanceCells := Obj.Get('ai_expansion_min_city_distance_cells', Result.AiExpansionMinCityDistanceCells);
+    Result.AiTargetSoldierCount := Obj.Get('ai_target_soldier_count', Result.AiTargetSoldierCount);
+    Result.AiAggressionRangeCells := Obj.Get('ai_aggression_range_cells', Result.AiAggressionRangeCells);
+    Result.AiResearchEnabled := Obj.Get('ai_research_enabled', Result.AiResearchEnabled);
 
     Result.VeterancyXPPerHit := Obj.Get('veterancy_xp_per_hit', Result.VeterancyXPPerHit);
     Result.VeterancyXPPerLevel := Obj.Get('veterancy_xp_per_level', Result.VeterancyXPPerLevel);
@@ -595,12 +708,181 @@ begin
       Def.CollectMultiplier := Obj.Get('collect_multiplier', 1.0);
       Def.MaxHP := Obj.Get('hp', 20);
       Def.Attack := Obj.Get('attack', 0);
+      Def.RequiresTech := Obj.Get('requires_tech', '');
       UnitDefs.AddOrSetValue(Def.TypeID, Def);
     end;
     LogDiag('Loaded ' + IntToStr(UnitDefs.Count) + ' unit type definitions.');
   finally
     Data.Free;
   end;
+end;
+
+// Loads tech definitions from tech.json at startup - a flat array of
+// {tech_id, display_name, prerequisites: [tech_id,...], cost: [{resource_type,amount},...],
+// research_ticks}. Same tolerant, non-fatal pattern as LoadUnitTypes: a
+// missing or malformed file just means TechDefs stays empty, which in
+// turn means HandleStartResearch always fails with "unknown tech" and
+// no unit type's RequiresTech can ever be satisfied - a safe, inert
+// fallback rather than a startup failure.
+procedure LoadTechDefs(const AFilename: string);
+var
+  Data: TJSONData;
+  Arr, PrereqArr, CostArr: TJSONArray;
+  Obj: TJSONObject;
+  Def: TTechDef;
+  i, j: Integer;
+  F: TextFile;
+  Line, JSONText: string;
+begin
+  if not FileExists(AFilename) then
+  begin
+    LogDiag('No tech.json at ' + AFilename + ' - starting with zero tech definitions.');
+    Exit;
+  end;
+
+  JSONText := '';
+  AssignFile(F, AFilename);
+  Reset(F);
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      JSONText := JSONText + Line;
+    end;
+  finally
+    CloseFile(F);
+  end;
+
+  try
+    Data := GetJSON(JSONText);
+  except
+    LogDiag('tech.json is not valid JSON - starting with zero tech definitions.');
+    Exit;
+  end;
+
+  try
+    if Data.JSONType <> jtArray then Exit;
+    Arr := TJSONArray(Data);
+    for i := 0 to Arr.Count - 1 do
+    begin
+      Obj := TJSONObject(Arr.Items[i]);
+      Def.TechID := Obj.Get('tech_id', '');
+      if Def.TechID = '' then Continue;
+      Def.DisplayName := Obj.Get('display_name', Def.TechID);
+      Def.ResearchTicks := Obj.Get('research_ticks', 100);
+
+      SetLength(Def.Prerequisites, 0);
+      PrereqArr := TJSONArray(Obj.Find('prerequisites'));
+      if Assigned(PrereqArr) and (PrereqArr.JSONType = jtArray) then
+      begin
+        SetLength(Def.Prerequisites, PrereqArr.Count);
+        for j := 0 to PrereqArr.Count - 1 do
+          Def.Prerequisites[j] := PrereqArr.Strings[j];
+      end;
+
+      SetLength(Def.Cost, 0);
+      CostArr := TJSONArray(Obj.Find('cost'));
+      if Assigned(CostArr) and (CostArr.JSONType = jtArray) then
+        Def.Cost := ParseResourceCostList(CostArr);
+
+      TechDefs.AddOrSetValue(Def.TechID, Def);
+      TechOrder.Add(Def.TechID);
+    end;
+    LogDiag('Loaded ' + IntToStr(TechDefs.Count) + ' tech definitions.');
+  finally
+    Data.Free;
+  end;
+end;
+
+// Loads ai_factions.json at startup - a flat array of per-faction
+// overrides, each falling back to the matching Balance.Ai* field for
+// anything it doesn't specify (so a faction entry can be as small as
+// {"faction_name":"ai_west"} and just inherit every default, or
+// override only the couple of fields that make it distinctive). If the
+// file is missing, malformed, or an empty array, synthesizes a SINGLE
+// faction entry named Balance.AiFactionName using Balance.Ai* directly
+// - this is what keeps a deployment with no ai_factions.json at all
+// running exactly one AI faction, same as before this file existed.
+procedure LoadAiFactionConfigs(const AFilename: string; const ABalance: TGameBalance);
+var
+  Data: TJSONData;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  Cfg: TAiFactionConfig;
+  i: Integer;
+  F: TextFile;
+  Line, JSONText: string;
+begin
+  SetLength(AiFactionConfigs, 0);
+
+  if FileExists(AFilename) then
+  begin
+    JSONText := '';
+    AssignFile(F, AFilename);
+    Reset(F);
+    try
+      while not Eof(F) do
+      begin
+        ReadLn(F, Line);
+        JSONText := JSONText + Line;
+      end;
+    finally
+      CloseFile(F);
+    end;
+
+    try
+      Data := GetJSON(JSONText);
+    except
+      Data := nil;
+      LogDiag('ai_factions.json is not valid JSON - falling back to a single default AI faction.');
+    end;
+
+    if Assigned(Data) then
+    begin
+      try
+        if Data.JSONType = jtArray then
+        begin
+          Arr := TJSONArray(Data);
+          SetLength(AiFactionConfigs, Arr.Count);
+          for i := 0 to Arr.Count - 1 do
+          begin
+            Obj := TJSONObject(Arr.Items[i]);
+            Cfg.FactionName := Obj.Get('faction_name', '');
+            Cfg.TickInterval := Obj.Get('tick_interval', ABalance.AiTickInterval);
+            Cfg.TargetWorkerCount := Obj.Get('target_worker_count', ABalance.AiTargetWorkerCount);
+            Cfg.TargetSettlerCount := Obj.Get('target_settler_count', ABalance.AiTargetSettlerCount);
+            Cfg.ExpansionSearchRadiusCells := Obj.Get('expansion_search_radius_cells', ABalance.AiExpansionSearchRadiusCells);
+            Cfg.ExpansionMinCityDistanceCells := Obj.Get('expansion_min_city_distance_cells', ABalance.AiExpansionMinCityDistanceCells);
+            Cfg.TargetSoldierCount := Obj.Get('target_soldier_count', ABalance.AiTargetSoldierCount);
+            Cfg.AggressionRangeCells := Obj.Get('aggression_range_cells', ABalance.AiAggressionRangeCells);
+            Cfg.ResearchEnabled := Obj.Get('research_enabled', ABalance.AiResearchEnabled);
+            Cfg.Offset := i;
+            AiFactionConfigs[i] := Cfg;
+          end;
+        end;
+      finally
+        Data.Free;
+      end;
+    end;
+  end;
+
+  if Length(AiFactionConfigs) = 0 then
+  begin
+    Cfg.FactionName := ABalance.AiFactionName;
+    Cfg.TickInterval := ABalance.AiTickInterval;
+    Cfg.TargetWorkerCount := ABalance.AiTargetWorkerCount;
+    Cfg.TargetSettlerCount := ABalance.AiTargetSettlerCount;
+    Cfg.ExpansionSearchRadiusCells := ABalance.AiExpansionSearchRadiusCells;
+    Cfg.ExpansionMinCityDistanceCells := ABalance.AiExpansionMinCityDistanceCells;
+    Cfg.TargetSoldierCount := ABalance.AiTargetSoldierCount;
+    Cfg.AggressionRangeCells := ABalance.AiAggressionRangeCells;
+    Cfg.ResearchEnabled := ABalance.AiResearchEnabled;
+    Cfg.Offset := 0;
+    SetLength(AiFactionConfigs, 1);
+    AiFactionConfigs[0] := Cfg;
+  end;
+
+  LogDiag('Running ' + IntToStr(Length(AiFactionConfigs)) + ' AI faction(s).');
 end;
 
 // Loads seed cities from cities.json at startup - a flat array of
@@ -725,6 +1007,134 @@ begin
   Result := Result + ']';
 end;
 
+// Canonical, order-independent key for a faction pair - DiplomacyKey('a','b')
+// and DiplomacyKey('b','a') always produce the same string, so a
+// relationship only ever needs one dictionary entry regardless of which
+// side is doing the asking. Plain string comparison is enough ordering
+// for this - factions are free-form owner strings, not anything with a
+// meaningful sort order beyond "consistent".
+function DiplomacyKey(const A, B: string): string;
+begin
+  if A <= B then
+    Result := A + '|' + B
+  else
+    Result := B + '|' + A;
+end;
+
+// 'war', 'allied', or '' (neutral - the default for any two factions
+// that have never interacted). Same faction compared to itself is
+// always '' too - nothing calling this ever needs a faction's
+// relationship with itself distinguished from ordinary neutral.
+function GetDiplomaticStatus(const A, B: string): string;
+begin
+  Result := '';
+  if A = B then Exit;
+  DiplomacyLock.Enter;
+  try
+    DiplomaticStatus.TryGetValue(DiplomacyKey(A, B), Result);
+  finally
+    DiplomacyLock.Leave;
+  end;
+end;
+
+// Applies AStatus ('war', 'allied', or '' for neutral) between A and B,
+// persists it, and broadcasts it - the single path every diplomacy
+// handler and HandleAttack's auto-war-on-first-strike go through, so
+// the log/broadcast shape never drifts between callers. '' removes the
+// key entirely rather than storing an explicit 'neutral' value (see
+// DiplomaticStatus's own comment).
+procedure SetDiplomaticStatus(const A, B, AStatus: string);
+var
+  Key: string;
+begin
+  Key := DiplomacyKey(A, B);
+  DiplomacyLock.Enter;
+  try
+    if AStatus = '' then
+      DiplomaticStatus.Remove(Key)
+    else
+      DiplomaticStatus.AddOrSetValue(Key, AStatus);
+  finally
+    DiplomacyLock.Leave;
+  end;
+
+  LogEvent(Format('{"type":"diplomacy_status_changed","faction_a":"%s","faction_b":"%s","status":"%s"}',
+    [A, B, AStatus]));
+  SendLine(Format('{"topic":"game.event.diplomacy_status_changed","payload":"{\"faction_a\":\"%s\",\"faction_b\":\"%s\",\"status\":\"%s\"}"}',
+    [A, B, AStatus]));
+end;
+
+// True if AOwner has already completed ATechID. An empty ATechID (the
+// common case - most unit types have RequiresTech = '') is trivially
+// always true, matching every pre-tech unit type's unconditional
+// spawnability.
+function HasResearched(const AOwner, ATechID: string): Boolean;
+begin
+  if ATechID = '' then Exit(True);
+  TechLock.Enter;
+  try
+    Result := ResearchedTech.ContainsKey(AOwner + '|' + ATechID);
+  finally
+    TechLock.Leave;
+  end;
+end;
+
+// True if every prerequisite listed on ATechID has already been
+// researched by AOwner. A tech with no prerequisites is trivially
+// always startable (subject to affording its own Cost separately -
+// see HandleStartResearch/RunAI).
+function TechPrereqsMet(const AOwner: string; const ADef: TTechDef): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  for i := 0 to High(ADef.Prerequisites) do
+    if not HasResearched(AOwner, ADef.Prerequisites[i]) then
+    begin
+      Result := False;
+      Break;
+    end;
+end;
+
+// Which faction "controls" cell (GX,GY), or '' if no city's influence
+// reaches it. Mirrors RecomputeDevelopment's own radius/falloff formula
+// (see its comment for why population scales the radius) so territory
+// lines up with what a viewer already sees as development, rather than
+// being a second, inconsistent notion of "whose land this is". Where
+// two different owners' cities both reach a cell, the stronger
+// falloff value wins - same tie-break RecomputeDevelopment's Contrib
+// dictionary already uses between overlapping cities.
+function GetTerritoryOwner(GX, GY: Integer): string;
+var
+  C: TCity;
+  radius: Integer;
+  dx, dy, dist, falloff, val, BestVal: Double;
+begin
+  Result := '';
+  BestVal := 0.0;
+  CitiesLock.Enter;
+  try
+    for C in Cities.Values do
+    begin
+      if C.Owner = '' then Continue; // unowned cities claim no territory
+      radius := Round(Min(Balance.DevelopmentRadiusCells,
+        Balance.DevelopmentMinRadiusCells + Balance.DevelopmentRadiusCells * (C.Population / Balance.CityMaxPopulation)));
+      dx := GX - C.GX; dy := GY - C.GY;
+      dist := Sqrt(dx * dx + dy * dy);
+      if dist > radius then Continue;
+      falloff := 1.0 - (dist / radius);
+      val := falloff * falloff * (C.Population / Balance.CityMaxPopulation);
+      if val > BestVal then
+      begin
+        BestVal := val;
+        Result := C.Owner;
+      end;
+    end;
+  finally
+    CitiesLock.Leave;
+  end;
+end;
+
 procedure HandleSpawn(APayload: TJSONObject);
 var
   UnitID: string;
@@ -775,9 +1185,19 @@ begin
     Exit;
   end;
 
-  U.ID := UnitID;
   U.Owner := APayload.Get('owner', '');
   U.UnitType := APayload.Get('unit_type', 'generic');
+
+  // Unowned spawns (U.Owner = '') stay exempt - there's no faction to
+  // check ResearchedTech against, same free-for-all carve-out
+  // HandleMove/HandleDespawn already give unowned units.
+  if (U.Owner <> '') and not HasResearched(U.Owner, GetUnitDef(U.UnitType).RequiresTech) then
+  begin
+    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"tech not researched\"}"}', [UnitID]));
+    Exit;
+  end;
+
+  U.ID := UnitID;
   U.GX := GX + 0.5;
   U.GY := GY + 0.5;
   SetLength(U.Path, 0);
@@ -843,7 +1263,7 @@ end;
 
 procedure HandleMove(APayload: TJSONObject);
 var
-  UnitID, Actor: string;
+  UnitID, Actor, TerritoryOwner, DiploStatus: string;
   U: TUnit;
   ToLon, ToLat: Double;
   ToX, ToY, StartX, StartY: Integer;
@@ -881,6 +1301,27 @@ begin
   ToY := LatToGridY(ToLat);
   StartX := Trunc(U.GX);
   StartY := Trunc(U.GY);
+
+  // Territory rule: a destination inside another faction's territory
+  // (see GetTerritoryOwner) is only open to a unit whose owner is at
+  // 'war' with that faction (invasion - the whole point of a war) or
+  // 'allied' with them (open borders). A plain neutral relationship
+  // keeps the border closed - declare war (or ally up) first. Unowned
+  // units (U.Owner = '') stay exempt, same free-for-all carve-out as
+  // the ownership check above.
+  if U.Owner <> '' then
+  begin
+    TerritoryOwner := GetTerritoryOwner(ToX, ToY);
+    if (TerritoryOwner <> '') and (TerritoryOwner <> U.Owner) then
+    begin
+      DiploStatus := GetDiplomaticStatus(U.Owner, TerritoryOwner);
+      if DiploStatus = '' then
+      begin
+        SendLine(Format('{"topic":"game.event.move_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"neutral territory - declare war or ally to enter\"}"}', [UnitID]));
+        Exit;
+      end;
+    end;
+  end;
 
   Path := FindPath(Grid, Config, StartX, StartY, ToX, ToY);
   if Length(Path) = 0 then
@@ -1532,155 +1973,18 @@ end;
 // with it - not a parallel "AI does this differently" code path. That
 // means the AI is bound by the exact same ownership/range/terrain
 // rules as anyone else, and any future rule change to spawning, moving,
-// or collecting automatically applies to the AI too.
-procedure RunAI;
-var
-  AiCity: TCity;
-  HasAiCity: Boolean;
-  CityPair: specialize TPair<string, TCity>;
-  WorkerCount: Integer;
-  UnitKeys: array of string;
-  UnitPair: specialize TPair<string, TUnit>;
-  i, KeyIdx: Integer;
-  U: TUnit;
-  AssignedNodeID, NewUnitID: string;
-  Node: TResourceNode;
-  NodeFound: Boolean;
-  BestNodeID: string;
-  BestDist, Dist: Double;
-  NodePair: specialize TPair<string, TResourceNode>;
-  PayloadStr: string;
-  PayloadData: TJSONData;
-  TargetLon, TargetLat: Double;
-begin
-  HasAiCity := False;
-  CitiesLock.Enter;
-  try
-    for CityPair in Cities do
-      if CityPair.Value.Owner = Balance.AiFactionName then
-      begin
-        AiCity := CityPair.Value;
-        HasAiCity := True;
-        Break;
-      end;
-  finally
-    CitiesLock.Leave;
-  end;
-  if not HasAiCity then Exit; // no seeded AI city (see cities.json) - nothing to run yet
-
-  WorkerCount := 0;
-  UnitsLock.Enter;
-  try
-    SetLength(UnitKeys, Units.Count);
-    KeyIdx := 0;
-    for UnitPair in Units do
-    begin
-      if (UnitPair.Value.Owner = Balance.AiFactionName) and (UnitPair.Value.UnitType = 'worker') then
-        Inc(WorkerCount);
-      UnitKeys[KeyIdx] := UnitPair.Key;
-      Inc(KeyIdx);
-    end;
-  finally
-    UnitsLock.Leave;
-  end;
-
-  if (Tick mod Balance.AiTickInterval = 0) and (WorkerCount < Balance.AiTargetWorkerCount) then
-  begin
-    NewUnitID := 'ai_w_' + IntToStr(Tick) + '_' + IntToStr(WorkerCount);
-    PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"worker"}',
-      [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), Balance.AiFactionName]);
-    PayloadData := GetJSON(PayloadStr);
-    try
-      HandleSpawn(TJSONObject(PayloadData));
-    finally
-      PayloadData.Free;
-    end;
-  end;
-
-  for i := 0 to High(UnitKeys) do
-  begin
-    UnitsLock.Enter;
-    try
-      if not Units.TryGetValue(UnitKeys[i], U) then Continue;
-    finally
-      UnitsLock.Leave;
-    end;
-
-    if (U.Owner <> Balance.AiFactionName) or (U.UnitType <> 'worker') then Continue;
-
-    if not AiUnitTargets.TryGetValue(UnitKeys[i], AssignedNodeID) then
-      AssignedNodeID := '';
-
-    NodesLock.Enter;
-    try
-      // Depleted or never assigned - (re)pick whatever's nearest with
-      // anything left. A full scan of Nodes is fine at this map's
-      // scale (a handful of seeded nodes), same reasoning as
-      // RecomputeDevelopment's full-recompute-over-incremental choice.
-      if (AssignedNodeID <> '') and Nodes.TryGetValue(AssignedNodeID, Node) and (Node.Amount <= 0) then
-        AssignedNodeID := '';
-
-      if AssignedNodeID = '' then
-      begin
-        BestNodeID := '';
-        BestDist := MaxDouble;
-        for NodePair in Nodes do
-        begin
-          if NodePair.Value.Amount <= 0 then Continue;
-          Dist := WrappedDistance(U.GX, U.GY, NodePair.Value.GX, NodePair.Value.GY);
-          if Dist < BestDist then
-          begin
-            BestDist := Dist;
-            BestNodeID := NodePair.Key;
-          end;
-        end;
-        AssignedNodeID := BestNodeID;
-      end;
-
-      NodeFound := (AssignedNodeID <> '') and Nodes.TryGetValue(AssignedNodeID, Node);
-    finally
-      NodesLock.Leave;
-    end;
-
-    if not NodeFound then Continue; // nothing left anywhere - this worker idles
-
-    AiUnitTargets.AddOrSetValue(UnitKeys[i], AssignedNodeID);
-
-    Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
-
-    if Dist <= Balance.CollectRadiusCells then
-    begin
-      PayloadStr := Format('{"unit_id":"%s","node_id":"%s","by":"%s"}', [UnitKeys[i], AssignedNodeID, Balance.AiFactionName]);
-      PayloadData := GetJSON(PayloadStr);
-      try
-        HandleCollect(TJSONObject(PayloadData));
-      finally
-        PayloadData.Free;
-      end;
-    end
-    else if Length(U.Path) = 0 then
-    begin
-      // Idle and out of range - (re)issue a move. Once en route,
-      // AdvanceUnits carries it there on its own; this only fires again
-      // if it arrives, gets interrupted, or its target got reassigned.
-      TargetLon := GridToLon(Node.GX);
-      TargetLat := GridToLat(Node.GY);
-      PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-        [UnitKeys[i], TargetLon, TargetLat, Balance.AiFactionName]);
-      PayloadData := GetJSON(PayloadStr);
-      try
-        HandleMove(TJSONObject(PayloadData));
-      finally
-        PayloadData.Free;
-      end;
-    end;
-  end;
-end;
+// or collecting automatically applies to the AI too. Settlers/soldiers
+// added for expansion/combat follow the same principle - see RunAI's
+// own body below for how each unit type is driven.
 
 // Builds a road between two existing cities, reusing the same A*
 // pathfinding as HandleMove with the cities' cells as start/end. The
 // path is cached on the TRoad so RecomputeDevelopment doesn't need to
-// re-run pathfinding on every density update.
+// re-run pathfinding on every density update. Moved ahead of RunAI
+// (which used to be textually first) because RunAI's own road-building
+// pass now calls this directly, and this file has no forward
+// declarations - everything a procedure calls has to already be
+// defined above it.
 procedure HandleBuildRoad(APayload: TJSONObject);
 var
   RoadID, FromCityID, ToCityID, Actor: string;
@@ -1761,6 +2065,841 @@ begin
   SendLine('{"topic":"game.event.road_built","payload":"{\"road_id\":\"' + RoadID +
     '\",\"from_city_id\":\"' + FromCityID + '\",\"to_city_id\":\"' + ToCityID +
     '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
+end;
+
+// True if a direct road already links two specific cities (either
+// direction) - the AI road-builder's own narrower question compared to
+// IsCityRoadConnected's "connected to ANY same-owner city" check, since
+// the AI wants to know about THIS pair specifically before spending a
+// road_id on a duplicate.
+function RoadExistsBetween(const ACityID1, ACityID2: string): Boolean;
+var
+  R: TRoad;
+begin
+  Result := False;
+  RoadsLock.Enter;
+  try
+    for R in Roads.Values do
+      if ((R.FromCityID = ACityID1) and (R.ToCityID = ACityID2)) or
+         ((R.FromCityID = ACityID2) and (R.ToCityID = ACityID1)) then
+      begin
+        Result := True;
+        Break;
+      end;
+  finally
+    RoadsLock.Leave;
+  end;
+end;
+
+// Handles both unit-vs-unit and unit-vs-city combat, distinguished by
+// which of target_unit_id/target_city_id the payload sets. A city's
+// Population doubles as its defense pool (see Balance.SiegeDamagePerAttack's
+// comment) - hitting a city just decrements it the same way an
+// attacker's damage decrements a unit's HP, and capture is simply what
+// happens when that pool bottoms out, mirroring death for units.
+procedure HandleAttack(APayload: TJSONObject);
+var
+  AttackerID, TargetUnitID, TargetCityID, Actor, Reason, PrevOwner: string;
+  Attacker, TargetUnit: TUnit;
+  AttackerDef: TUnitDef;
+  AttackerFound, TargetUnitFound, TargetCityFound, LeveledUp: Boolean;
+  TargetCity: TCity;
+  Dist: Double;
+  Damage, NewHP, NewPop: Integer;
+begin
+  AttackerID := APayload.Get('attacker_unit_id', '');
+  TargetUnitID := APayload.Get('target_unit_id', '');
+  TargetCityID := APayload.Get('target_city_id', '');
+  Actor := APayload.Get('by', '');
+  Reason := '';
+
+  if (AttackerID = '') or ((TargetUnitID = '') and (TargetCityID = '')) then Exit;
+
+  UnitsLock.Enter;
+  try
+    AttackerFound := Units.TryGetValue(AttackerID, Attacker);
+  finally
+    UnitsLock.Leave;
+  end;
+
+  if not AttackerFound then
+    Reason := 'unknown attacker'
+  else if (Attacker.Owner <> '') and (Attacker.Owner <> Actor) then
+    Reason := 'not your unit'
+  else if Attacker.Owner = '' then
+    Reason := 'unowned units cannot attack' // nobody to credit the conquest to
+  else
+  begin
+    AttackerDef := GetUnitDef(Attacker.UnitType);
+    if AttackerDef.Attack <= 0 then
+      Reason := 'unit type cannot fight';
+  end;
+
+  if (Reason = '') and (TargetUnitID <> '') then
+  begin
+    UnitsLock.Enter;
+    try
+      TargetUnitFound := Units.TryGetValue(TargetUnitID, TargetUnit);
+    finally
+      UnitsLock.Leave;
+    end;
+
+    if not TargetUnitFound then
+      Reason := 'unknown target'
+    else if TargetUnit.Owner = Attacker.Owner then
+      Reason := 'cannot attack your own faction'
+    else if (TargetUnit.Owner <> '') and (GetDiplomaticStatus(Attacker.Owner, TargetUnit.Owner) = 'allied') then
+      Reason := 'cannot attack an allied faction - break the alliance first'
+    else
+    begin
+      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetUnit.GX, TargetUnit.GY);
+      if Dist > Balance.AttackRangeCells then
+        Reason := 'too far';
+    end;
+
+    // A strike against a faction not already at war is itself a
+    // declaration of war - same "attacking auto-opens hostilities"
+    // convention plenty of strategy games use, so declare_war is
+    // available for signaling intent up front but never a hard
+    // prerequisite to actually fighting. Allied targets never reach
+    // here (blocked above); an unowned target (TargetUnit.Owner = '')
+    // has no faction to open a war against.
+    if (Reason = '') and (TargetUnit.Owner <> '') and (GetDiplomaticStatus(Attacker.Owner, TargetUnit.Owner) <> 'war') then
+      SetDiplomaticStatus(Attacker.Owner, TargetUnit.Owner, 'war');
+
+    if Reason = '' then
+    begin
+      // Effective damage includes the attacker's veterancy bonus - a
+      // Level 2 soldier hits harder than a fresh one of the same type.
+      Damage := AttackerDef.Attack + Attacker.Level * Balance.VeterancyAttackBonusPerLevel;
+      NewHP := TargetUnit.HP - Damage;
+      if NewHP < 0 then NewHP := 0;
+
+      // Veterancy: any landed hit grants XP, win or lose, dead or
+      // alive on the target's side - the attacker did the fighting
+      // regardless of outcome. Scoped to unit-vs-unit only (see
+      // Balance.VeterancyXPPerHit's comment) so this branch is the only place
+      // that ever touches XP/Level.
+      Attacker.XP := Attacker.XP + Balance.VeterancyXPPerHit;
+      LeveledUp := False;
+      while (Attacker.Level < Balance.VeterancyMaxLevel) and
+            (Attacker.XP >= (Attacker.Level + 1) * Balance.VeterancyXPPerLevel) do
+      begin
+        Attacker.XP := Attacker.XP - (Attacker.Level + 1) * Balance.VeterancyXPPerLevel;
+        Inc(Attacker.Level);
+        Inc(Attacker.HP, Balance.VeterancyHPBonusPerLevel); // heals on level-up, not just a higher ceiling a wounded unit wouldn't feel
+        LeveledUp := True;
+      end;
+      UnitsLock.Enter;
+      try
+        Units.AddOrSetValue(AttackerID, Attacker);
+      finally
+        UnitsLock.Leave;
+      end;
+
+      LogEvent(Format('{"type":"unit_attacked","attacker_unit_id":"%s","target_unit_id":"%s","by":"%s","damage":%d,"remaining_hp":%d,"attacker_xp":%d,"attacker_level":%d}',
+        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
+      SendLine(Format('{"topic":"game.event.unit_attacked","payload":"{\"attacker_unit_id\":\"%s\",\"target_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"remaining_hp\":%d,\"attacker_xp\":%d,\"attacker_level\":%d}"}',
+        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
+
+      if LeveledUp then
+      begin
+        // Notification-only - fully redundant with the attacker_xp/
+        // attacker_level fields already in unit_attacked above, so
+        // replay never needs to handle this one specially. It exists
+        // purely so a dashboard or map viewer can flag the moment
+        // distinctly rather than noticing it by comparing two numbers.
+        SendLine(Format('{"topic":"game.event.unit_leveled_up","payload":"{\"unit_id\":\"%s\",\"level\":%d,\"hp\":%d}"}',
+          [AttackerID, Attacker.Level, Attacker.HP]));
+      end;
+
+      if NewHP <= 0 then
+      begin
+        UnitsLock.Enter;
+        try
+          Units.Remove(TargetUnitID);
+        finally
+          UnitsLock.Leave;
+        end;
+        // Same event shape a normal despawn produces - the client and
+        // replay both already know how to remove a unit this way, so
+        // death-by-combat doesn't need its own removal handling.
+        LogEvent(Format('{"type":"despawned","unit_id":"%s"}', [TargetUnitID]));
+        SendLine(Format('{"topic":"game.event.despawned","payload":"{\"unit_id\":\"%s\"}"}', [TargetUnitID]));
+      end
+      else
+      begin
+        TargetUnit.HP := NewHP;
+        UnitsLock.Enter;
+        try
+          Units.AddOrSetValue(TargetUnitID, TargetUnit);
+        finally
+          UnitsLock.Leave;
+        end;
+      end;
+      Exit;
+    end;
+  end
+  else if (Reason = '') and (TargetCityID <> '') then
+  begin
+    CitiesLock.Enter;
+    try
+      TargetCityFound := Cities.TryGetValue(TargetCityID, TargetCity);
+    finally
+      CitiesLock.Leave;
+    end;
+
+    if not TargetCityFound then
+      Reason := 'unknown city'
+    else if TargetCity.Owner = Attacker.Owner then
+      Reason := 'already yours'
+    else if (TargetCity.Owner <> '') and (GetDiplomaticStatus(Attacker.Owner, TargetCity.Owner) = 'allied') then
+      Reason := 'cannot siege an allied faction - break the alliance first'
+    else
+    begin
+      // TargetCity.GX/GY are the raw cell (no +0.5) - unlike a unit's
+      // GX/GY, which is always a cell CENTER. Comparing against the
+      // raw cell made the effective range asymmetric depending on
+      // which direction the attacker approached from (a city dead
+      // east could be out of range while the same distance to the
+      // west was in range) - +0.5 puts both sides of the comparison
+      // on the same cell-center footing.
+      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetCity.GX + 0.5, TargetCity.GY + 0.5);
+      if Dist > Balance.AttackRangeCells then
+        Reason := 'too far';
+    end;
+
+    // Same auto-war convention as the unit-target branch above.
+    if (Reason = '') and (TargetCity.Owner <> '') and (GetDiplomaticStatus(Attacker.Owner, TargetCity.Owner) <> 'war') then
+      SetDiplomaticStatus(Attacker.Owner, TargetCity.Owner, 'war');
+
+    if Reason = '' then
+    begin
+      NewPop := TargetCity.Population - Balance.SiegeDamagePerAttack;
+
+      if NewPop <= 0 then
+      begin
+        PrevOwner := TargetCity.Owner;
+        TargetCity.Owner := Attacker.Owner;
+        TargetCity.Population := Balance.CityCaptureResetPopulation;
+        TargetCity.LastGrowthTick := Tick;
+        TargetCity.LastUpkeepTick := Tick; // fresh upkeep clock too - no back-charged upkeep from being conquered
+
+        CitiesLock.Enter;
+        try
+          Cities.AddOrSetValue(TargetCityID, TargetCity);
+        finally
+          CitiesLock.Leave;
+        end;
+
+        LogEvent(Format('{"type":"city_captured","city_id":"%s","previous_owner":"%s","new_owner":"%s","population":%d}',
+          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
+        SendLine(Format('{"topic":"game.event.city_captured","payload":"{\"city_id\":\"%s\",\"previous_owner\":\"%s\",\"new_owner\":\"%s\",\"population\":%d}"}',
+          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
+      end
+      else
+      begin
+        TargetCity.Population := NewPop;
+        CitiesLock.Enter;
+        try
+          Cities.AddOrSetValue(TargetCityID, TargetCity);
+        finally
+          CitiesLock.Leave;
+        end;
+
+        LogEvent(Format('{"type":"city_attacked","city_id":"%s","attacker_unit_id":"%s","by":"%s","damage":%d,"population_remaining":%d}',
+          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
+        SendLine(Format('{"topic":"game.event.city_attacked","payload":"{\"city_id\":\"%s\",\"attacker_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"population_remaining\":%d}"}',
+          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
+      end;
+      Exit;
+    end;
+  end;
+
+  if Reason <> '' then
+    SendLine(Format('{"topic":"game.event.attack_failed","payload":"{\"attacker_unit_id\":\"%s\",\"reason\":\"%s\"}"}', [AttackerID, Reason]));
+end;
+
+// Starts research on ATechID for AOwner, deducting its Cost up front
+// (same "pay now, wait ticks" shape as GrowCities' growth cost, except
+// research has no free-if-unaffordable retry loop - a rejected start
+// just fails outright and the caller can retry once they can afford
+// it). One research at a time per faction - starting a new one while
+// another is already running is rejected rather than queued or
+// overwritten, so a faction's progress on its current pick is never
+// silently lost to a second command.
+procedure HandleStartResearch(APayload: TJSONObject);
+var
+  TechID, Actor, Reason: string;
+  Def: TTechDef;
+  DefFound, AlreadyInProgress: Boolean;
+  Dummy: TResearchInProgress;
+  InProgress: TResearchInProgress;
+begin
+  TechID := APayload.Get('tech_id', '');
+  Actor := APayload.Get('by', '');
+  if (TechID = '') or (Actor = '') then Exit;
+
+  Reason := '';
+  DefFound := TechDefs.TryGetValue(TechID, Def);
+
+  if not DefFound then
+    Reason := 'unknown tech'
+  else if HasResearched(Actor, TechID) then
+    Reason := 'already researched'
+  else if not TechPrereqsMet(Actor, Def) then
+    Reason := 'prerequisites not met'
+  else
+  begin
+    TechLock.Enter;
+    try
+      AlreadyInProgress := ResearchInProgress.TryGetValue(Actor, Dummy);
+    finally
+      TechLock.Leave;
+    end;
+    if AlreadyInProgress then
+      Reason := 'research already in progress'
+    else if not CanAffordCost(Actor, Def.Cost) then
+      Reason := 'cannot afford';
+  end;
+
+  if Reason <> '' then
+  begin
+    SendLine(Format('{"topic":"game.event.research_failed","payload":"{\"tech_id\":\"%s\",\"by\":\"%s\",\"reason\":\"%s\"}"}',
+      [TechID, Actor, Reason]));
+    Exit;
+  end;
+
+  DeductCost(Actor, Def.Cost);
+
+  InProgress.TechID := TechID;
+  InProgress.StartTick := Tick;
+  TechLock.Enter;
+  try
+    ResearchInProgress.AddOrSetValue(Actor, InProgress);
+  finally
+    TechLock.Leave;
+  end;
+
+  if Length(Def.Cost) > 0 then
+  begin
+    LogEvent(Format('{"type":"research_cost_spent","owner":"%s","costs":%s}', [Actor, CostsToJSON(Def.Cost)]));
+    SendLine('{"topic":"game.event.research_cost_spent","payload":"{\"owner\":\"' + Actor +
+      '\",\"costs\":' + StringReplace(CostsToJSON(Def.Cost), '"', '\"', [rfReplaceAll]) + '}"}');
+  end;
+
+  LogEvent(Format('{"type":"research_started","owner":"%s","tech_id":"%s"}', [Actor, TechID]));
+  SendLine(Format('{"topic":"game.event.research_started","payload":"{\"owner\":\"%s\",\"tech_id\":\"%s\",\"research_ticks\":%d}"}',
+    [Actor, TechID, Def.ResearchTicks]));
+end;
+
+
+procedure RunAI(const AConfig: TAiFactionConfig);
+var
+  AiCity: TCity;
+  HasAiCity: Boolean;
+  CityPair: specialize TPair<string, TCity>;
+  WorkerCount, SettlerCount, SoldierCount: Integer;
+  UnitKeys: array of string;
+  UnitPair: specialize TPair<string, TUnit>;
+  i, j, KeyIdx, TryX, TryY, SiteGX, SiteGY: Integer;
+  U, OtherU: TUnit;
+  AssignedNodeID, NewUnitID, AssignedTarget, TargetTechID: string;
+  Node: TResourceNode;
+  NodeFound, SiteFound, AllFarEnough: Boolean;
+  BestNodeID: string;
+  BestDist, Dist: Double;
+  NodePair: specialize TPair<string, TResourceNode>;
+  PayloadStr: string;
+  PayloadData: TJSONData;
+  TargetLon, TargetLat: Double;
+  AiCityKeys: array of string;
+  AiCityIdx: Integer;
+  CityA, CityB: TCity;
+  TargetUnitID, TargetCityID: string;
+  BestTargetDist: Double;
+  OtherCity: TCity;
+  Def: TTechDef;
+  AlreadyResearching: Boolean;
+  Dummy: TResearchInProgress;
+begin
+  HasAiCity := False;
+  SetLength(AiCityKeys, 0);
+  AiCityIdx := 0;
+  CitiesLock.Enter;
+  try
+    SetLength(AiCityKeys, Cities.Count);
+    for CityPair in Cities do
+      if CityPair.Value.Owner = AConfig.FactionName then
+      begin
+        if not HasAiCity then
+        begin
+          AiCity := CityPair.Value;
+          HasAiCity := True;
+        end;
+        AiCityKeys[AiCityIdx] := CityPair.Key;
+        Inc(AiCityIdx);
+      end;
+  finally
+    CitiesLock.Leave;
+  end;
+  SetLength(AiCityKeys, AiCityIdx);
+  if not HasAiCity then Exit; // no seeded AI city (see cities.json) - nothing to run yet
+
+  WorkerCount := 0;
+  SettlerCount := 0;
+  SoldierCount := 0;
+  UnitsLock.Enter;
+  try
+    SetLength(UnitKeys, Units.Count);
+    KeyIdx := 0;
+    for UnitPair in Units do
+    begin
+      if UnitPair.Value.Owner = AConfig.FactionName then
+      begin
+        if UnitPair.Value.UnitType = 'worker' then Inc(WorkerCount)
+        else if UnitPair.Value.UnitType = 'settler' then Inc(SettlerCount)
+        else if UnitPair.Value.UnitType = 'soldier' then Inc(SoldierCount);
+      end;
+      UnitKeys[KeyIdx] := UnitPair.Key;
+      Inc(KeyIdx);
+    end;
+  finally
+    UnitsLock.Leave;
+  end;
+
+  if (Tick + AConfig.Offset) mod AConfig.TickInterval = 0 then
+  begin
+    if WorkerCount < AConfig.TargetWorkerCount then
+    begin
+      NewUnitID := 'ai_w_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(WorkerCount);
+      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"worker"}',
+        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+      PayloadData := GetJSON(PayloadStr);
+      try
+        HandleSpawn(TJSONObject(PayloadData));
+      finally
+        PayloadData.Free;
+      end;
+    end;
+
+    if SettlerCount < AConfig.TargetSettlerCount then
+    begin
+      NewUnitID := 'ai_s_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SettlerCount);
+      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"settler"}',
+        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+      PayloadData := GetJSON(PayloadStr);
+      try
+        HandleSpawn(TJSONObject(PayloadData));
+      finally
+        PayloadData.Free;
+      end;
+    end;
+
+    if SoldierCount < AConfig.TargetSoldierCount then
+    begin
+      NewUnitID := 'ai_m_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SoldierCount);
+      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"soldier"}',
+        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+      PayloadData := GetJSON(PayloadStr);
+      try
+        HandleSpawn(TJSONObject(PayloadData));
+      finally
+        PayloadData.Free;
+      end;
+    end;
+
+    // Road building: link every pair of AI-owned cities that isn't
+    // already directly connected. O(n^2) over AI's own city count,
+    // which stays tiny for the foreseeable lifetime of this project
+    // (same "fine at this scale" reasoning the worker-node search
+    // above already leans on).
+    for i := 0 to High(AiCityKeys) do
+      for j := i + 1 to High(AiCityKeys) do
+        if not RoadExistsBetween(AiCityKeys[i], AiCityKeys[j]) then
+        begin
+          CitiesLock.Enter;
+          try
+            if not (Cities.TryGetValue(AiCityKeys[i], CityA) and Cities.TryGetValue(AiCityKeys[j], CityB)) then
+              Continue;
+          finally
+            CitiesLock.Leave;
+          end;
+          PayloadStr := Format('{"road_id":"ai_road_%s_%s","from_city_id":"%s","to_city_id":"%s","by":"%s"}',
+            [AiCityKeys[i], AiCityKeys[j], AiCityKeys[i], AiCityKeys[j], AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleBuildRoad(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end;
+
+    // Research: at most one tech in flight at a time (HandleStartResearch
+    // enforces this too - the check here just avoids the noise of a
+    // rejected research_failed event every AiTickInterval ticks while
+    // one is already running). Walks TechOrder (tech.json's own array
+    // order) and starts the first tech whose prerequisites are met and
+    // whose cost the AI can currently afford, so cheaper/earlier techs
+    // in the file tend to get picked up before pricier later ones.
+    if AConfig.ResearchEnabled then
+    begin
+      TechLock.Enter;
+      try
+        AlreadyResearching := ResearchInProgress.TryGetValue(AConfig.FactionName, Dummy);
+      finally
+        TechLock.Leave;
+      end;
+
+      if not AlreadyResearching then
+      begin
+        TargetTechID := '';
+        for i := 0 to TechOrder.Count - 1 do
+        begin
+          if not TechDefs.TryGetValue(TechOrder[i], Def) then Continue;
+          if HasResearched(AConfig.FactionName, Def.TechID) then Continue;
+          if not TechPrereqsMet(AConfig.FactionName, Def) then Continue;
+          if not CanAffordCost(AConfig.FactionName, Def.Cost) then Continue;
+          TargetTechID := Def.TechID;
+          Break;
+        end;
+
+        if TargetTechID <> '' then
+        begin
+          PayloadStr := Format('{"tech_id":"%s","by":"%s"}', [TargetTechID, AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleStartResearch(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  for i := 0 to High(UnitKeys) do
+  begin
+    UnitsLock.Enter;
+    try
+      if not Units.TryGetValue(UnitKeys[i], U) then Continue;
+    finally
+      UnitsLock.Leave;
+    end;
+
+    if U.Owner <> AConfig.FactionName then Continue;
+
+    // --- Workers: collect from the nearest node with anything left ---
+    if U.UnitType = 'worker' then
+    begin
+      if not AiUnitTargets.TryGetValue(UnitKeys[i], AssignedNodeID) then
+        AssignedNodeID := '';
+
+      NodesLock.Enter;
+      try
+        // Depleted or never assigned - (re)pick whatever's nearest with
+        // anything left. A full scan of Nodes is fine at this map's
+        // scale (a handful of seeded nodes), same reasoning as
+        // RecomputeDevelopment's full-recompute-over-incremental choice.
+        if (AssignedNodeID <> '') and Nodes.TryGetValue(AssignedNodeID, Node) and (Node.Amount <= 0) then
+          AssignedNodeID := '';
+
+        if AssignedNodeID = '' then
+        begin
+          BestNodeID := '';
+          BestDist := MaxDouble;
+          for NodePair in Nodes do
+          begin
+            if NodePair.Value.Amount <= 0 then Continue;
+            Dist := WrappedDistance(U.GX, U.GY, NodePair.Value.GX, NodePair.Value.GY);
+            if Dist < BestDist then
+            begin
+              BestDist := Dist;
+              BestNodeID := NodePair.Key;
+            end;
+          end;
+          AssignedNodeID := BestNodeID;
+        end;
+
+        NodeFound := (AssignedNodeID <> '') and Nodes.TryGetValue(AssignedNodeID, Node);
+      finally
+        NodesLock.Leave;
+      end;
+
+      if not NodeFound then Continue; // nothing left anywhere - this worker idles
+
+      AiUnitTargets.AddOrSetValue(UnitKeys[i], AssignedNodeID);
+
+      Dist := WrappedDistance(U.GX, U.GY, Node.GX, Node.GY);
+
+      if Dist <= Balance.CollectRadiusCells then
+      begin
+        PayloadStr := Format('{"unit_id":"%s","node_id":"%s","by":"%s"}', [UnitKeys[i], AssignedNodeID, AConfig.FactionName]);
+        PayloadData := GetJSON(PayloadStr);
+        try
+          HandleCollect(TJSONObject(PayloadData));
+        finally
+          PayloadData.Free;
+        end;
+      end
+      else if Length(U.Path) = 0 then
+      begin
+        // Idle and out of range - (re)issue a move. Once en route,
+        // AdvanceUnits carries it there on its own; this only fires again
+        // if it arrives, gets interrupted, or its target got reassigned.
+        TargetLon := GridToLon(Node.GX);
+        TargetLat := GridToLat(Node.GY);
+        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
+          [UnitKeys[i], TargetLon, TargetLat, AConfig.FactionName]);
+        PayloadData := GetJSON(PayloadStr);
+        try
+          HandleMove(TJSONObject(PayloadData));
+        finally
+          PayloadData.Free;
+        end;
+      end;
+      Continue;
+    end;
+
+    // --- Settlers: pick an unclaimed site, walk to it, found a city ---
+    if U.UnitType = 'settler' then
+    begin
+      AssignedTarget := '';
+      AiUnitTargets.TryGetValue(UnitKeys[i], AssignedTarget);
+
+      // A settler target is stored as "GX,GY" (always contains a comma);
+      // a worker's node target is a bare node_id (never does) - sharing
+      // AiUnitTargets between the two is safe since each unit ID is only
+      // ever used for one unit, so there's no risk of one unit's entry
+      // being misread as the other's format.
+      SiteFound := False;
+      if (AssignedTarget <> '') and (Pos(',', AssignedTarget) > 0) then
+      begin
+        SiteGX := StrToIntDef(Copy(AssignedTarget, 1, Pos(',', AssignedTarget) - 1), -1);
+        SiteGY := StrToIntDef(Copy(AssignedTarget, Pos(',', AssignedTarget) + 1, MaxInt), -1);
+        SiteFound := SiteGX >= 0;
+      end;
+
+      if SiteFound and (Length(U.Path) = 0) and (Trunc(U.GX) = SiteGX) and (Trunc(U.GY) = SiteGY) then
+      begin
+        // Arrived - found the city and clear the target so a
+        // replacement settler (if this one somehow survives, e.g. the
+        // founding fails on a race with something else claiming the
+        // site first) picks a fresh site next pass rather than
+        // re-trying a now-stale one forever.
+        PayloadStr := Format('{"city_id":"ai_city_%s_%d_%d","unit_id":"%s","by":"%s"}',
+          [AConfig.FactionName, SiteGX, SiteGY, UnitKeys[i], AConfig.FactionName]);
+        PayloadData := GetJSON(PayloadStr);
+        try
+          HandleFoundCity(TJSONObject(PayloadData));
+        finally
+          PayloadData.Free;
+        end;
+        AiUnitTargets.Remove(UnitKeys[i]);
+        Continue;
+      end;
+
+      if not SiteFound then
+      begin
+        // Bounded random search around the AI's (first) city for a
+        // passable cell far enough from EVERY existing city (any
+        // owner) - a handful of random tries is enough at this map's
+        // scale rather than an exhaustive spiral scan, same "good
+        // enough, not optimal" spirit as the worker's nearest-node pick.
+        for j := 1 to 40 do
+        begin
+          TryX := Trunc(AiCity.GX) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
+          TryY := Trunc(AiCity.GY) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
+          if (TryX < 0) or (TryX >= Grid.Width) or (TryY < 0) or (TryY >= Grid.Height) then Continue;
+          if CellMoveCost(Grid, Config, TryX, TryY) <= 0 then Continue;
+
+          AllFarEnough := True;
+          CitiesLock.Enter;
+          try
+            for OtherCity in Cities.Values do
+            begin
+              Dist := WrappedDistance(TryX + 0.5, TryY + 0.5, OtherCity.GX + 0.5, OtherCity.GY + 0.5);
+              if Dist < AConfig.ExpansionMinCityDistanceCells then
+              begin
+                AllFarEnough := False;
+                Break;
+              end;
+            end;
+          finally
+            CitiesLock.Leave;
+          end;
+
+          if AllFarEnough then
+          begin
+            SiteGX := TryX;
+            SiteGY := TryY;
+            SiteFound := True;
+            Break;
+          end;
+        end;
+
+        if not SiteFound then Continue; // no acceptable site found this pass - try again next tick
+
+        AiUnitTargets.AddOrSetValue(UnitKeys[i], Format('%d,%d', [SiteGX, SiteGY]));
+      end;
+
+      if Length(U.Path) = 0 then
+      begin
+        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
+          [UnitKeys[i], GridToLon(SiteGX + 0.5), GridToLat(SiteGY + 0.5), AConfig.FactionName]);
+        PayloadData := GetJSON(PayloadStr);
+        try
+          HandleMove(TJSONObject(PayloadData));
+        finally
+          PayloadData.Free;
+        end;
+      end;
+      Continue;
+    end;
+
+    // --- Soldiers: hunt anyone the AI is at war with, else garrison ---
+    if U.UnitType = 'soldier' then
+    begin
+      TargetUnitID := '';
+      BestTargetDist := AConfig.AggressionRangeCells;
+      UnitsLock.Enter;
+      try
+        for UnitPair in Units do
+        begin
+          OtherU := UnitPair.Value;
+          if (OtherU.Owner = '') or (OtherU.Owner = AConfig.FactionName) then Continue;
+          if GetDiplomaticStatus(AConfig.FactionName, OtherU.Owner) <> 'war' then Continue;
+          Dist := WrappedDistance(U.GX, U.GY, OtherU.GX, OtherU.GY);
+          if Dist < BestTargetDist then
+          begin
+            BestTargetDist := Dist;
+            TargetUnitID := UnitPair.Key;
+          end;
+        end;
+      finally
+        UnitsLock.Leave;
+      end;
+
+      if TargetUnitID <> '' then
+      begin
+        UnitsLock.Enter;
+        try
+          Units.TryGetValue(TargetUnitID, OtherU);
+        finally
+          UnitsLock.Leave;
+        end;
+
+        if BestTargetDist <= Balance.AttackRangeCells then
+        begin
+          PayloadStr := Format('{"attacker_unit_id":"%s","target_unit_id":"%s","by":"%s"}',
+            [UnitKeys[i], TargetUnitID, AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleAttack(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end
+        else if Length(U.Path) = 0 then
+        begin
+          PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
+            [UnitKeys[i], GridToLon(OtherU.GX), GridToLat(OtherU.GY), AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleMove(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end;
+        Continue;
+      end;
+
+      // No unit target in range - try an enemy CITY at war with the AI
+      // instead, same range/attack-or-approach shape as above.
+      TargetCityID := '';
+      BestTargetDist := AConfig.AggressionRangeCells;
+      CitiesLock.Enter;
+      try
+        for CityPair in Cities do
+        begin
+          OtherCity := CityPair.Value;
+          if (OtherCity.Owner = '') or (OtherCity.Owner = AConfig.FactionName) then Continue;
+          if GetDiplomaticStatus(AConfig.FactionName, OtherCity.Owner) <> 'war' then Continue;
+          Dist := WrappedDistance(U.GX, U.GY, OtherCity.GX + 0.5, OtherCity.GY + 0.5);
+          if Dist < BestTargetDist then
+          begin
+            BestTargetDist := Dist;
+            TargetCityID := CityPair.Key;
+          end;
+        end;
+      finally
+        CitiesLock.Leave;
+      end;
+
+      if TargetCityID <> '' then
+      begin
+        CitiesLock.Enter;
+        try
+          Cities.TryGetValue(TargetCityID, OtherCity);
+        finally
+          CitiesLock.Leave;
+        end;
+
+        if BestTargetDist <= Balance.AttackRangeCells then
+        begin
+          PayloadStr := Format('{"attacker_unit_id":"%s","target_city_id":"%s","by":"%s"}',
+            [UnitKeys[i], TargetCityID, AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleAttack(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end
+        else if Length(U.Path) = 0 then
+        begin
+          PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
+            [UnitKeys[i], GridToLon(OtherCity.GX + 0.5), GridToLat(OtherCity.GY + 0.5), AConfig.FactionName]);
+          PayloadData := GetJSON(PayloadStr);
+          try
+            HandleMove(TJSONObject(PayloadData));
+          finally
+            PayloadData.Free;
+          end;
+        end;
+        Continue;
+      end;
+
+      // Nobody to fight - garrison at home rather than wandering.
+      if (Length(U.Path) = 0) and (WrappedDistance(U.GX, U.GY, AiCity.GX + 0.5, AiCity.GY + 0.5) > Balance.AttackRangeCells * 2) then
+      begin
+        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
+          [UnitKeys[i], GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+        PayloadData := GetJSON(PayloadStr);
+        try
+          HandleMove(TJSONObject(PayloadData));
+        finally
+          PayloadData.Free;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// Drives every AI faction in AiFactionConfigs once per tick. RunAI
+// itself is always called - its per-unit movement/collection/combat
+// pass needs to run every tick for smooth behavior. Only RunAI's OWN
+// internal spawn/road/research section is throttled, by that
+// faction's TickInterval+Offset (see TAiFactionConfig's comment) -
+// staggering which tick each faction's heavier decision pass falls on
+// so N factions sharing the same interval don't all recompute on the
+// identical tick.
+procedure RunAllAI;
+var
+  i: Integer;
+begin
+  for i := 0 to High(AiFactionConfigs) do
+    RunAI(AiFactionConfigs[i]);
 end;
 
 // Same "one message, full current state" pattern as HandleListNodes.
@@ -1996,215 +3135,334 @@ begin
     StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
 end;
 
-// Handles both unit-vs-unit and unit-vs-city combat, distinguished by
-// which of target_unit_id/target_city_id the payload sets. A city's
-// Population doubles as its defense pool (see Balance.SiegeDamagePerAttack's
-// comment) - hitting a city just decrements it the same way an
-// attacker's damage decrements a unit's HP, and capture is simply what
-// happens when that pool bottoms out, mirroring death for units.
-procedure HandleAttack(APayload: TJSONObject);
+
+// Full tech.json registry, same "one message, full current state"
+// pattern as HandleListNodes/HandleListCities - a client needs this
+// once to know what's researchable at all and what each tech costs/
+// unlocks, then follows individual research_started/research_completed
+// events for what's actually happened.
+procedure HandleListTechDefs;
 var
-  AttackerID, TargetUnitID, TargetCityID, Actor, Reason, PrevOwner: string;
-  Attacker, TargetUnit: TUnit;
-  AttackerDef: TUnitDef;
-  AttackerFound, TargetUnitFound, TargetCityFound, LeveledUp: Boolean;
-  TargetCity: TCity;
-  Dist: Double;
-  Damage, NewHP, NewPop: Integer;
+  TechID: string;
+  Def: TTechDef;
+  ListJSON, PrereqJSON: string;
+  First, FirstPrereq: Boolean;
+  i: Integer;
 begin
-  AttackerID := APayload.Get('attacker_unit_id', '');
-  TargetUnitID := APayload.Get('target_unit_id', '');
-  TargetCityID := APayload.Get('target_city_id', '');
+  ListJSON := '[';
+  First := True;
+  for TechID in TechOrder do
+  begin
+    if not TechDefs.TryGetValue(TechID, Def) then Continue;
+    if not First then ListJSON := ListJSON + ',';
+    First := False;
+
+    PrereqJSON := '[';
+    FirstPrereq := True;
+    for i := 0 to High(Def.Prerequisites) do
+    begin
+      if not FirstPrereq then PrereqJSON := PrereqJSON + ',';
+      FirstPrereq := False;
+      PrereqJSON := PrereqJSON + '"' + Def.Prerequisites[i] + '"';
+    end;
+    PrereqJSON := PrereqJSON + ']';
+
+    ListJSON := ListJSON + Format('{"tech_id":"%s","display_name":"%s","research_ticks":%d,"prerequisites":%s,"cost":%s}',
+      [Def.TechID, Def.DisplayName, Def.ResearchTicks, PrereqJSON, CostsToJSON(Def.Cost)]);
+  end;
+  ListJSON := ListJSON + ']';
+  SendLine('{"topic":"game.event.tech_list","payload":"{\"tech_defs\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+end;
+
+// One faction's researched tech + current in-progress research (if
+// any) - scoped to the requester's own "by", same privacy stance
+// HandleGetLedger already takes with resource totals.
+procedure HandleGetTech(APayload: TJSONObject);
+var
+  Actor, Prefix, TechID, ResearchedJSON: string;
+  First: Boolean;
+  Pair: specialize TPair<string, Boolean>;
+  InProgress: TResearchInProgress;
+  HasInProgress: Boolean;
+begin
   Actor := APayload.Get('by', '');
-  Reason := '';
+  Prefix := Actor + '|';
+  ResearchedJSON := '[';
+  First := True;
 
-  if (AttackerID = '') or ((TargetUnitID = '') and (TargetCityID = '')) then Exit;
-
-  UnitsLock.Enter;
+  TechLock.Enter;
   try
-    AttackerFound := Units.TryGetValue(AttackerID, Attacker);
+    for Pair in ResearchedTech do
+      if Copy(Pair.Key, 1, Length(Prefix)) = Prefix then
+      begin
+        TechID := Copy(Pair.Key, Length(Prefix) + 1, MaxInt);
+        if not First then ResearchedJSON := ResearchedJSON + ',';
+        First := False;
+        ResearchedJSON := ResearchedJSON + '"' + TechID + '"';
+      end;
+    HasInProgress := ResearchInProgress.TryGetValue(Actor, InProgress);
   finally
-    UnitsLock.Leave;
+    TechLock.Leave;
   end;
+  ResearchedJSON := ResearchedJSON + ']';
 
-  if not AttackerFound then
-    Reason := 'unknown attacker'
-  else if (Attacker.Owner <> '') and (Attacker.Owner <> Actor) then
-    Reason := 'not your unit'
-  else if Attacker.Owner = '' then
-    Reason := 'unowned units cannot attack' // nobody to credit the conquest to
+  if HasInProgress then
+    SendLine(Format('{"topic":"game.event.tech_status","payload":"{\"owner\":\"%s\",\"researched\":%s,\"in_progress\":\"%s\",\"started_tick\":%d}"}',
+      [Actor, StringReplace(ResearchedJSON, '"', '\"', [rfReplaceAll]), InProgress.TechID, InProgress.StartTick]))
   else
-  begin
-    AttackerDef := GetUnitDef(Attacker.UnitType);
-    if AttackerDef.Attack <= 0 then
-      Reason := 'unit type cannot fight';
+    SendLine(Format('{"topic":"game.event.tech_status","payload":"{\"owner\":\"%s\",\"researched\":%s,\"in_progress\":\"\"}"}',
+      [Actor, StringReplace(ResearchedJSON, '"', '\"', [rfReplaceAll])]));
+end;
+
+// Advances every faction's in-progress research once per tick - same
+// "snapshot keys, then process" shape as GrowCities/ProcessCityUpkeep,
+// which matters here too: completing a research can theoretically
+// (via a future scripted reaction) trigger a new HandleStartResearch,
+// and iterating a live dictionary while it's being mutated elsewhere
+// is exactly what that snapshot avoids.
+procedure ProcessResearch;
+var
+  Keys: array of string;
+  i, KeyIdx: Integer;
+  Pair: specialize TPair<string, TResearchInProgress>;
+  InProgress: TResearchInProgress;
+  Def: TTechDef;
+begin
+  TechLock.Enter;
+  try
+    SetLength(Keys, ResearchInProgress.Count);
+    KeyIdx := 0;
+    for Pair in ResearchInProgress do
+    begin
+      Keys[KeyIdx] := Pair.Key;
+      Inc(KeyIdx);
+    end;
+  finally
+    TechLock.Leave;
   end;
 
-  if (Reason = '') and (TargetUnitID <> '') then
+  for i := 0 to High(Keys) do
   begin
-    UnitsLock.Enter;
+    TechLock.Enter;
     try
-      TargetUnitFound := Units.TryGetValue(TargetUnitID, TargetUnit);
+      if not ResearchInProgress.TryGetValue(Keys[i], InProgress) then Continue;
     finally
-      UnitsLock.Leave;
+      TechLock.Leave;
     end;
 
-    if not TargetUnitFound then
-      Reason := 'unknown target'
-    else if TargetUnit.Owner = Attacker.Owner then
-      Reason := 'cannot attack your own faction'
-    else
-    begin
-      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetUnit.GX, TargetUnit.GY);
-      if Dist > Balance.AttackRangeCells then
-        Reason := 'too far';
-    end;
+    if not TechDefs.TryGetValue(InProgress.TechID, Def) then Continue; // tech.json changed out from under a running research - just stalls rather than crashing
+    if Tick - InProgress.StartTick < Def.ResearchTicks then Continue;
 
-    if Reason = '' then
-    begin
-      // Effective damage includes the attacker's veterancy bonus - a
-      // Level 2 soldier hits harder than a fresh one of the same type.
-      Damage := AttackerDef.Attack + Attacker.Level * Balance.VeterancyAttackBonusPerLevel;
-      NewHP := TargetUnit.HP - Damage;
-      if NewHP < 0 then NewHP := 0;
-
-      // Veterancy: any landed hit grants XP, win or lose, dead or
-      // alive on the target's side - the attacker did the fighting
-      // regardless of outcome. Scoped to unit-vs-unit only (see
-      // Balance.VeterancyXPPerHit's comment) so this branch is the only place
-      // that ever touches XP/Level.
-      Attacker.XP := Attacker.XP + Balance.VeterancyXPPerHit;
-      LeveledUp := False;
-      while (Attacker.Level < Balance.VeterancyMaxLevel) and
-            (Attacker.XP >= (Attacker.Level + 1) * Balance.VeterancyXPPerLevel) do
-      begin
-        Attacker.XP := Attacker.XP - (Attacker.Level + 1) * Balance.VeterancyXPPerLevel;
-        Inc(Attacker.Level);
-        Inc(Attacker.HP, Balance.VeterancyHPBonusPerLevel); // heals on level-up, not just a higher ceiling a wounded unit wouldn't feel
-        LeveledUp := True;
-      end;
-      UnitsLock.Enter;
-      try
-        Units.AddOrSetValue(AttackerID, Attacker);
-      finally
-        UnitsLock.Leave;
-      end;
-
-      LogEvent(Format('{"type":"unit_attacked","attacker_unit_id":"%s","target_unit_id":"%s","by":"%s","damage":%d,"remaining_hp":%d,"attacker_xp":%d,"attacker_level":%d}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
-      SendLine(Format('{"topic":"game.event.unit_attacked","payload":"{\"attacker_unit_id\":\"%s\",\"target_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"remaining_hp\":%d,\"attacker_xp\":%d,\"attacker_level\":%d}"}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
-
-      if LeveledUp then
-      begin
-        // Notification-only - fully redundant with the attacker_xp/
-        // attacker_level fields already in unit_attacked above, so
-        // replay never needs to handle this one specially. It exists
-        // purely so a dashboard or map viewer can flag the moment
-        // distinctly rather than noticing it by comparing two numbers.
-        SendLine(Format('{"topic":"game.event.unit_leveled_up","payload":"{\"unit_id\":\"%s\",\"level\":%d,\"hp\":%d}"}',
-          [AttackerID, Attacker.Level, Attacker.HP]));
-      end;
-
-      if NewHP <= 0 then
-      begin
-        UnitsLock.Enter;
-        try
-          Units.Remove(TargetUnitID);
-        finally
-          UnitsLock.Leave;
-        end;
-        // Same event shape a normal despawn produces - the client and
-        // replay both already know how to remove a unit this way, so
-        // death-by-combat doesn't need its own removal handling.
-        LogEvent(Format('{"type":"despawned","unit_id":"%s"}', [TargetUnitID]));
-        SendLine(Format('{"topic":"game.event.despawned","payload":"{\"unit_id\":\"%s\"}"}', [TargetUnitID]));
-      end
-      else
-      begin
-        TargetUnit.HP := NewHP;
-        UnitsLock.Enter;
-        try
-          Units.AddOrSetValue(TargetUnitID, TargetUnit);
-        finally
-          UnitsLock.Leave;
-        end;
-      end;
-      Exit;
-    end;
-  end
-  else if (Reason = '') and (TargetCityID <> '') then
-  begin
-    CitiesLock.Enter;
+    TechLock.Enter;
     try
-      TargetCityFound := Cities.TryGetValue(TargetCityID, TargetCity);
+      ResearchedTech.AddOrSetValue(Keys[i] + '|' + InProgress.TechID, True);
+      ResearchInProgress.Remove(Keys[i]);
     finally
-      CitiesLock.Leave;
+      TechLock.Leave;
     end;
 
-    if not TargetCityFound then
-      Reason := 'unknown city'
-    else if TargetCity.Owner = Attacker.Owner then
-      Reason := 'already yours'
-    else
+    LogEvent(Format('{"type":"research_completed","owner":"%s","tech_id":"%s"}', [Keys[i], InProgress.TechID]));
+    SendLine(Format('{"topic":"game.event.research_completed","payload":"{\"owner\":\"%s\",\"tech_id\":\"%s\"}"}',
+      [Keys[i], InProgress.TechID]));
+  end;
+end;
+
+// One faction's current relationships with every other faction it has
+// a non-neutral status with. Scans the whole DiplomaticStatus
+// dictionary (cheap at the scale of "a handful of factions", same
+// reasoning RunAI's node search already leans on) rather than
+// maintaining a second per-faction index just for this query.
+procedure HandleGetDiplomacy(APayload: TJSONObject);
+var
+  Actor, Other, ListJSON: string;
+  First: Boolean;
+  Pair: specialize TPair<string, string>;
+  Parts: TStringArray;
+begin
+  Actor := APayload.Get('by', '');
+  ListJSON := '[';
+  First := True;
+
+  DiplomacyLock.Enter;
+  try
+    for Pair in DiplomaticStatus do
     begin
-      // TargetCity.GX/GY are the raw cell (no +0.5) - unlike a unit's
-      // GX/GY, which is always a cell CENTER. Comparing against the
-      // raw cell made the effective range asymmetric depending on
-      // which direction the attacker approached from (a city dead
-      // east could be out of range while the same distance to the
-      // west was in range) - +0.5 puts both sides of the comparison
-      // on the same cell-center footing.
-      Dist := WrappedDistance(Attacker.GX, Attacker.GY, TargetCity.GX + 0.5, TargetCity.GY + 0.5);
-      if Dist > Balance.AttackRangeCells then
-        Reason := 'too far';
+      Parts := Pair.Key.Split('|');
+      if Length(Parts) <> 2 then Continue;
+      Other := '';
+      if Parts[0] = Actor then Other := Parts[1]
+      else if Parts[1] = Actor then Other := Parts[0];
+      if Other = '' then Continue;
+
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + Format('{"faction":"%s","status":"%s"}', [Other, Pair.Value]);
     end;
+  finally
+    DiplomacyLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
 
-    if Reason = '' then
-    begin
-      NewPop := TargetCity.Population - Balance.SiegeDamagePerAttack;
+  SendLine('{"topic":"game.event.diplomacy_status","payload":"{\"owner\":\"' + Actor + '\",\"relations\":' +
+    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+end;
 
-      if NewPop <= 0 then
-      begin
-        PrevOwner := TargetCity.Owner;
-        TargetCity.Owner := Attacker.Owner;
-        TargetCity.Population := Balance.CityCaptureResetPopulation;
-        TargetCity.LastGrowthTick := Tick;
-        TargetCity.LastUpkeepTick := Tick; // fresh upkeep clock too - no back-charged upkeep from being conquered
+// Unilateral - no acceptance needed, matching how HandleAttack's own
+// auto-war-on-first-strike already treats war as something one side
+// alone can start. Clears any standing alliance between the two
+// (fighting an ally makes no sense without breaking that first) and
+// any proposals either side had pending toward the other, since a
+// declared war supersedes an unanswered alliance/peace offer.
+procedure HandleDeclareWar(APayload: TJSONObject);
+var
+  Actor, Target: string;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
 
-        CitiesLock.Enter;
-        try
-          Cities.AddOrSetValue(TargetCityID, TargetCity);
-        finally
-          CitiesLock.Leave;
-        end;
-
-        LogEvent(Format('{"type":"city_captured","city_id":"%s","previous_owner":"%s","new_owner":"%s","population":%d}',
-          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
-        SendLine(Format('{"topic":"game.event.city_captured","payload":"{\"city_id\":\"%s\",\"previous_owner\":\"%s\",\"new_owner\":\"%s\",\"population\":%d}"}',
-          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
-      end
-      else
-      begin
-        TargetCity.Population := NewPop;
-        CitiesLock.Enter;
-        try
-          Cities.AddOrSetValue(TargetCityID, TargetCity);
-        finally
-          CitiesLock.Leave;
-        end;
-
-        LogEvent(Format('{"type":"city_attacked","city_id":"%s","attacker_unit_id":"%s","by":"%s","damage":%d,"population_remaining":%d}',
-          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
-        SendLine(Format('{"topic":"game.event.city_attacked","payload":"{\"city_id\":\"%s\",\"attacker_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"population_remaining\":%d}"}',
-          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
-      end;
-      Exit;
-    end;
+  DiplomacyLock.Enter;
+  try
+    PendingProposals.Remove(Actor + '|' + Target + '|alliance');
+    PendingProposals.Remove(Target + '|' + Actor + '|alliance');
+    PendingProposals.Remove(Actor + '|' + Target + '|peace');
+    PendingProposals.Remove(Target + '|' + Actor + '|peace');
+  finally
+    DiplomacyLock.Leave;
   end;
 
-  if Reason <> '' then
-    SendLine(Format('{"topic":"game.event.attack_failed","payload":"{\"attacker_unit_id\":\"%s\",\"reason\":\"%s\"}"}', [AttackerID, Reason]));
+  SetDiplomaticStatus(Actor, Target, 'war');
+end;
+
+// Proposes an alliance - takes effect only once Target calls
+// HandleAcceptAlliance (see PendingProposals' own comment on why this
+// half is never persisted/replayed). Rejected outright if the two are
+// already at war - break peace first, alliance second, not both at
+// once via a single accept.
+procedure HandleProposeAlliance(APayload: TJSONObject);
+var
+  Actor, Target: string;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
+
+  if GetDiplomaticStatus(Actor, Target) = 'war' then
+  begin
+    SendLine(Format('{"topic":"game.event.alliance_proposal_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"at war - make peace first\"}"}', [Actor, Target]));
+    Exit;
+  end;
+
+  DiplomacyLock.Enter;
+  try
+    PendingProposals.AddOrSetValue(Actor + '|' + Target + '|alliance', True);
+  finally
+    DiplomacyLock.Leave;
+  end;
+
+  SendLine(Format('{"topic":"game.event.alliance_proposed","payload":"{\"by\":\"%s\",\"target\":\"%s\"}"}', [Actor, Target]));
+end;
+
+// Actor accepts an alliance TARGET previously proposed TO them -
+// note the reversed roles from HandleProposeAlliance: here Actor is
+// the one who received the offer, Target is who sent it.
+procedure HandleAcceptAlliance(APayload: TJSONObject);
+var
+  Actor, Target, Key: string;
+  Pending: Boolean;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
+
+  Key := Target + '|' + Actor + '|alliance'; // Target proposed, Actor is accepting
+  DiplomacyLock.Enter;
+  try
+    Pending := PendingProposals.ContainsKey(Key);
+    if Pending then PendingProposals.Remove(Key);
+  finally
+    DiplomacyLock.Leave;
+  end;
+
+  if not Pending then
+  begin
+    SendLine(Format('{"topic":"game.event.alliance_accept_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"no pending proposal\"}"}', [Actor, Target]));
+    Exit;
+  end;
+
+  SetDiplomaticStatus(Actor, Target, 'allied');
+end;
+
+// Unilateral, same as declaring war - either side can walk away from
+// an alliance at any time, no acceptance from the other side required.
+procedure HandleBreakAlliance(APayload: TJSONObject);
+var
+  Actor, Target: string;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
+  if GetDiplomaticStatus(Actor, Target) <> 'allied' then Exit;
+
+  SetDiplomaticStatus(Actor, Target, '');
+end;
+
+// Proposes ending a war - like alliance, takes effect only once the
+// other side accepts (HandleAcceptPeace). Rejected if the two aren't
+// actually at war, since "peace" is only meaningful relative to an
+// active war.
+procedure HandleProposePeace(APayload: TJSONObject);
+var
+  Actor, Target: string;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
+
+  if GetDiplomaticStatus(Actor, Target) <> 'war' then
+  begin
+    SendLine(Format('{"topic":"game.event.peace_proposal_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"not at war\"}"}', [Actor, Target]));
+    Exit;
+  end;
+
+  DiplomacyLock.Enter;
+  try
+    PendingProposals.AddOrSetValue(Actor + '|' + Target + '|peace', True);
+  finally
+    DiplomacyLock.Leave;
+  end;
+
+  SendLine(Format('{"topic":"game.event.peace_proposed","payload":"{\"by\":\"%s\",\"target\":\"%s\"}"}', [Actor, Target]));
+end;
+
+// Mirrors HandleAcceptAlliance's reversed-roles convention: Target
+// proposed peace, Actor is accepting it here.
+procedure HandleAcceptPeace(APayload: TJSONObject);
+var
+  Actor, Target, Key: string;
+  Pending: Boolean;
+begin
+  Actor := APayload.Get('by', '');
+  Target := APayload.Get('target', '');
+  if (Actor = '') or (Target = '') or (Actor = Target) then Exit;
+
+  Key := Target + '|' + Actor + '|peace';
+  DiplomacyLock.Enter;
+  try
+    Pending := PendingProposals.ContainsKey(Key);
+    if Pending then PendingProposals.Remove(Key);
+  finally
+    DiplomacyLock.Leave;
+  end;
+
+  if not Pending then
+  begin
+    SendLine(Format('{"topic":"game.event.peace_accept_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"no pending proposal\"}"}', [Actor, Target]));
+    Exit;
+  end;
+
+  SetDiplomaticStatus(Actor, Target, '');
 end;
 
 procedure DispatchIncoming(const ALine: string);
@@ -2296,6 +3554,53 @@ begin
     begin
       if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
         HandleAttack(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.list_tech_defs' then
+      HandleListTechDefs
+    else if Topic = 'game.cmd.get_tech' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleGetTech(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.start_research' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleStartResearch(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.get_diplomacy' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleGetDiplomacy(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.declare_war' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleDeclareWar(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.propose_alliance' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleProposeAlliance(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.accept_alliance' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleAcceptAlliance(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.break_alliance' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleBreakAlliance(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.propose_peace' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleProposePeace(TJSONObject(PayloadData));
+    end
+    else if Topic = 'game.cmd.accept_peace' then
+    begin
+      if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then
+        HandleAcceptPeace(TJSONObject(PayloadData));
     end;
     // add more topic handlers here as the command set grows
   finally
@@ -2416,12 +3721,14 @@ procedure ReplayEventLog(const AFilename: string);
 var
   F: TextFile;
   Line, EventType, UnitID, NodeID, ByActor, LedgerKey, CityID, RoadID, TargetUnitID, AttackerUnitID: string;
+  TechID, StatusVal, FactionA, FactionB: string;
   Data: TJSONData;
   Obj: TJSONObject;
   U: TUnit;
   Node: TResourceNode;
   C: TCity;
   R: TRoad;
+  InProgressRec: TResearchInProgress;
   Lon, Lat: Double;
   PathArr, PointArr, CostsArr: TJSONArray;
   GridPath: TGridPath;
@@ -2709,6 +4016,55 @@ begin
           RoadID := Obj.Get('road_id', '');
           if RoadID <> '' then
             Roads.Remove(RoadID);
+        end
+        else if EventType = 'research_cost_spent' then
+        begin
+          // Mirrors city_growth_spent/city_upkeep_spent.
+          ByActor := Obj.Get('owner', '');
+          CostsArr := TJSONArray(Obj.Find('costs'));
+          if (ByActor <> '') and Assigned(CostsArr) then
+            DeductCost(ByActor, ParseResourceCostList(CostsArr));
+        end
+        else if EventType = 'research_started' then
+        begin
+          // StartTick resets to 0 alongside every other in-flight
+          // clock this server tracks (see LastGrowthTick's own
+          // precedent) - Tick itself starts back at 0 on every
+          // restart, so a research that was N ticks into a
+          // ResearchTicks-tick run before the last stop resumes as if
+          // freshly started, the same "restart forgives partial
+          // progress" behavior city growth/upkeep already have.
+          ByActor := Obj.Get('owner', '');
+          TechID := Obj.Get('tech_id', '');
+          if (ByActor <> '') and (TechID <> '') then
+          begin
+            InProgressRec.TechID := TechID;
+            InProgressRec.StartTick := 0;
+            ResearchInProgress.AddOrSetValue(ByActor, InProgressRec);
+          end;
+        end
+        else if EventType = 'research_completed' then
+        begin
+          ByActor := Obj.Get('owner', '');
+          TechID := Obj.Get('tech_id', '');
+          if (ByActor <> '') and (TechID <> '') then
+          begin
+            ResearchedTech.AddOrSetValue(ByActor + '|' + TechID, True);
+            ResearchInProgress.Remove(ByActor);
+          end;
+        end
+        else if EventType = 'diplomacy_status_changed' then
+        begin
+          FactionA := Obj.Get('faction_a', '');
+          FactionB := Obj.Get('faction_b', '');
+          StatusVal := Obj.Get('status', '');
+          if (FactionA <> '') and (FactionB <> '') then
+          begin
+            if StatusVal = '' then
+              DiplomaticStatus.Remove(DiplomacyKey(FactionA, FactionB))
+            else
+              DiplomaticStatus.AddOrSetValue(DiplomacyKey(FactionA, FactionB), StatusVal);
+          end;
         end;
 
         Inc(EventCount);
@@ -2798,6 +4154,14 @@ begin
   Density := specialize TDictionary<string, TDensityCell>.Create;
   UnitDefs := specialize TDictionary<string, TUnitDef>.Create;
   AiUnitTargets := specialize TDictionary<string, string>.Create;
+  TechLock := TCriticalSection.Create;
+  DiplomacyLock := TCriticalSection.Create;
+  TechDefs := specialize TDictionary<string, TTechDef>.Create;
+  TechOrder := TStringList.Create;
+  ResearchedTech := specialize TDictionary<string, Boolean>.Create;
+  ResearchInProgress := specialize TDictionary<string, TResearchInProgress>.Create;
+  DiplomaticStatus := specialize TDictionary<string, string>.Create;
+  PendingProposals := specialize TDictionary<string, Boolean>.Create;
 
   LogDiag('Loading bake_config.json ...');
   Config := LoadBakeConfig(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'bake_config.json');
@@ -2811,6 +4175,12 @@ begin
 
   LogDiag('Loading unit_types.json ...');
   LoadUnitTypes(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'unit_types.json');
+
+  LogDiag('Loading tech.json ...');
+  LoadTechDefs(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'tech.json');
+
+  LogDiag('Loading ai_factions.json ...');
+  LoadAiFactionConfigs(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'ai_factions.json', Balance);
 
   LogDiag('Loading resource_nodes.json ...');
   LoadResourceNodes(ExpandFileName(ExtractFilePath(ParamStr(0))) + 'resource_nodes.json');
@@ -2863,7 +4233,8 @@ begin
     AdvanceUnits;
     GrowCities;
     ProcessCityUpkeep;
-    RunAI;
+    ProcessResearch;
+    RunAllAI;
     if Tick mod Balance.DevelopmentUpdateTicks = 0 then
       RecomputeDevelopment;
     Sleep(50); // ~20 ticks/sec target loop pacing

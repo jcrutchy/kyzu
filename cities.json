@@ -2,5 +2,7 @@
   {"id": "city_alpha",   "owner": "",    "lon": 21.0, "lat": 13.5, "population": 50},
   {"id": "city_beta",    "owner": "",    "lon": 25.0, "lat": 12.5, "population": 30},
   {"id": "city_gamma",   "owner": "me",  "lon": 23.0, "lat": 14.0, "population": 10},
-  {"id": "city_ai_home", "owner": "ai",  "lon": 24.0, "lat": 13.0, "population": 20}
+  {"id": "city_ai_home", "owner": "ai",  "lon": 24.0, "lat": 13.0, "population": 20},
+  {"id": "city_ai_west_home", "owner": "ai_west", "lon": 19.5, "lat": 13.5, "population": 20},
+  {"id": "city_ai_east_home", "owner": "ai_east", "lon": 27.5, "lat": 13.0, "population": 20}
 ]

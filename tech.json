@@ -1,0 +1,7 @@
+[
+  {"tech_id": "masonry", "display_name": "Masonry", "prerequisites": [], "cost": [{"resource_type": "stone", "amount": 25}], "research_ticks": 120},
+  {"tech_id": "bronze_working", "display_name": "Bronze Working", "prerequisites": [], "cost": [{"resource_type": "stone", "amount": 30}, {"resource_type": "wood", "amount": 10}], "research_ticks": 150},
+  {"tech_id": "horseback_riding", "display_name": "Horseback Riding", "prerequisites": [], "cost": [{"resource_type": "wood", "amount": 40}], "research_ticks": 150},
+  {"tech_id": "siege_engineering", "display_name": "Siege Engineering", "prerequisites": ["bronze_working", "masonry"], "cost": [{"resource_type": "stone", "amount": 60}, {"resource_type": "wood", "amount": 30}], "research_ticks": 250},
+  {"tech_id": "logistics", "display_name": "Logistics", "prerequisites": ["horseback_riding"], "cost": [{"resource_type": "wood", "amount": 50}, {"resource_type": "stone", "amount": 20}], "research_ticks": 200}
+]

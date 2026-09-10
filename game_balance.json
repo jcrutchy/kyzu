@@ -32,6 +32,12 @@
   "ai_faction_name": "ai",
   "ai_tick_interval": 40,
   "ai_target_worker_count": 2,
+  "ai_target_settler_count": 1,
+  "ai_expansion_search_radius_cells": 25,
+  "ai_expansion_min_city_distance_cells": 6,
+  "ai_target_soldier_count": 2,
+  "ai_aggression_range_cells": 15,
+  "ai_research_enabled": true,
 
   "veterancy_xp_per_hit": 10,
   "veterancy_xp_per_level": 30,

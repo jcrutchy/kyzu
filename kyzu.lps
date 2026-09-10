@@ -8,16 +8,16 @@
       <Unit>
         <Filename Value="kyzu.lpr"/>
         <IsPartOfProject Value="True"/>
-        <CursorPos X="11" Y="11"/>
+        <IsVisibleTab Value="True"/>
+        <CursorPos X="65" Y="20"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="kyzu_pathfinding.pas"/>
         <IsPartOfProject Value="True"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="2"/>
-        <CursorPos X="52" Y="11"/>
+        <CursorPos X="9" Y="4"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
@@ -29,10 +29,14 @@
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory>
+    <JumpHistory HistoryIndex="1">
       <Position>
         <Filename Value="kyzu.lpr"/>
         <Caret Line="8" Column="21"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu_pathfinding.pas"/>
+        <Caret Line="10" Column="45"/>
       </Position>
     </JumpHistory>
     <RunParams>
