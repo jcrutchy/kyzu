@@ -231,6 +231,19 @@ type
     Offset: Integer;
   end;
 
+  // One AI-owned city's local "governor" state for the current RunAI
+  // pass - computed fresh every call (never persisted, never locked -
+  // same reasoning as AiUnitTargets: only ever touched from the single
+  // main tick-loop thread). Exists so spawning/garrisoning can be
+  // decided per-city rather than always favouring whichever city the
+  // faction happened to found first - see RunAI's use of
+  // ComputeAiRegions/NearestAiRegion.
+  TAiRegion = record
+    CityID: string;
+    GX, GY: Integer;
+    WorkerCount, SettlerCount, SoldierCount: Integer;
+  end;
+
 // StdErr is buffered by default and only auto-flushes on a clean, natural
 // exit - a forceful kill (VDRX's normal way of stopping this process)
 // loses anything not explicitly flushed. Confirmed by direct test: an
@@ -2091,6 +2104,116 @@ begin
   end;
 end;
 
+// Builds one TAiRegion per city in ACityKeys (an AI faction's own
+// cities - see RunAI's AiCityKeys) and tallies how many of the
+// faction's own workers/settlers/soldiers currently belong to each,
+// "belong to" meaning nearest-by-distance rather than any explicit
+// assignment. This is what turns RunAI's spawning/garrisoning from
+// "always city #1" into "whichever of our cities needs it most" -
+// the regional/tactical layer sitting between the per-faction
+// TAiFactionConfig (strategic) and the per-unit Drive-style logic
+// further down RunAI (unit level).
+function ComputeAiRegions(const AFactionName: string; const ACityKeys: array of string): specialize TArray<TAiRegion>;
+var
+  Regions: specialize TArray<TAiRegion>;
+  City: TCity;
+  UnitPair: specialize TPair<string, TUnit>;
+  i, BestIdx: Integer;
+  BestDist, Dist: Double;
+begin
+  SetLength(Regions, Length(ACityKeys));
+  CitiesLock.Enter;
+  try
+    for i := 0 to High(ACityKeys) do
+      if Cities.TryGetValue(ACityKeys[i], City) then
+      begin
+        Regions[i].CityID := City.ID;
+        Regions[i].GX := City.GX;
+        Regions[i].GY := City.GY;
+      end;
+  finally
+    CitiesLock.Leave;
+  end;
+
+  if Length(Regions) = 0 then Exit(Regions);
+
+  UnitsLock.Enter;
+  try
+    for UnitPair in Units do
+    begin
+      if UnitPair.Value.Owner <> AFactionName then Continue;
+
+      BestIdx := 0;
+      BestDist := WrappedDistance(UnitPair.Value.GX, UnitPair.Value.GY, Regions[0].GX + 0.5, Regions[0].GY + 0.5);
+      for i := 1 to High(Regions) do
+      begin
+        Dist := WrappedDistance(UnitPair.Value.GX, UnitPair.Value.GY, Regions[i].GX + 0.5, Regions[i].GY + 0.5);
+        if Dist < BestDist then
+        begin
+          BestDist := Dist;
+          BestIdx := i;
+        end;
+      end;
+
+      if UnitPair.Value.UnitType = 'worker' then Inc(Regions[BestIdx].WorkerCount)
+      else if UnitPair.Value.UnitType = 'settler' then Inc(Regions[BestIdx].SettlerCount)
+      else if UnitPair.Value.UnitType = 'soldier' then Inc(Regions[BestIdx].SoldierCount);
+    end;
+  finally
+    UnitsLock.Leave;
+  end;
+
+  Result := Regions;
+end;
+
+// Index into ARegions whose city is nearest to (PX,PY) - used both to
+// pick which understaffed region a new unit spawns into (fewest of
+// that unit type first, nearest as a tiebreak - see RunAI) and to
+// send an idle soldier home to whichever of the faction's OWN cities
+// is closest to it right now, rather than always the first one founded.
+function NearestAiRegion(const ARegions: array of TAiRegion; PX, PY: Double): Integer;
+var
+  i: Integer;
+  BestDist, Dist: Double;
+begin
+  Result := -1;
+  if Length(ARegions) = 0 then Exit;
+  Result := 0;
+  BestDist := WrappedDistance(PX, PY, ARegions[0].GX + 0.5, ARegions[0].GY + 0.5);
+  for i := 1 to High(ARegions) do
+  begin
+    Dist := WrappedDistance(PX, PY, ARegions[i].GX + 0.5, ARegions[i].GY + 0.5);
+    if Dist < BestDist then
+    begin
+      BestDist := Dist;
+      Result := i;
+    end;
+  end;
+end;
+
+// Index of the region with the fewest of AUnitType currently nearest
+// to it (ties broken by array order, i.e. whichever city was founded
+// first) - the "understaffed region" a new spawn of that type should
+// go to.
+function LeastStaffedAiRegion(const ARegions: array of TAiRegion; const AUnitType: string): Integer;
+var
+  i, Count, BestCount: Integer;
+begin
+  Result := 0;
+  BestCount := MaxInt;
+  for i := 0 to High(ARegions) do
+  begin
+    if AUnitType = 'worker' then Count := ARegions[i].WorkerCount
+    else if AUnitType = 'settler' then Count := ARegions[i].SettlerCount
+    else Count := ARegions[i].SoldierCount;
+    if Count < BestCount then
+    begin
+      BestCount := Count;
+      Result := i;
+    end;
+  end;
+end;
+
 // Handles both unit-vs-unit and unit-vs-city combat, distinguished by
 // which of target_unit_id/target_city_id the payload sets. A city's
 // Population doubles as its defense pool (see Balance.SiegeDamagePerAttack's
@@ -2396,7 +2519,6 @@ end;
 
 procedure RunAI(const AConfig: TAiFactionConfig);
 var
-  AiCity: TCity;
   HasAiCity: Boolean;
   CityPair: specialize TPair<string, TCity>;
   WorkerCount, SettlerCount, SoldierCount: Integer;
@@ -2422,6 +2544,8 @@ var
   Def: TTechDef;
   AlreadyResearching: Boolean;
   Dummy: TResearchInProgress;
+  Regions: specialize TArray<TAiRegion>;
+  RegionIdx: Integer;
 begin
   HasAiCity := False;
   SetLength(AiCityKeys, 0);
@@ -2432,11 +2556,7 @@ begin
     for CityPair in Cities do
       if CityPair.Value.Owner = AConfig.FactionName then
       begin
-        if not HasAiCity then
-        begin
-          AiCity := CityPair.Value;
-          HasAiCity := True;
-        end;
+        HasAiCity := True;
         AiCityKeys[AiCityIdx] := CityPair.Key;
         Inc(AiCityIdx);
       end;
@@ -2468,13 +2588,19 @@ begin
     UnitsLock.Leave;
   end;
 
+  // Regional/tactical layer: which of our own cities is currently
+  // understaffed of each unit type, and which is nearest a given
+  // point - see ComputeAiRegions/LeastStaffedAiRegion/NearestAiRegion.
+  Regions := ComputeAiRegions(AConfig.FactionName, AiCityKeys);
+
   if (Tick + AConfig.Offset) mod AConfig.TickInterval = 0 then
   begin
     if WorkerCount < AConfig.TargetWorkerCount then
     begin
+      RegionIdx := LeastStaffedAiRegion(Regions, 'worker');
       NewUnitID := 'ai_w_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(WorkerCount);
       PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"worker"}',
-        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2485,9 +2611,10 @@ begin
 
     if SettlerCount < AConfig.TargetSettlerCount then
     begin
+      RegionIdx := LeastStaffedAiRegion(Regions, 'settler');
       NewUnitID := 'ai_s_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SettlerCount);
       PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"settler"}',
-        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2498,9 +2625,10 @@ begin
 
     if SoldierCount < AConfig.TargetSoldierCount then
     begin
+      RegionIdx := LeastStaffedAiRegion(Regions, 'soldier');
       NewUnitID := 'ai_m_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SoldierCount);
       PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"soldier"}',
-        [NewUnitID, GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2701,15 +2829,21 @@ begin
 
       if not SiteFound then
       begin
-        // Bounded random search around the AI's (first) city for a
-        // passable cell far enough from EVERY existing city (any
-        // owner) - a handful of random tries is enough at this map's
-        // scale rather than an exhaustive spiral scan, same "good
-        // enough, not optimal" spirit as the worker's nearest-node pick.
+        // Bounded random search around the settler's OWN nearest owned
+        // city (its home region - see NearestAiRegion) for a passable
+        // cell far enough from EVERY existing city (any owner). A
+        // handful of random tries is enough at this map's scale rather
+        // than an exhaustive spiral scan, same "good enough, not
+        // optimal" spirit as the worker's nearest-node pick. Centering
+        // on the settler's own region rather than always the first
+        // city founded is what lets a faction's expansion spread out
+        // from each of its cities in turn instead of every settler
+        // radiating from the same origin point forever.
+        RegionIdx := NearestAiRegion(Regions, U.GX, U.GY);
         for j := 1 to 40 do
         begin
-          TryX := Trunc(AiCity.GX) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
-          TryY := Trunc(AiCity.GY) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
+          TryX := Trunc(Regions[RegionIdx].GX) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
+          TryY := Trunc(Regions[RegionIdx].GY) + Random(Round(AConfig.ExpansionSearchRadiusCells * 2) + 1) - Round(AConfig.ExpansionSearchRadiusCells);
           if (TryX < 0) or (TryX >= Grid.Width) or (TryY < 0) or (TryY >= Grid.Height) then Continue;
           if CellMoveCost(Grid, Config, TryX, TryY) <= 0 then Continue;
 
@@ -2870,11 +3004,15 @@ begin
         Continue;
       end;
 
-      // Nobody to fight - garrison at home rather than wandering.
-      if (Length(U.Path) = 0) and (WrappedDistance(U.GX, U.GY, AiCity.GX + 0.5, AiCity.GY + 0.5) > Balance.AttackRangeCells * 2) then
+      // Nobody to fight - garrison at the NEAREST of our own cities
+      // rather than always the first one founded, so a faction with
+      // more than one city ends up with soldiers actually distributed
+      // across them instead of every idle soldier converging on city #1.
+      RegionIdx := NearestAiRegion(Regions, U.GX, U.GY);
+      if (Length(U.Path) = 0) and (WrappedDistance(U.GX, U.GY, Regions[RegionIdx].GX + 0.5, Regions[RegionIdx].GY + 0.5) > Balance.AttackRangeCells * 2) then
       begin
         PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-          [UnitKeys[i], GridToLon(AiCity.GX + 0.5), GridToLat(AiCity.GY + 0.5), AConfig.FactionName]);
+          [UnitKeys[i], GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
         PayloadData := GetJSON(PayloadStr);
         try
           HandleMove(TJSONObject(PayloadData));

@@ -171,11 +171,9 @@
   </div>
 </footer>
 
+<script src="vdrx.js"></script>
 <script>
 (function(){
-  const WS_URL = 'ws://' + location.hostname + ':8082';
-  const AUTH_TOKEN = 'dev'; // stub auth - any non-empty token is accepted today
-
   const logEl = document.getElementById('log');
   const dotEl = document.getElementById('statusDot');
   const statusEl = document.getElementById('statusText');
@@ -185,8 +183,6 @@
   const tickDisplay = document.getElementById('tickDisplay').querySelector('b');
   const unitsBar = document.getElementById('unitsBar');
 
-  let ws = null;
-  let authed = false;
   let hiddenPrefixes = [];
   const units = new Map(); // unit_id -> {lon, lat}
 
@@ -272,63 +268,27 @@
     statusEl.textContent = state;
   }
 
-  function rpc(method, params){
-    if (!ws || ws.readyState !== WebSocket.OPEN){
-      logErr('not connected - cannot send ' + method);
-      return;
+  const bus = new VdrxBus({
+    autoSubscribe: false, // this page's own "subscribe" button drives that, like before
+    onStatus: (state) => {
+      setStatus(state);
+      if (state === 'connecting') logSys('connecting to ' + bus.url + ' ...');
+      else if (state === 'error') logErr('websocket error');
+      else if (state === 'disconnected') logSys('connection closed.');
+    },
+    onAuthed: () => { logSys('authenticated.'); },
+    onMessage: (topic, payload, source, raw) => {
+      const payloadStr = typeof raw.payload === 'string' ? raw.payload : JSON.stringify(raw.payload);
+      logRx(topic, payloadStr, source);
     }
-    const msg = Object.assign({method: method}, params || {});
-    ws.send(JSON.stringify(msg));
-  }
+  });
 
   function doPublish(topic, payloadStr){
     let payload;
     try { payload = JSON.parse(payloadStr); }
     catch(e){ logErr('payload is not valid JSON: ' + e.message); return; }
-    rpc('publish', {topic: topic, payload: payload});
+    if (!bus.publish(topic, payload)){ logErr('not connected - cannot send publish'); return; }
     logTx(topic, payloadStr);
-  }
-
-  function connect(){
-    setStatus('connecting');
-    logSys('connecting to ' + WS_URL + ' ...');
-    ws = new WebSocket(WS_URL);
-
-    ws.onopen = () => {
-      logSys('socket open, authenticating...');
-      rpc('sys.auth', {token: AUTH_TOKEN});
-    };
-
-    ws.onmessage = (evt) => {
-      let msg;
-      try { msg = JSON.parse(evt.data); }
-      catch(e){ logErr('unparseable frame: ' + evt.data); return; }
-
-      // First successful response after sys.auth we treat as "authed" -
-      // adjust here if the server starts sending an explicit ack shape.
-      if (!authed){
-        authed = true;
-        setStatus('up');
-        logSys('authenticated.');
-        return;
-      }
-
-      if (msg.topic !== undefined){
-        logRx(msg.topic, typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload), msg.source);
-      } else {
-        logSys('recv: ' + evt.data);
-      }
-    };
-
-    ws.onerror = () => {
-      logErr('websocket error');
-    };
-
-    ws.onclose = () => {
-      authed = false;
-      setStatus('disconnected');
-      logSys('connection closed.');
-    };
   }
 
   document.querySelectorAll('.quickrow button[data-topic]').forEach(btn => {
@@ -338,13 +298,12 @@
   });
 
   document.getElementById('btnSubscribe').addEventListener('click', () => {
-    rpc('subscribe', {filter: 'game.>'});
+    bus.subscribe('game.>');
     logSys('subscribe requested: game.>');
   });
 
   document.getElementById('btnReconnect').addEventListener('click', () => {
-    if (ws) ws.close();
-    connect();
+    bus.reconnect();
   });
 
   document.getElementById('btnSend').addEventListener('click', () => {
@@ -358,7 +317,7 @@
     if (e.key === 'Enter') document.getElementById('btnSend').click();
   });
 
-  connect();
+  bus.connect();
 })();
 </script>
 

@@ -148,6 +148,7 @@
   </div>
 </div>
 
+<script src="vdrx.js"></script>
 <script>
 (function(){
   const TILE_SIZE = 256;
@@ -186,8 +187,6 @@
   let cursorLonLat = { lon: 0, lat: 0 };
 
   const ICON_ZOOM_THRESHOLD = 4;
-  const WS_URL = 'ws://' + location.hostname + ':8082';
-  const AUTH_TOKEN = 'dev';
 
   const units = new Map();
   const unitMeta = new Map();
@@ -227,8 +226,7 @@
     clearTimeout(toastTimeout);
     toastTimeout = setTimeout(() => el.classList.remove('show'), 2200);
   }
-  let ws = null;
-  let wsAuthed = false;
+  let bus = null;
 
   const wsDot = document.getElementById('wsDot');
   const wsStatus = document.getElementById('wsStatus');
@@ -271,8 +269,7 @@
   }
 
   function publish(topic, payload) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ method: 'publish', topic: topic, payload: payload }));
+    if (bus) bus.publish(topic, payload);
   }
 
   let spawnArmed = false;
@@ -469,284 +466,183 @@
   }
 
   function connectWS() {
-    setWsStatus('connecting');
-    ws = new WebSocket(WS_URL);
-    wsAuthed = false;
-
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ method: 'sys.auth', token: AUTH_TOKEN }));
-    };
-
-    ws.onmessage = (evt) => {
-      let msg;
-      try { msg = JSON.parse(evt.data); } catch (e) { return; }
-
-      if (!wsAuthed) {
-        wsAuthed = true;
-        setWsStatus('up');
-        ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
+    bus = new VdrxBus({
+      onStatus: (state) => { setWsStatus(state); },
+      onAuthed: () => {
         publish('game.cmd.list_nodes', {});
         publish('game.cmd.get_ledger', { by: factionInput.value || '' });
         publish('game.cmd.list_cities', {});
         publish('game.cmd.list_roads', {});
         publish('game.cmd.get_development', {});
-        return;
-      }
-
-      if (msg.topic === 'game.event.position') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.unit_id !== undefined) {
-          onUnitPosition(payload.unit_id, payload.lon, payload.lat);
-        }
-      } else if (msg.topic === 'game.event.spawned') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.unit_id !== undefined) {
-          unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', hp: payload.hp });
-          onUnitPosition(payload.unit_id, payload.lon, payload.lat);
-        }
-      } else if (msg.topic === 'game.event.despawned') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.unit_id !== undefined) {
-          units.delete(payload.unit_id);
-          unitMeta.delete(payload.unit_id);
-          unitPaths.delete(payload.unit_id);
-          if (selectedUnitId === payload.unit_id) setSelectedUnit(null);
-          unitCountEl.textContent = String(units.size);
-        }
-      } else if (msg.topic === 'game.event.spawn_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('spawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.despawn_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.unit_attacked') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.target_unit_id !== undefined) {
-          const meta = unitMeta.get(payload.target_unit_id);
-          if (meta) meta.hp = payload.remaining_hp;
-          if (payload.by === factionInput.value || (meta && meta.owner === factionInput.value)) {
-            showToast(payload.attacker_unit_id + ' hit ' + payload.target_unit_id + ' for ' + payload.damage + ' (' + payload.remaining_hp + ' hp left)');
+      },
+      onMessage: (topic, payload) => {
+        if (topic === 'game.event.position') {
+          if (payload && payload.unit_id !== undefined) {
+            onUnitPosition(payload.unit_id, payload.lon, payload.lat);
           }
-        }
-      } else if (msg.topic === 'game.event.attack_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('attack failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.city_attacked') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.city_id !== undefined) {
-          const c = cities.get(payload.city_id);
-          if (c) c.population = payload.population_remaining;
-          showToast(payload.city_id + ' under siege - ' + payload.population_remaining + ' population left');
-        }
-      } else if (msg.topic === 'game.event.city_captured') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.city_id !== undefined) {
-          const c = cities.get(payload.city_id) || {};
-          c.owner = payload.new_owner;
-          c.population = payload.population;
-          cities.set(payload.city_id, c);
-          showToast(payload.city_id + ' captured by ' + payload.new_owner);
-        }
-      } else if (msg.topic === 'game.event.city_upkeep_spent') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
-          for (const c of payload.costs) {
-            myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+        } else if (topic === 'game.event.spawned') {
+          if (payload && payload.unit_id !== undefined) {
+            unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', hp: payload.hp });
+            onUnitPosition(payload.unit_id, payload.lon, payload.lat);
           }
-          renderStash();
-        }
-      } else if (msg.topic === 'game.event.city_population_decayed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.city_id !== undefined) {
-          const c = cities.get(payload.city_id);
-          if (c) c.population = payload.population;
-          showToast(payload.city_id + ' is short on upkeep - population down to ' + payload.population);
-        }
-      } else if (msg.topic === 'game.event.city_abandoned') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.city_id !== undefined) {
-          cities.delete(payload.city_id);
-          if (selectedCityId === payload.city_id) {
-            selectedCityId = null;
-            hudSelectedCity.textContent = 'none';
+        } else if (topic === 'game.event.despawned') {
+          if (payload && payload.unit_id !== undefined) {
+            units.delete(payload.unit_id);
+            unitMeta.delete(payload.unit_id);
+            unitPaths.delete(payload.unit_id);
+            if (selectedUnitId === payload.unit_id) setSelectedUnit(null);
+            unitCountEl.textContent = String(units.size);
           }
-          showToast(payload.city_id + ' was abandoned - upkeep unpaid too long');
-        }
-      } else if (msg.topic === 'game.event.road_removed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.road_id !== undefined) {
-          roads.delete(payload.road_id);
-        }
-      } else if (msg.topic === 'game.event.node_list') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && Array.isArray(payload.nodes)) {
-          nodes.clear();
-          for (const n of payload.nodes) {
-            nodes.set(n.id, { resourceType: n.resource_type, lon: n.lon, lat: n.lat, amount: n.amount });
+        } else if (topic === 'game.event.spawn_failed') {
+          showToast('spawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.despawn_failed') {
+          showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.unit_attacked') {
+          if (payload && payload.target_unit_id !== undefined) {
+            const meta = unitMeta.get(payload.target_unit_id);
+            if (meta) meta.hp = payload.remaining_hp;
+            if (payload.by === factionInput.value || (meta && meta.owner === factionInput.value)) {
+              showToast(payload.attacker_unit_id + ' hit ' + payload.target_unit_id + ' for ' + payload.damage + ' (' + payload.remaining_hp + ' hp left)');
+            }
           }
-        }
-      } else if (msg.topic === 'game.event.collected') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.node_id !== undefined) {
-          const n = nodes.get(payload.node_id);
-          if (n) n.amount = payload.remaining;
-          if (payload.by === factionInput.value) {
-            myLedger[payload.resource_type] = (myLedger[payload.resource_type] || 0) + payload.amount;
+        } else if (topic === 'game.event.attack_failed') {
+          showToast('attack failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_attacked') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id);
+            if (c) c.population = payload.population_remaining;
+            showToast(payload.city_id + ' under siege - ' + payload.population_remaining + ' population left');
+          }
+        } else if (topic === 'game.event.city_captured') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id) || {};
+            c.owner = payload.new_owner;
+            c.population = payload.population;
+            cities.set(payload.city_id, c);
+            showToast(payload.city_id + ' captured by ' + payload.new_owner);
+          }
+        } else if (topic === 'game.event.city_upkeep_spent') {
+          if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+            for (const c of payload.costs) {
+              myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+            }
             renderStash();
           }
-          showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
-        }
-      } else if (msg.topic === 'game.event.city_growth_spent') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
-          for (const c of payload.costs) {
-            myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+        } else if (topic === 'game.event.city_population_decayed') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id);
+            if (c) c.population = payload.population;
+            showToast(payload.city_id + ' is short on upkeep - population down to ' + payload.population);
           }
-          renderStash();
-          const costStr = payload.costs.map(c => c.amount + ' ' + c.resource_type).join(', ');
-          showToast('city ' + payload.city_id + ' grew - spent ' + costStr);
-        }
-      } else if (msg.topic === 'game.event.ledger') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.owner === factionInput.value && payload.totals) {
-          Object.keys(myLedger).forEach(k => delete myLedger[k]);
-          Object.assign(myLedger, payload.totals);
-          renderStash();
-        }
-      } else if (msg.topic === 'game.event.collect_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('collect failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.path_found') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.unit_id !== undefined && Array.isArray(payload.path)) {
-          unitPaths.set(payload.unit_id, payload.path.map(p => ({ lon: p[0], lat: p[1] })));
-        }
-      } else if (msg.topic === 'game.event.arrived') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.unit_id !== undefined) {
-          unitPaths.delete(payload.unit_id);
-        }
-      } else if (msg.topic === 'game.event.move_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.city_founded' || msg.topic === 'game.event.city_grew') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.city_id !== undefined) {
-          const existing = cities.get(payload.city_id) || {};
-          cities.set(payload.city_id, {
-            owner: payload.owner !== undefined ? payload.owner : existing.owner,
-            lon: payload.lon !== undefined ? payload.lon : existing.lon,
-            lat: payload.lat !== undefined ? payload.lat : existing.lat,
-            population: payload.population
-          });
-        }
-      } else if (msg.topic === 'game.event.city_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('found city failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.city_list') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && Array.isArray(payload.cities)) {
-          cities.clear();
-          for (const c of payload.cities) {
-            cities.set(c.id, { owner: c.owner, lon: c.lon, lat: c.lat, population: c.population });
+        } else if (topic === 'game.event.city_abandoned') {
+          if (payload && payload.city_id !== undefined) {
+            cities.delete(payload.city_id);
+            if (selectedCityId === payload.city_id) {
+              selectedCityId = null;
+              hudSelectedCity.textContent = 'none';
+            }
+            showToast(payload.city_id + ' was abandoned - upkeep unpaid too long');
           }
-        }
-      } else if (msg.topic === 'game.event.road_built') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && payload.road_id !== undefined && Array.isArray(payload.path)) {
-          roads.set(payload.road_id, {
-            fromCityId: payload.from_city_id,
-            toCityId: payload.to_city_id,
-            path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
-          });
-        }
-      } else if (msg.topic === 'game.event.road_failed') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        showToast('build road failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
-      } else if (msg.topic === 'game.event.road_list') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && Array.isArray(payload.roads)) {
-          roads.clear();
-          for (const r of payload.roads) {
-            roads.set(r.id, {
-              fromCityId: r.from_city_id,
-              toCityId: r.to_city_id,
-              path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
+        } else if (topic === 'game.event.road_removed') {
+          if (payload && payload.road_id !== undefined) {
+            roads.delete(payload.road_id);
+          }
+        } else if (topic === 'game.event.node_list') {
+          if (payload && Array.isArray(payload.nodes)) {
+            nodes.clear();
+            for (const n of payload.nodes) {
+              nodes.set(n.id, { resourceType: n.resource_type, lon: n.lon, lat: n.lat, amount: n.amount });
+            }
+          }
+        } else if (topic === 'game.event.collected') {
+          if (payload && payload.node_id !== undefined) {
+            const n = nodes.get(payload.node_id);
+            if (n) n.amount = payload.remaining;
+            if (payload.by === factionInput.value) {
+              myLedger[payload.resource_type] = (myLedger[payload.resource_type] || 0) + payload.amount;
+              renderStash();
+            }
+            showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
+          }
+        } else if (topic === 'game.event.city_growth_spent') {
+          if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+            for (const c of payload.costs) {
+              myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+            }
+            renderStash();
+            const costStr = payload.costs.map(c => c.amount + ' ' + c.resource_type).join(', ');
+            showToast('city ' + payload.city_id + ' grew - spent ' + costStr);
+          }
+        } else if (topic === 'game.event.ledger') {
+          if (payload && payload.owner === factionInput.value && payload.totals) {
+            Object.keys(myLedger).forEach(k => delete myLedger[k]);
+            Object.assign(myLedger, payload.totals);
+            renderStash();
+          }
+        } else if (topic === 'game.event.collect_failed') {
+          showToast('collect failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.path_found') {
+          if (payload && payload.unit_id !== undefined && Array.isArray(payload.path)) {
+            unitPaths.set(payload.unit_id, payload.path.map(p => ({ lon: p[0], lat: p[1] })));
+          }
+        } else if (topic === 'game.event.arrived') {
+          if (payload && payload.unit_id !== undefined) {
+            unitPaths.delete(payload.unit_id);
+          }
+        } else if (topic === 'game.event.move_failed') {
+          showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_founded' || topic === 'game.event.city_grew') {
+          if (payload && payload.city_id !== undefined) {
+            const existing = cities.get(payload.city_id) || {};
+            cities.set(payload.city_id, {
+              owner: payload.owner !== undefined ? payload.owner : existing.owner,
+              lon: payload.lon !== undefined ? payload.lon : existing.lon,
+              lat: payload.lat !== undefined ? payload.lat : existing.lat,
+              population: payload.population
             });
           }
-        }
-      } else if (msg.topic === 'game.event.development_delta' || msg.topic === 'game.event.development_snapshot') {
-        let payload;
-        try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload; }
-        catch (e) { return; }
-        if (payload && Array.isArray(payload.cells)) {
-          if (msg.topic === 'game.event.development_snapshot') development.clear();
-          for (const c of payload.cells) {
-            development.set(c.gx + ',' + c.gy, c.d);
+        } else if (topic === 'game.event.city_failed') {
+          showToast('found city failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_list') {
+          if (payload && Array.isArray(payload.cities)) {
+            cities.clear();
+            for (const c of payload.cities) {
+              cities.set(c.id, { owner: c.owner, lon: c.lon, lat: c.lat, population: c.population });
+            }
+          }
+        } else if (topic === 'game.event.road_built') {
+          if (payload && payload.road_id !== undefined && Array.isArray(payload.path)) {
+            roads.set(payload.road_id, {
+              fromCityId: payload.from_city_id,
+              toCityId: payload.to_city_id,
+              path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
+            });
+          }
+        } else if (topic === 'game.event.road_failed') {
+          showToast('build road failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.road_list') {
+          if (payload && Array.isArray(payload.roads)) {
+            roads.clear();
+            for (const r of payload.roads) {
+              roads.set(r.id, {
+                fromCityId: r.from_city_id,
+                toCityId: r.to_city_id,
+                path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
+              });
+            }
+          }
+        } else if (topic === 'game.event.development_delta' || topic === 'game.event.development_snapshot') {
+          if (payload && Array.isArray(payload.cells)) {
+            if (topic === 'game.event.development_snapshot') development.clear();
+            for (const c of payload.cells) {
+              development.set(c.gx + ',' + c.gy, c.d);
+            }
           }
         }
       }
-    };
+    });
 
-    ws.onerror = () => { setWsStatus('error'); };
-    ws.onclose = () => {
-      setWsStatus('disconnected');
-      setTimeout(connectWS, 2000);
-    };
+    bus.connect();
   }
 
   function resizeCanvas() {

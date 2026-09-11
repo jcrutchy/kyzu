@@ -66,7 +66,7 @@
 <div id="topbar">
   <div class="wsdot" id="wsdot"></div>
   <h1>kyzu // faction dashboard</h1>
-  <input id="wsUrlInput" value="ws://127.0.0.1:8181" spellcheck="false">
+  <input id="wsUrlInput" value="ws://127.0.0.1:8082" spellcheck="false">
   <button id="connectBtn">connect</button>
   <span class="dim" id="statusText">disconnected</span>
   <span id="tickDisplay">tick: -</span>
@@ -82,57 +82,41 @@
   </div>
 </div>
 
+<script src="vdrx.js"></script>
 <script>
   // ── Connection - identical protocol to the map viewer
   // (sys.auth -> subscribe -> receive {topic,payload}), just a
-  // different renderer on top. This page has NO relationship to
-  // kyzu.lpr beyond being another bus subscriber - it could be
-  // running on a different machine entirely. ──
-  let ws = null;
+  // different renderer on top, via the shared VdrxBus module. This
+  // page has NO relationship to kyzu.lpr beyond being another bus
+  // subscriber - it could be running on a different machine entirely. ──
   const wsdot = document.getElementById('wsdot');
   const statusText = document.getElementById('statusText');
   const tickDisplay = document.getElementById('tickDisplay');
   const connectBtn = document.getElementById('connectBtn');
   const wsUrlInput = document.getElementById('wsUrlInput');
-  const AUTH_TOKEN = 'dashboard';
 
   function setStatus(connected, text) {
     wsdot.classList.toggle('up', connected);
     statusText.textContent = text;
   }
 
+  let bus = null;
+
   function connect() {
-    if (ws) { try { ws.close(); } catch (e) {} }
-    const url = wsUrlInput.value.trim();
-    setStatus(false, 'connecting...');
-    ws = new WebSocket(url);
-
-    ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ method: 'sys.auth', token: AUTH_TOKEN }));
+    if (bus) bus.close();
+    bus = new VdrxBus({
+      url: wsUrlInput.value.trim(),
+      token: 'dashboard',
+      reconnectDelayMs: 3000,
+      onStatus: (state, detail) => {
+        if (state === 'connecting') setStatus(false, 'connecting...');
+        else if (state === 'up') setStatus(true, 'connected as ' + detail);
+        else if (state === 'error') setStatus(false, 'connection error');
+        else setStatus(false, 'disconnected - retrying in 3s');
+      },
+      onMessage: (topic, payload) => { handleMessage(topic, payload); }
     });
-
-    ws.addEventListener('message', (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch (e) { return; }
-
-      if (msg.event === 'auth.ok') {
-        setStatus(true, 'connected as ' + msg.source);
-        ws.send(JSON.stringify({ method: 'subscribe', filter: 'game.>' }));
-        return;
-      }
-
-      if (!msg.topic) return;
-      handleMessage(msg);
-    });
-
-    ws.addEventListener('close', () => {
-      setStatus(false, 'disconnected - retrying in 3s');
-      setTimeout(connect, 3000);
-    });
-
-    ws.addEventListener('error', () => {
-      setStatus(false, 'connection error');
-    });
+    bus.connect();
   }
 
   connectBtn.addEventListener('click', connect);
@@ -177,24 +161,12 @@
     feed.scrollTop = feed.scrollHeight;
   }
 
-  function payloadOf(msg) {
-    let p = msg.payload;
-    if (typeof p === 'string') {
-      try { p = JSON.parse(p); } catch (e) { return null; }
-    }
-    return p;
-  }
-
-  function handleMessage(msg) {
-    const topic = msg.topic;
-
+  function handleMessage(topic, payload) {
     if (topic === 'game.tick') {
-      const p = payloadOf(msg);
-      if (p) tickDisplay.textContent = 'tick: ' + p.tick;
+      if (payload) tickDisplay.textContent = 'tick: ' + payload.tick;
       return; // too frequent to log or re-render stats on every single tick
     }
 
-    const payload = payloadOf(msg);
     if (!payload) return;
 
     let dirty = true;
