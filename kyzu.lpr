@@ -322,6 +322,47 @@ begin
   end;
 end;
 
+// Returns a JSON string literal, including surrounding double quotes.
+// Non-ASCII UTF-8 is left intact (valid JSON permits UTF-8), while JSON
+// metacharacters and control characters are escaped according to RFC 8259.
+function JsonQuote(const S: string): string;
+var
+  i, C: Integer;
+  Ch: Char;
+begin
+  Result := '"';
+  for i := 1 to Length(S) do
+  begin
+    Ch := S[i];
+    C := Ord(Ch);
+    case Ch of
+      '"': Result := Result + '\"';
+      '\': Result := Result + '\\';
+      #8: Result := Result + '\b';
+      #9: Result := Result + '\t';
+      #10: Result := Result + '\n';
+      #12: Result := Result + '\f';
+      #13: Result := Result + '\r';
+    else
+      if C < 32 then
+        Result := Result + '\u' + IntToHex(C, 4)
+      else
+        Result := Result + Ch;
+    end;
+  end;
+  Result := Result + '"';
+end;
+
+// VDRX's current KYZU contract deliberately carries the inner event object
+// as a JSON-encoded string in the outer payload field. Keep that wire format
+// stable, but centralize the escaping so callers cannot accidentally emit
+// invalid JSON when an id/name contains '"', '\\', or control characters.
+function MakeEventLine(const ATopic, APayloadJSON: string): string;
+begin
+  Result := '{"topic":' + JsonQuote(ATopic) + ',"payload":' +
+    JsonQuote(APayloadJSON) + '}';
+end;
+
 // Persistence: append-only JSONL event log, same convention as VDRX's own
 // TVDRX_BucketExecutive. Logs resolved OUTCOMES (a spawn's actual
 // location, a move's actual computed path), not raw commands - replay
@@ -370,6 +411,22 @@ begin
   // Same off-by-one at Lat = -90.0 exactly (the south pole).
   if Result >= Grid.Height then Result := Grid.Height - 1;
   if Result < 0 then Result := 0;
+end;
+
+function TryLonToGridX(Lon: Double; out GX: Integer): Boolean;
+begin
+  Result := (Lon >= -180.0) and (Lon <= 180.0) and
+            (not IsNan(Lon)) and (not IsInfinite(Lon));
+  if Result then
+    GX := LonToGridX(Lon);
+end;
+
+function TryLatToGridY(Lat: Double; out GY: Integer): Boolean;
+begin
+  Result := (Lat >= -90.0) and (Lat <= 90.0) and
+            (not IsNan(Lat)) and (not IsInfinite(Lat));
+  if Result then
+    GY := LatToGridY(Lat);
 end;
 
 // The grid is toroidal in X only - longitude wraps at the ±180° seam,
@@ -988,19 +1045,18 @@ begin
     begin
       if not First then ListJSON := ListJSON + ',';
       First := False;
-      ListJSON := ListJSON + Format('{"id":"%s","resource_type":"%s","lon":%.4f,"lat":%.4f,"amount":%d}',
-        [Node.ID, Node.ResourceType, Node.Lon, Node.Lat, Node.Amount]);
+      ListJSON := ListJSON + '{"id":' + JsonQuote(Node.ID) +
+        ',"resource_type":' + JsonQuote(Node.ResourceType) +
+        ',"lon":' + Format('%.4f', [Node.Lon]) +
+        ',"lat":' + Format('%.4f', [Node.Lat]) +
+        ',"amount":' + IntToStr(Node.Amount) + '}';
     end;
   finally
     NodesLock.Leave;
   end;
   ListJSON := ListJSON + ']';
 
-  // ListJSON has its own internal quotes (ids, resource_type strings) -
-  // unlike BuildPathJSON's plain numeric arrays, this needs actual
-  // escaping before it can be embedded in the outer payload string.
-  SendLine('{"topic":"game.event.node_list","payload":"{\"nodes\":' +
-    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+  SendLine(MakeEventLine('game.event.node_list', '{"nodes":' + ListJSON + '}'));
 end;
 
 // Raw JSON array text, e.g. [[20.08,15.09],[20.15,15.02],...] - no quotes
@@ -1071,10 +1127,11 @@ begin
     DiplomacyLock.Leave;
   end;
 
-  LogEvent(Format('{"type":"diplomacy_status_changed","faction_a":"%s","faction_b":"%s","status":"%s"}',
-    [A, B, AStatus]));
-  SendLine(Format('{"topic":"game.event.diplomacy_status_changed","payload":"{\"faction_a\":\"%s\",\"faction_b\":\"%s\",\"status\":\"%s\"}"}',
-    [A, B, AStatus]));
+  LogEvent('{"type":"diplomacy_status_changed","faction_a":' + JsonQuote(A) +
+    ',"faction_b":' + JsonQuote(B) + ',"status":' + JsonQuote(AStatus) + '}');
+  SendLine(MakeEventLine('game.event.diplomacy_status_changed',
+    '{"faction_a":' + JsonQuote(A) + ',"faction_b":' + JsonQuote(B) +
+    ',"status":' + JsonQuote(AStatus) + '}'));
 end;
 
 // True if AOwner has already completed ATechID. An empty ATechID (the
@@ -1177,24 +1234,24 @@ begin
   end;
   if AlreadyExists then
   begin
-    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"id already in use\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.spawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"id already in use"}'));
     Exit;
   end;
 
   Lon := APayload.Get('lon', 0.0);
   Lat := APayload.Get('lat', 0.0);
-  GX := LonToGridX(Lon);
-  GY := LatToGridY(Lat);
-
-  if (GX < 0) or (GX >= Grid.Width) or (GY < 0) or (GY >= Grid.Height) then
+  // Validate the geographic range before grid conversion. The conversion
+  // helpers intentionally clamp exact valid endpoints (±180/±90), so
+  // checking only the resulting cell cannot reject values like lon=999.
+  if (not TryLonToGridX(Lon, GX)) or (not TryLatToGridY(Lat, GY)) then
   begin
-    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"out of bounds\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.spawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"out of bounds"}'));
     Exit;
   end;
 
   if CellMoveCost(Grid, Config, GX, GY) <= 0 then
   begin
-    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"impassable terrain\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.spawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"impassable terrain"}'));
     Exit;
   end;
 
@@ -1206,7 +1263,7 @@ begin
   // HandleMove/HandleDespawn already give unowned units.
   if (U.Owner <> '') and not HasResearched(U.Owner, GetUnitDef(U.UnitType).RequiresTech) then
   begin
-    SendLine(Format('{"topic":"game.event.spawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"tech not researched\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.spawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"tech not researched"}'));
     Exit;
   end;
 
@@ -1226,10 +1283,16 @@ begin
     UnitsLock.Leave;
   end;
 
-  LogEvent(Format('{"type":"spawned","unit_id":"%s","owner":"%s","unit_type":"%s","lon":%.4f,"lat":%.4f,"hp":%d}',
-    [UnitID, U.Owner, U.UnitType, GridToLon(U.GX), GridToLat(U.GY), U.HP]));
-  SendLine(Format('{"topic":"game.event.spawned","payload":"{\"unit_id\":\"%s\",\"owner\":\"%s\",\"unit_type\":\"%s\",\"lon\":%.4f,\"lat\":%.4f,\"hp\":%d}"}',
-    [UnitID, U.Owner, U.UnitType, GridToLon(U.GX), GridToLat(U.GY), U.HP]));
+  LogEvent('{"type":"spawned","unit_id":' + JsonQuote(UnitID) +
+    ',"owner":' + JsonQuote(U.Owner) + ',"unit_type":' + JsonQuote(U.UnitType) +
+    ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) +
+    ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) +
+    ',"hp":' + IntToStr(U.HP) + '}');
+  SendLine(MakeEventLine('game.event.spawned', '{"unit_id":' + JsonQuote(UnitID) +
+    ',"owner":' + JsonQuote(U.Owner) + ',"unit_type":' + JsonQuote(U.UnitType) +
+    ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) +
+    ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) +
+    ',"hp":' + IntToStr(U.HP) + '}'));
 end;
 
 // Removes a unit outright - no "death" event distinct from a deliberate
@@ -1260,18 +1323,18 @@ begin
 
   if not Found then
   begin
-    SendLine(Format('{"topic":"game.event.despawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"unknown unit\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.despawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"unknown unit"}'));
     Exit;
   end;
 
   if not Owned then
   begin
-    SendLine(Format('{"topic":"game.event.despawn_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"not your unit\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.despawn_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"not your unit"}'));
     Exit;
   end;
 
-  LogEvent(Format('{"type":"despawned","unit_id":"%s"}', [UnitID]));
-  SendLine(Format('{"topic":"game.event.despawned","payload":"{\"unit_id\":\"%s\"}"}', [UnitID]));
+  LogEvent('{"type":"despawned","unit_id":' + JsonQuote(UnitID) + '}');
+  SendLine(MakeEventLine('game.event.despawned', '{"unit_id":' + JsonQuote(UnitID) + '}'));
 end;
 
 procedure HandleMove(APayload: TJSONObject);
@@ -1295,7 +1358,7 @@ begin
 
   if not Found then
   begin
-    SendLine(Format('{"topic":"game.event.move_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"unknown unit\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.move_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"unknown unit"}'));
     Exit;
   end;
 
@@ -1304,14 +1367,19 @@ begin
   // working unmodified against any unit spawned without an owner.
   if (U.Owner <> '') and (U.Owner <> Actor) then
   begin
-    SendLine(Format('{"topic":"game.event.move_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"not your unit\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.move_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"not your unit"}'));
     Exit;
   end;
 
   ToLon := APayload.Get('to_lon', 0.0);
   ToLat := APayload.Get('to_lat', 0.0);
-  ToX := LonToGridX(ToLon);
-  ToY := LatToGridY(ToLat);
+  // Validate before conversion for the same reason as spawn: otherwise
+  // an out-of-range request silently becomes an edge-cell destination.
+  if (not TryLonToGridX(ToLon, ToX)) or (not TryLatToGridY(ToLat, ToY)) then
+  begin
+    SendLine(MakeEventLine('game.event.move_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"out of bounds"}'));
+    Exit;
+  end;
   StartX := Trunc(U.GX);
   StartY := Trunc(U.GY);
 
@@ -1330,7 +1398,7 @@ begin
       DiploStatus := GetDiplomaticStatus(U.Owner, TerritoryOwner);
       if DiploStatus = '' then
       begin
-        SendLine(Format('{"topic":"game.event.move_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"neutral territory - declare war or ally to enter\"}"}', [UnitID]));
+        SendLine(MakeEventLine('game.event.move_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"neutral territory - declare war or ally to enter"}'));
         Exit;
       end;
     end;
@@ -1339,7 +1407,7 @@ begin
   Path := FindPath(Grid, Config, StartX, StartY, ToX, ToY);
   if Length(Path) = 0 then
   begin
-    SendLine(Format('{"topic":"game.event.move_failed","payload":"{\"unit_id\":\"%s\",\"reason\":\"no path\"}"}', [UnitID]));
+    SendLine(MakeEventLine('game.event.move_failed', '{"unit_id":' + JsonQuote(UnitID) + ',"reason":"no path"}'));
     Exit;
   end;
 
@@ -1353,9 +1421,9 @@ begin
     UnitsLock.Leave;
   end;
 
-  LogEvent('{"type":"path_found","unit_id":"' + UnitID + '","path":' + BuildPathJSON(Path) + '}');
-  SendLine('{"topic":"game.event.path_found","payload":"{\"unit_id\":\"' + UnitID +
-    '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
+  LogEvent('{"type":"path_found","unit_id":' + JsonQuote(UnitID) + ',"path":' + BuildPathJSON(Path) + '}');
+  SendLine(MakeEventLine('game.event.path_found', '{"unit_id":' + JsonQuote(UnitID) +
+    ',"steps":' + IntToStr(Length(Path)) + ',"path":' + BuildPathJSON(Path) + '}'));
 end;
 
 // A flat, instant harvest - no travel time or animation on the resource
@@ -1430,8 +1498,8 @@ begin
 
   if Reason <> '' then
   begin
-    SendLine(Format('{"topic":"game.event.collect_failed","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"reason\":\"%s\"}"}',
-      [UnitID, NodeID, Reason]));
+    SendLine(MakeEventLine('game.event.collect_failed', '{"unit_id":' + JsonQuote(UnitID) +
+      ',"node_id":' + JsonQuote(NodeID) + ',"reason":' + JsonQuote(Reason) + '}'));
     Exit;
   end;
 
@@ -1453,9 +1521,13 @@ begin
     end;
   end;
 
-  LogEvent(Format('{"type":"collected","unit_id":"%s","node_id":"%s","by":"%s","amount":%d}', [UnitID, NodeID, Actor, Taken]));
-  SendLine(Format('{"topic":"game.event.collected","payload":"{\"unit_id\":\"%s\",\"node_id\":\"%s\",\"resource_type\":\"%s\",\"by\":\"%s\",\"amount\":%d,\"remaining\":%d}"}',
-    [UnitID, NodeID, Node.ResourceType, Actor, Taken, Node.Amount]));
+  LogEvent('{"type":"collected","unit_id":' + JsonQuote(UnitID) +
+    ',"node_id":' + JsonQuote(NodeID) + ',"by":' + JsonQuote(Actor) +
+    ',"amount":' + IntToStr(Taken) + '}');
+  SendLine(MakeEventLine('game.event.collected', '{"unit_id":' + JsonQuote(UnitID) +
+    ',"node_id":' + JsonQuote(NodeID) + ',"resource_type":' + JsonQuote(Node.ResourceType) +
+    ',"by":' + JsonQuote(Actor) + ',"amount":' + IntToStr(Taken) +
+    ',"remaining":' + IntToStr(Node.Amount) + '}'));
 end;
 
 // Reports one faction's accumulated totals - deliberately scoped to the
@@ -1483,7 +1555,7 @@ begin
         KeyResource := Copy(Pair.Key, Length(Prefix) + 1, MaxInt);
         if not First then TotalsJSON := TotalsJSON + ',';
         First := False;
-        TotalsJSON := TotalsJSON + Format('"%s":%d', [KeyResource, Pair.Value]);
+        TotalsJSON := TotalsJSON + JsonQuote(KeyResource) + ':' + IntToStr(Pair.Value);
       end;
     end;
   finally
@@ -1570,8 +1642,8 @@ begin
 
   if Reason <> '' then
   begin
-    SendLine(Format('{"topic":"game.event.city_failed","payload":"{\"city_id\":\"%s\",\"unit_id\":\"%s\",\"reason\":\"%s\"}"}',
-      [CityID, UnitID, Reason]));
+    SendLine(MakeEventLine('game.event.city_failed', '{"city_id":' + JsonQuote(CityID) +
+      ',"unit_id":' + JsonQuote(UnitID) + ',"reason":' + JsonQuote(Reason) + '}'));
     Exit;
   end;
 
@@ -1585,8 +1657,8 @@ begin
   finally
     UnitsLock.Leave;
   end;
-  LogEvent(Format('{"type":"despawned","unit_id":"%s"}', [UnitID]));
-  SendLine(Format('{"topic":"game.event.despawned","payload":"{\"unit_id\":\"%s\"}"}', [UnitID]));
+  LogEvent('{"type":"despawned","unit_id":' + JsonQuote(UnitID) + '}');
+  SendLine(MakeEventLine('game.event.despawned', '{"unit_id":' + JsonQuote(UnitID) + '}'));
 
   Owner := U.Owner;
   C.ID := CityID;
@@ -1604,10 +1676,12 @@ begin
     CitiesLock.Leave;
   end;
 
-  LogEvent(Format('{"type":"city_founded","city_id":"%s","owner":"%s","lon":%.4f,"lat":%.4f,"population":%d}',
-    [CityID, Owner, GridToLon(GX + 0.5), GridToLat(GY + 0.5), C.Population]));
-  SendLine(Format('{"topic":"game.event.city_founded","payload":"{\"city_id\":\"%s\",\"owner\":\"%s\",\"lon\":%.4f,\"lat\":%.4f,\"population\":%d}"}',
-    [CityID, Owner, GridToLon(GX + 0.5), GridToLat(GY + 0.5), C.Population]));
+  LogEvent('{"type":"city_founded","city_id":' + JsonQuote(CityID) +
+    ',"owner":' + JsonQuote(Owner) + ',"lon":' + Format('%.4f', [GridToLon(GX + 0.5)]) +
+    ',"lat":' + Format('%.4f', [GridToLat(GY + 0.5)]) + ',"population":' + IntToStr(C.Population) + '}');
+  SendLine(MakeEventLine('game.event.city_founded', '{"city_id":' + JsonQuote(CityID) +
+    ',"owner":' + JsonQuote(Owner) + ',"lon":' + Format('%.4f', [GridToLon(GX + 0.5)]) +
+    ',"lat":' + Format('%.4f', [GridToLat(GY + 0.5)]) + ',"population":' + IntToStr(C.Population) + '}'));
 end;
 
 // Grows every city's population by a fixed step once every
@@ -1690,7 +1764,8 @@ begin
   for i := 0 to High(ACosts) do
   begin
     if i > 0 then Result := Result + ',';
-    Result := Result + Format('{"resource_type":"%s","amount":%d}', [ACosts[i].ResourceType, ACosts[i].Amount]);
+    Result := Result + '{"resource_type":' + JsonQuote(ACosts[i].ResourceType) +
+      ',"amount":' + IntToStr(ACosts[i].Amount) + '}';
   end;
   Result := Result + ']';
 end;
@@ -1754,15 +1829,14 @@ begin
 
     if (C.Owner <> '') and (Length(Balance.CityGrowthCost) > 0) then
     begin
-      LogEvent(Format('{"type":"city_growth_spent","city_id":"%s","owner":"%s","costs":%s}',
-        [Keys[i], C.Owner, CostsToJSON(Balance.CityGrowthCost)]));
-      SendLine('{"topic":"game.event.city_growth_spent","payload":"{\"city_id\":\"' + Keys[i] +
-        '\",\"owner\":\"' + C.Owner + '\",\"costs\":' +
-        StringReplace(CostsToJSON(Balance.CityGrowthCost), '"', '\"', [rfReplaceAll]) + '}"}');
+      LogEvent('{"type":"city_growth_spent","city_id":' + JsonQuote(Keys[i]) +
+        ',"owner":' + JsonQuote(C.Owner) + ',"costs":' + CostsToJSON(Balance.CityGrowthCost) + '}');
+      SendLine(MakeEventLine('game.event.city_growth_spent', '{"city_id":' + JsonQuote(Keys[i]) +
+        ',"owner":' + JsonQuote(C.Owner) + ',"costs":' + CostsToJSON(Balance.CityGrowthCost) + '}'));
     end;
 
-    LogEvent(Format('{"type":"city_grew","city_id":"%s","population":%d}', [Keys[i], C.Population]));
-    SendLine(Format('{"topic":"game.event.city_grew","payload":"{\"city_id\":\"%s\",\"population\":%d}"}', [Keys[i], C.Population]));
+    LogEvent('{"type":"city_grew","city_id":' + JsonQuote(Keys[i]) + ',"population":' + IntToStr(C.Population) + '}');
+    SendLine(MakeEventLine('game.event.city_grew', '{"city_id":' + JsonQuote(Keys[i]) + ',"population":' + IntToStr(C.Population) + '}'));
   end;
 end;
 
@@ -1859,8 +1933,8 @@ begin
     finally
       RoadsLock.Leave;
     end;
-    LogEvent(Format('{"type":"road_removed","road_id":"%s","reason":"city_abandoned"}', [ToRemove[i]]));
-    SendLine(Format('{"topic":"game.event.road_removed","payload":"{\"road_id\":\"%s\",\"reason\":\"city_abandoned\"}"}', [ToRemove[i]]));
+    LogEvent('{"type":"road_removed","road_id":' + JsonQuote(ToRemove[i]) + ',"reason":"city_abandoned"}');
+    SendLine(MakeEventLine('game.event.road_removed', '{"road_id":' + JsonQuote(ToRemove[i]) + ',"reason":"city_abandoned"}'));
   end;
 end;
 
@@ -1931,11 +2005,10 @@ begin
       end;
       if Length(Balance.CityUpkeepCost) > 0 then
       begin
-        LogEvent(Format('{"type":"city_upkeep_spent","city_id":"%s","owner":"%s","costs":%s}',
-          [Keys[i], C.Owner, CostsToJSON(Balance.CityUpkeepCost)]));
-        SendLine('{"topic":"game.event.city_upkeep_spent","payload":"{\"city_id\":\"' + Keys[i] +
-          '\",\"owner\":\"' + C.Owner + '\",\"costs\":' +
-          StringReplace(CostsToJSON(Balance.CityUpkeepCost), '"', '\"', [rfReplaceAll]) + '}"}');
+        LogEvent('{"type":"city_upkeep_spent","city_id":' + JsonQuote(Keys[i]) +
+          ',"owner":' + JsonQuote(C.Owner) + ',"costs":' + CostsToJSON(Balance.CityUpkeepCost) + '}');
+        SendLine(MakeEventLine('game.event.city_upkeep_spent', '{"city_id":' + JsonQuote(Keys[i]) +
+          ',"owner":' + JsonQuote(C.Owner) + ',"costs":' + CostsToJSON(Balance.CityUpkeepCost) + '}'));
       end;
       Continue;
     end;
@@ -1953,8 +2026,8 @@ begin
       finally
         CitiesLock.Leave;
       end;
-      LogEvent(Format('{"type":"city_abandoned","city_id":"%s","previous_owner":"%s"}', [Keys[i], C.Owner]));
-      SendLine(Format('{"topic":"game.event.city_abandoned","payload":"{\"city_id\":\"%s\",\"previous_owner\":\"%s\"}"}', [Keys[i], C.Owner]));
+      LogEvent('{"type":"city_abandoned","city_id":' + JsonQuote(Keys[i]) + ',"previous_owner":' + JsonQuote(C.Owner) + '}');
+      SendLine(MakeEventLine('game.event.city_abandoned', '{"city_id":' + JsonQuote(Keys[i]) + ',"previous_owner":' + JsonQuote(C.Owner) + '}'));
       PruneRoadsForCity(Keys[i]);
     end
     else
@@ -1966,8 +2039,8 @@ begin
       finally
         CitiesLock.Leave;
       end;
-      LogEvent(Format('{"type":"city_population_decayed","city_id":"%s","population":%d}', [Keys[i], NewPop]));
-      SendLine(Format('{"topic":"game.event.city_population_decayed","payload":"{\"city_id\":\"%s\",\"population\":%d}"}', [Keys[i], NewPop]));
+      LogEvent('{"type":"city_population_decayed","city_id":' + JsonQuote(Keys[i]) + ',"population":' + IntToStr(NewPop) + '}');
+      SendLine(MakeEventLine('game.event.city_population_decayed', '{"city_id":' + JsonQuote(Keys[i]) + ',"population":' + IntToStr(NewPop) + '}'));
     end;
   end;
 end;
@@ -2023,7 +2096,7 @@ begin
   end;
   if RoadIDTaken then
   begin
-    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"id already in use\"}"}', [RoadID]));
+    SendLine(MakeEventLine('game.event.road_failed', '{"road_id":' + JsonQuote(RoadID) + ',"reason":"id already in use"}'));
     Exit;
   end;
 
@@ -2037,7 +2110,7 @@ begin
 
   if (not Found1) or (not Found2) then
   begin
-    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"unknown city\"}"}', [RoadID]));
+    SendLine(MakeEventLine('game.event.road_failed', '{"road_id":' + JsonQuote(RoadID) + ',"reason":"unknown city"}'));
     Exit;
   end;
 
@@ -2049,14 +2122,14 @@ begin
   if ((FromCity.Owner <> '') and (FromCity.Owner <> Actor)) and
      ((ToCity.Owner <> '') and (ToCity.Owner <> Actor)) then
   begin
-    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"not your city\"}"}', [RoadID]));
+    SendLine(MakeEventLine('game.event.road_failed', '{"road_id":' + JsonQuote(RoadID) + ',"reason":"not your city"}'));
     Exit;
   end;
 
   Path := FindPath(Grid, Config, FromCity.GX, FromCity.GY, ToCity.GX, ToCity.GY);
   if Length(Path) = 0 then
   begin
-    SendLine(Format('{"topic":"game.event.road_failed","payload":"{\"road_id\":\"%s\",\"reason\":\"no path\"}"}', [RoadID]));
+    SendLine(MakeEventLine('game.event.road_failed', '{"road_id":' + JsonQuote(RoadID) + ',"reason":"no path"}'));
     Exit;
   end;
 
@@ -2073,11 +2146,12 @@ begin
     RoadsLock.Leave;
   end;
 
-  LogEvent('{"type":"road_built","road_id":"' + RoadID + '","from_city_id":"' + FromCityID +
-    '","to_city_id":"' + ToCityID + '","owner":"' + Actor + '","path":' + BuildPathJSON(Path) + '}');
-  SendLine('{"topic":"game.event.road_built","payload":"{\"road_id\":\"' + RoadID +
-    '\",\"from_city_id\":\"' + FromCityID + '\",\"to_city_id\":\"' + ToCityID +
-    '\",\"steps\":' + IntToStr(Length(Path)) + ',\"path\":' + BuildPathJSON(Path) + '}"}');
+  LogEvent('{"type":"road_built","road_id":' + JsonQuote(RoadID) +
+    ',"from_city_id":' + JsonQuote(FromCityID) + ',"to_city_id":' + JsonQuote(ToCityID) +
+    ',"owner":' + JsonQuote(Actor) + ',"path":' + BuildPathJSON(Path) + '}');
+  SendLine(MakeEventLine('game.event.road_built', '{"road_id":' + JsonQuote(RoadID) +
+    ',"from_city_id":' + JsonQuote(FromCityID) + ',"to_city_id":' + JsonQuote(ToCityID) +
+    ',"steps":' + IntToStr(Length(Path)) + ',"path":' + BuildPathJSON(Path) + '}'));
 end;
 
 // True if a direct road already links two specific cities (either
@@ -2320,10 +2394,14 @@ begin
         UnitsLock.Leave;
       end;
 
-      LogEvent(Format('{"type":"unit_attacked","attacker_unit_id":"%s","target_unit_id":"%s","by":"%s","damage":%d,"remaining_hp":%d,"attacker_xp":%d,"attacker_level":%d}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
-      SendLine(Format('{"topic":"game.event.unit_attacked","payload":"{\"attacker_unit_id\":\"%s\",\"target_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"remaining_hp\":%d,\"attacker_xp\":%d,\"attacker_level\":%d}"}',
-        [AttackerID, TargetUnitID, Actor, Damage, NewHP, Attacker.XP, Attacker.Level]));
+      LogEvent('{"type":"unit_attacked","attacker_unit_id":' + JsonQuote(AttackerID) +
+        ',"target_unit_id":' + JsonQuote(TargetUnitID) + ',"by":' + JsonQuote(Actor) +
+        ',"damage":' + IntToStr(Damage) + ',"remaining_hp":' + IntToStr(NewHP) +
+        ',"attacker_xp":' + IntToStr(Attacker.XP) + ',"attacker_level":' + IntToStr(Attacker.Level) + '}');
+      SendLine(MakeEventLine('game.event.unit_attacked', '{"attacker_unit_id":' + JsonQuote(AttackerID) +
+        ',"target_unit_id":' + JsonQuote(TargetUnitID) + ',"by":' + JsonQuote(Actor) +
+        ',"damage":' + IntToStr(Damage) + ',"remaining_hp":' + IntToStr(NewHP) +
+        ',"attacker_xp":' + IntToStr(Attacker.XP) + ',"attacker_level":' + IntToStr(Attacker.Level) + '}'));
 
       if LeveledUp then
       begin
@@ -2332,8 +2410,8 @@ begin
         // replay never needs to handle this one specially. It exists
         // purely so a dashboard or map viewer can flag the moment
         // distinctly rather than noticing it by comparing two numbers.
-        SendLine(Format('{"topic":"game.event.unit_leveled_up","payload":"{\"unit_id\":\"%s\",\"level\":%d,\"hp\":%d}"}',
-          [AttackerID, Attacker.Level, Attacker.HP]));
+        SendLine(MakeEventLine('game.event.unit_leveled_up', '{"unit_id":' + JsonQuote(AttackerID) +
+          ',"level":' + IntToStr(Attacker.Level) + ',"hp":' + IntToStr(Attacker.HP) + '}'));
       end;
 
       if NewHP <= 0 then
@@ -2347,8 +2425,8 @@ begin
         // Same event shape a normal despawn produces - the client and
         // replay both already know how to remove a unit this way, so
         // death-by-combat doesn't need its own removal handling.
-        LogEvent(Format('{"type":"despawned","unit_id":"%s"}', [TargetUnitID]));
-        SendLine(Format('{"topic":"game.event.despawned","payload":"{\"unit_id\":\"%s\"}"}', [TargetUnitID]));
+        LogEvent('{"type":"despawned","unit_id":' + JsonQuote(TargetUnitID) + '}');
+        SendLine(MakeEventLine('game.event.despawned', '{"unit_id":' + JsonQuote(TargetUnitID) + '}'));
       end
       else
       begin
@@ -2415,10 +2493,12 @@ begin
           CitiesLock.Leave;
         end;
 
-        LogEvent(Format('{"type":"city_captured","city_id":"%s","previous_owner":"%s","new_owner":"%s","population":%d}',
-          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
-        SendLine(Format('{"topic":"game.event.city_captured","payload":"{\"city_id\":\"%s\",\"previous_owner\":\"%s\",\"new_owner\":\"%s\",\"population\":%d}"}',
-          [TargetCityID, PrevOwner, TargetCity.Owner, TargetCity.Population]));
+        LogEvent('{"type":"city_captured","city_id":' + JsonQuote(TargetCityID) +
+          ',"previous_owner":' + JsonQuote(PrevOwner) + ',"new_owner":' + JsonQuote(TargetCity.Owner) +
+          ',"population":' + IntToStr(TargetCity.Population) + '}');
+        SendLine(MakeEventLine('game.event.city_captured', '{"city_id":' + JsonQuote(TargetCityID) +
+          ',"previous_owner":' + JsonQuote(PrevOwner) + ',"new_owner":' + JsonQuote(TargetCity.Owner) +
+          ',"population":' + IntToStr(TargetCity.Population) + '}'));
       end
       else
       begin
@@ -2430,17 +2510,19 @@ begin
           CitiesLock.Leave;
         end;
 
-        LogEvent(Format('{"type":"city_attacked","city_id":"%s","attacker_unit_id":"%s","by":"%s","damage":%d,"population_remaining":%d}',
-          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
-        SendLine(Format('{"topic":"game.event.city_attacked","payload":"{\"city_id\":\"%s\",\"attacker_unit_id\":\"%s\",\"by\":\"%s\",\"damage\":%d,\"population_remaining\":%d}"}',
-          [TargetCityID, AttackerID, Actor, Balance.SiegeDamagePerAttack, NewPop]));
+        LogEvent('{"type":"city_attacked","city_id":' + JsonQuote(TargetCityID) +
+          ',"attacker_unit_id":' + JsonQuote(AttackerID) + ',"by":' + JsonQuote(Actor) +
+          ',"damage":' + IntToStr(Balance.SiegeDamagePerAttack) + ',"population_remaining":' + IntToStr(NewPop) + '}');
+        SendLine(MakeEventLine('game.event.city_attacked', '{"city_id":' + JsonQuote(TargetCityID) +
+          ',"attacker_unit_id":' + JsonQuote(AttackerID) + ',"by":' + JsonQuote(Actor) +
+          ',"damage":' + IntToStr(Balance.SiegeDamagePerAttack) + ',"population_remaining":' + IntToStr(NewPop) + '}'));
       end;
       Exit;
     end;
   end;
 
   if Reason <> '' then
-    SendLine(Format('{"topic":"game.event.attack_failed","payload":"{\"attacker_unit_id\":\"%s\",\"reason\":\"%s\"}"}', [AttackerID, Reason]));
+    SendLine(MakeEventLine('game.event.attack_failed', '{"attacker_unit_id":' + JsonQuote(AttackerID) + ',"reason":' + JsonQuote(Reason) + '}'));
 end;
 
 // Starts research on ATechID for AOwner, deducting its Cost up front
@@ -2488,8 +2570,8 @@ begin
 
   if Reason <> '' then
   begin
-    SendLine(Format('{"topic":"game.event.research_failed","payload":"{\"tech_id\":\"%s\",\"by\":\"%s\",\"reason\":\"%s\"}"}',
-      [TechID, Actor, Reason]));
+    SendLine(MakeEventLine('game.event.research_failed', '{"tech_id":' + JsonQuote(TechID) + ',"by":' + JsonQuote(Actor) +
+      ',"reason":' + JsonQuote(Reason) + '}'));
     Exit;
   end;
 
@@ -2506,14 +2588,14 @@ begin
 
   if Length(Def.Cost) > 0 then
   begin
-    LogEvent(Format('{"type":"research_cost_spent","owner":"%s","costs":%s}', [Actor, CostsToJSON(Def.Cost)]));
-    SendLine('{"topic":"game.event.research_cost_spent","payload":"{\"owner\":\"' + Actor +
-      '\",\"costs\":' + StringReplace(CostsToJSON(Def.Cost), '"', '\"', [rfReplaceAll]) + '}"}');
+    LogEvent('{"type":"research_cost_spent","owner":' + JsonQuote(Actor) + ',"costs":' + CostsToJSON(Def.Cost) + '}');
+    SendLine(MakeEventLine('game.event.research_cost_spent', '{"owner":' + JsonQuote(Actor) +
+      ',"costs":' + CostsToJSON(Def.Cost) + '}'));
   end;
 
-  LogEvent(Format('{"type":"research_started","owner":"%s","tech_id":"%s"}', [Actor, TechID]));
-  SendLine(Format('{"topic":"game.event.research_started","payload":"{\"owner\":\"%s\",\"tech_id\":\"%s\",\"research_ticks\":%d}"}',
-    [Actor, TechID, Def.ResearchTicks]));
+  LogEvent('{"type":"research_started","owner":' + JsonQuote(Actor) + ',"tech_id":' + JsonQuote(TechID) + '}');
+  SendLine(MakeEventLine('game.event.research_started', '{"owner":' + JsonQuote(Actor) +
+    ',"tech_id":' + JsonQuote(TechID) + ',"research_ticks":' + IntToStr(Def.ResearchTicks) + '}'));
 end;
 
 
@@ -2599,8 +2681,10 @@ begin
     begin
       RegionIdx := LeastStaffedAiRegion(Regions, 'worker');
       NewUnitID := 'ai_w_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(WorkerCount);
-      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"worker"}',
-        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
+      PayloadStr := '{"unit_id":' + JsonQuote(NewUnitID) + ',"lon":' +
+        Format('%.4f', [GridToLon(Regions[RegionIdx].GX + 0.5)]) + ',"lat":' +
+        Format('%.4f', [GridToLat(Regions[RegionIdx].GY + 0.5)]) + ',"owner":' +
+        JsonQuote(AConfig.FactionName) + ',"unit_type":"worker"}';
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2613,8 +2697,10 @@ begin
     begin
       RegionIdx := LeastStaffedAiRegion(Regions, 'settler');
       NewUnitID := 'ai_s_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SettlerCount);
-      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"settler"}',
-        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
+      PayloadStr := '{"unit_id":' + JsonQuote(NewUnitID) + ',"lon":' +
+        Format('%.4f', [GridToLon(Regions[RegionIdx].GX + 0.5)]) + ',"lat":' +
+        Format('%.4f', [GridToLat(Regions[RegionIdx].GY + 0.5)]) + ',"owner":' +
+        JsonQuote(AConfig.FactionName) + ',"unit_type":"settler"}';
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2627,8 +2713,10 @@ begin
     begin
       RegionIdx := LeastStaffedAiRegion(Regions, 'soldier');
       NewUnitID := 'ai_m_' + AConfig.FactionName + '_' + IntToStr(Tick) + '_' + IntToStr(SoldierCount);
-      PayloadStr := Format('{"unit_id":"%s","lon":%.4f,"lat":%.4f,"owner":"%s","unit_type":"soldier"}',
-        [NewUnitID, GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
+      PayloadStr := '{"unit_id":' + JsonQuote(NewUnitID) + ',"lon":' +
+        Format('%.4f', [GridToLon(Regions[RegionIdx].GX + 0.5)]) + ',"lat":' +
+        Format('%.4f', [GridToLat(Regions[RegionIdx].GY + 0.5)]) + ',"owner":' +
+        JsonQuote(AConfig.FactionName) + ',"unit_type":"soldier"}';
       PayloadData := GetJSON(PayloadStr);
       try
         HandleSpawn(TJSONObject(PayloadData));
@@ -2653,8 +2741,9 @@ begin
           finally
             CitiesLock.Leave;
           end;
-          PayloadStr := Format('{"road_id":"ai_road_%s_%s","from_city_id":"%s","to_city_id":"%s","by":"%s"}',
-            [AiCityKeys[i], AiCityKeys[j], AiCityKeys[i], AiCityKeys[j], AConfig.FactionName]);
+          PayloadStr := '{"road_id":' + JsonQuote('ai_road_' + AiCityKeys[i] + '_' + AiCityKeys[j]) +
+            ',"from_city_id":' + JsonQuote(AiCityKeys[i]) + ',"to_city_id":' +
+            JsonQuote(AiCityKeys[j]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleBuildRoad(TJSONObject(PayloadData));
@@ -2694,7 +2783,8 @@ begin
 
         if TargetTechID <> '' then
         begin
-          PayloadStr := Format('{"tech_id":"%s","by":"%s"}', [TargetTechID, AConfig.FactionName]);
+          PayloadStr := '{"tech_id":' + JsonQuote(TargetTechID) + ',"by":' +
+            JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleStartResearch(TJSONObject(PayloadData));
@@ -2762,7 +2852,8 @@ begin
 
       if Dist <= Balance.CollectRadiusCells then
       begin
-        PayloadStr := Format('{"unit_id":"%s","node_id":"%s","by":"%s"}', [UnitKeys[i], AssignedNodeID, AConfig.FactionName]);
+        PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"node_id":' +
+          JsonQuote(AssignedNodeID) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
         PayloadData := GetJSON(PayloadStr);
         try
           HandleCollect(TJSONObject(PayloadData));
@@ -2777,8 +2868,9 @@ begin
         // if it arrives, gets interrupted, or its target got reassigned.
         TargetLon := GridToLon(Node.GX);
         TargetLat := GridToLat(Node.GY);
-        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-          [UnitKeys[i], TargetLon, TargetLat, AConfig.FactionName]);
+        PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"to_lon":' +
+          Format('%.4f', [TargetLon]) + ',"to_lat":' + Format('%.4f', [TargetLat]) +
+          ',"by":' + JsonQuote(AConfig.FactionName) + '}';
         PayloadData := GetJSON(PayloadStr);
         try
           HandleMove(TJSONObject(PayloadData));
@@ -2815,8 +2907,9 @@ begin
         // founding fails on a race with something else claiming the
         // site first) picks a fresh site next pass rather than
         // re-trying a now-stale one forever.
-        PayloadStr := Format('{"city_id":"ai_city_%s_%d_%d","unit_id":"%s","by":"%s"}',
-          [AConfig.FactionName, SiteGX, SiteGY, UnitKeys[i], AConfig.FactionName]);
+        PayloadStr := '{"city_id":' + JsonQuote('ai_city_' + AConfig.FactionName + '_' +
+          IntToStr(SiteGX) + '_' + IntToStr(SiteGY)) + ',"unit_id":' +
+          JsonQuote(UnitKeys[i]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
         PayloadData := GetJSON(PayloadStr);
         try
           HandleFoundCity(TJSONObject(PayloadData));
@@ -2879,8 +2972,9 @@ begin
 
       if Length(U.Path) = 0 then
       begin
-        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-          [UnitKeys[i], GridToLon(SiteGX + 0.5), GridToLat(SiteGY + 0.5), AConfig.FactionName]);
+        PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"to_lon":' +
+          Format('%.4f', [GridToLon(SiteGX + 0.5)]) + ',"to_lat":' +
+          Format('%.4f', [GridToLat(SiteGY + 0.5)]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
         PayloadData := GetJSON(PayloadStr);
         try
           HandleMove(TJSONObject(PayloadData));
@@ -2925,8 +3019,9 @@ begin
 
         if BestTargetDist <= Balance.AttackRangeCells then
         begin
-          PayloadStr := Format('{"attacker_unit_id":"%s","target_unit_id":"%s","by":"%s"}',
-            [UnitKeys[i], TargetUnitID, AConfig.FactionName]);
+          PayloadStr := '{"attacker_unit_id":' + JsonQuote(UnitKeys[i]) +
+            ',"target_unit_id":' + JsonQuote(TargetUnitID) + ',"by":' +
+            JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleAttack(TJSONObject(PayloadData));
@@ -2936,8 +3031,10 @@ begin
         end
         else if Length(U.Path) = 0 then
         begin
-          PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-            [UnitKeys[i], GridToLon(OtherU.GX), GridToLat(OtherU.GY), AConfig.FactionName]);
+          PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"to_lon":' +
+            Format('%.4f', [GridToLon(OtherU.GX)]) + ',"to_lat":' +
+            Format('%.4f', [GridToLat(OtherU.GY)]) + ',"by":' +
+            JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleMove(TJSONObject(PayloadData));
@@ -2981,8 +3078,9 @@ begin
 
         if BestTargetDist <= Balance.AttackRangeCells then
         begin
-          PayloadStr := Format('{"attacker_unit_id":"%s","target_city_id":"%s","by":"%s"}',
-            [UnitKeys[i], TargetCityID, AConfig.FactionName]);
+          PayloadStr := '{"attacker_unit_id":' + JsonQuote(UnitKeys[i]) +
+            ',"target_city_id":' + JsonQuote(TargetCityID) + ',"by":' +
+            JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleAttack(TJSONObject(PayloadData));
@@ -2992,8 +3090,9 @@ begin
         end
         else if Length(U.Path) = 0 then
         begin
-          PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-            [UnitKeys[i], GridToLon(OtherCity.GX + 0.5), GridToLat(OtherCity.GY + 0.5), AConfig.FactionName]);
+          PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"to_lon":' +
+            Format('%.4f', [GridToLon(OtherCity.GX + 0.5)]) + ',"to_lat":' +
+            Format('%.4f', [GridToLat(OtherCity.GY + 0.5)]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
           PayloadData := GetJSON(PayloadStr);
           try
             HandleMove(TJSONObject(PayloadData));
@@ -3011,8 +3110,9 @@ begin
       RegionIdx := NearestAiRegion(Regions, U.GX, U.GY);
       if (Length(U.Path) = 0) and (WrappedDistance(U.GX, U.GY, Regions[RegionIdx].GX + 0.5, Regions[RegionIdx].GY + 0.5) > Balance.AttackRangeCells * 2) then
       begin
-        PayloadStr := Format('{"unit_id":"%s","to_lon":%.4f,"to_lat":%.4f,"by":"%s"}',
-          [UnitKeys[i], GridToLon(Regions[RegionIdx].GX + 0.5), GridToLat(Regions[RegionIdx].GY + 0.5), AConfig.FactionName]);
+        PayloadStr := '{"unit_id":' + JsonQuote(UnitKeys[i]) + ',"to_lon":' +
+          Format('%.4f', [GridToLon(Regions[RegionIdx].GX + 0.5)]) + ',"to_lat":' +
+          Format('%.4f', [GridToLat(Regions[RegionIdx].GY + 0.5)]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
         PayloadData := GetJSON(PayloadStr);
         try
           HandleMove(TJSONObject(PayloadData));
@@ -3055,15 +3155,17 @@ begin
     begin
       if not First then ListJSON := ListJSON + ',';
       First := False;
-      ListJSON := ListJSON + Format('{"id":"%s","owner":"%s","lon":%.4f,"lat":%.4f,"population":%d}',
-        [C.ID, C.Owner, GridToLon(C.GX + 0.5), GridToLat(C.GY + 0.5), C.Population]);
+      ListJSON := ListJSON + '{"id":' + JsonQuote(C.ID) +
+        ',"owner":' + JsonQuote(C.Owner) +
+        ',"lon":' + Format('%.4f', [GridToLon(C.GX + 0.5)]) +
+        ',"lat":' + Format('%.4f', [GridToLat(C.GY + 0.5)]) +
+        ',"population":' + IntToStr(C.Population) + '}';
     end;
   finally
     CitiesLock.Leave;
   end;
   ListJSON := ListJSON + ']';
-  SendLine('{"topic":"game.event.city_list","payload":"{\"cities\":' +
-    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+  SendLine(MakeEventLine('game.event.city_list', '{"cities":' + ListJSON + '}'));
 end;
 
 procedure HandleListRoads;
@@ -3080,15 +3182,17 @@ begin
     begin
       if not First then ListJSON := ListJSON + ',';
       First := False;
-      ListJSON := ListJSON + Format('{"id":"%s","from_city_id":"%s","to_city_id":"%s","owner":"%s","path":%s}',
-        [R.ID, R.FromCityID, R.ToCityID, R.Owner, BuildPathJSON(R.Path)]);
+      ListJSON := ListJSON + '{"id":' + JsonQuote(R.ID) +
+        ',"from_city_id":' + JsonQuote(R.FromCityID) +
+        ',"to_city_id":' + JsonQuote(R.ToCityID) +
+        ',"owner":' + JsonQuote(R.Owner) +
+        ',"path":' + BuildPathJSON(R.Path) + '}';
     end;
   finally
     RoadsLock.Leave;
   end;
   ListJSON := ListJSON + ']';
-  SendLine('{"topic":"game.event.road_list","payload":"{\"roads\":' +
-    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+  SendLine(MakeEventLine('game.event.road_list', '{"roads":' + ListJSON + '}'));
 end;
 
 // Recomputes the whole density field from Cities+Roads every
@@ -3301,16 +3405,18 @@ begin
     begin
       if not FirstPrereq then PrereqJSON := PrereqJSON + ',';
       FirstPrereq := False;
-      PrereqJSON := PrereqJSON + '"' + Def.Prerequisites[i] + '"';
+      PrereqJSON := PrereqJSON + JsonQuote(Def.Prerequisites[i]);
     end;
     PrereqJSON := PrereqJSON + ']';
 
-    ListJSON := ListJSON + Format('{"tech_id":"%s","display_name":"%s","research_ticks":%d,"prerequisites":%s,"cost":%s}',
-      [Def.TechID, Def.DisplayName, Def.ResearchTicks, PrereqJSON, CostsToJSON(Def.Cost)]);
+    ListJSON := ListJSON + '{"tech_id":' + JsonQuote(Def.TechID) +
+      ',"display_name":' + JsonQuote(Def.DisplayName) +
+      ',"research_ticks":' + IntToStr(Def.ResearchTicks) +
+      ',"prerequisites":' + PrereqJSON +
+      ',"cost":' + CostsToJSON(Def.Cost) + '}';
   end;
   ListJSON := ListJSON + ']';
-  SendLine('{"topic":"game.event.tech_list","payload":"{\"tech_defs\":' +
-    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+  SendLine(MakeEventLine('game.event.tech_list', '{"tech_defs":' + ListJSON + '}'));
 end;
 
 // One faction's researched tech + current in-progress research (if
@@ -3346,11 +3452,10 @@ begin
   ResearchedJSON := ResearchedJSON + ']';
 
   if HasInProgress then
-    SendLine(Format('{"topic":"game.event.tech_status","payload":"{\"owner\":\"%s\",\"researched\":%s,\"in_progress\":\"%s\",\"started_tick\":%d}"}',
-      [Actor, StringReplace(ResearchedJSON, '"', '\"', [rfReplaceAll]), InProgress.TechID, InProgress.StartTick]))
+    SendLine(MakeEventLine('game.event.tech_status', '{"owner":' + JsonQuote(Actor) + ',"researched":' + ResearchedJSON +
+      ',"in_progress":' + JsonQuote(InProgress.TechID) + ',"started_tick":' + IntToStr(InProgress.StartTick) + '}'))
   else
-    SendLine(Format('{"topic":"game.event.tech_status","payload":"{\"owner\":\"%s\",\"researched\":%s,\"in_progress\":\"\"}"}',
-      [Actor, StringReplace(ResearchedJSON, '"', '\"', [rfReplaceAll])]));
+    SendLine(MakeEventLine('game.event.tech_status', '{"owner":' + JsonQuote(Actor) + ',"researched":' + ResearchedJSON + ',"in_progress":""}'));
 end;
 
 // Advances every faction's in-progress research once per tick - same
@@ -3400,9 +3505,9 @@ begin
       TechLock.Leave;
     end;
 
-    LogEvent(Format('{"type":"research_completed","owner":"%s","tech_id":"%s"}', [Keys[i], InProgress.TechID]));
-    SendLine(Format('{"topic":"game.event.research_completed","payload":"{\"owner\":\"%s\",\"tech_id\":\"%s\"}"}',
-      [Keys[i], InProgress.TechID]));
+    LogEvent('{"type":"research_completed","owner":' + JsonQuote(Keys[i]) + ',"tech_id":' + JsonQuote(InProgress.TechID) + '}');
+    SendLine(MakeEventLine('game.event.research_completed', '{"owner":' + JsonQuote(Keys[i]) +
+      ',"tech_id":' + JsonQuote(InProgress.TechID) + '}'));
   end;
 end;
 
@@ -3435,15 +3540,16 @@ begin
 
       if not First then ListJSON := ListJSON + ',';
       First := False;
-      ListJSON := ListJSON + Format('{"faction":"%s","status":"%s"}', [Other, Pair.Value]);
+      ListJSON := ListJSON + '{"faction":' + JsonQuote(Other) +
+        ',"status":' + JsonQuote(Pair.Value) + '}';
     end;
   finally
     DiplomacyLock.Leave;
   end;
   ListJSON := ListJSON + ']';
 
-  SendLine('{"topic":"game.event.diplomacy_status","payload":"{\"owner\":\"' + Actor + '\",\"relations\":' +
-    StringReplace(ListJSON, '"', '\"', [rfReplaceAll]) + '}"}');
+  SendLine(MakeEventLine('game.event.diplomacy_status', '{"owner":' + JsonQuote(Actor) +
+    ',"relations":' + ListJSON + '}'));
 end;
 
 // Unilateral - no acceptance needed, matching how HandleAttack's own
@@ -3488,7 +3594,7 @@ begin
 
   if GetDiplomaticStatus(Actor, Target) = 'war' then
   begin
-    SendLine(Format('{"topic":"game.event.alliance_proposal_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"at war - make peace first\"}"}', [Actor, Target]));
+    SendLine(MakeEventLine('game.event.alliance_proposal_failed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + ',"reason":"at war - make peace first"}'));
     Exit;
   end;
 
@@ -3499,7 +3605,7 @@ begin
     DiplomacyLock.Leave;
   end;
 
-  SendLine(Format('{"topic":"game.event.alliance_proposed","payload":"{\"by\":\"%s\",\"target\":\"%s\"}"}', [Actor, Target]));
+  SendLine(MakeEventLine('game.event.alliance_proposed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + '}'));
 end;
 
 // Actor accepts an alliance TARGET previously proposed TO them -
@@ -3525,7 +3631,7 @@ begin
 
   if not Pending then
   begin
-    SendLine(Format('{"topic":"game.event.alliance_accept_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"no pending proposal\"}"}', [Actor, Target]));
+    SendLine(MakeEventLine('game.event.alliance_accept_failed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + ',"reason":"no pending proposal"}'));
     Exit;
   end;
 
@@ -3560,7 +3666,7 @@ begin
 
   if GetDiplomaticStatus(Actor, Target) <> 'war' then
   begin
-    SendLine(Format('{"topic":"game.event.peace_proposal_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"not at war\"}"}', [Actor, Target]));
+    SendLine(MakeEventLine('game.event.peace_proposal_failed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + ',"reason":"not at war"}'));
     Exit;
   end;
 
@@ -3571,7 +3677,7 @@ begin
     DiplomacyLock.Leave;
   end;
 
-  SendLine(Format('{"topic":"game.event.peace_proposed","payload":"{\"by\":\"%s\",\"target\":\"%s\"}"}', [Actor, Target]));
+  SendLine(MakeEventLine('game.event.peace_proposed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + '}'));
 end;
 
 // Mirrors HandleAcceptAlliance's reversed-roles convention: Target
@@ -3596,7 +3702,7 @@ begin
 
   if not Pending then
   begin
-    SendLine(Format('{"topic":"game.event.peace_accept_failed","payload":"{\"by\":\"%s\",\"target\":\"%s\",\"reason\":\"no pending proposal\"}"}', [Actor, Target]));
+    SendLine(MakeEventLine('game.event.peace_accept_failed', '{"by":' + JsonQuote(Actor) + ',"target":' + JsonQuote(Target) + ',"reason":"no pending proposal"}'));
     Exit;
   end;
 
@@ -3819,13 +3925,13 @@ begin
         U.GX := TargetX + 0.5;
         U.GY := TargetY + 0.5;
         Inc(U.PathIndex);
-        LogEvent(Format('{"type":"waypoint","unit_id":"%s","path_index":%d}', [Keys[i], U.PathIndex]));
+        LogEvent('{"type":"waypoint","unit_id":' + JsonQuote(Keys[i]) + ',"path_index":' + IntToStr(U.PathIndex) + '}');
 
         if U.PathIndex >= High(U.Path) then
         begin
           SetLength(U.Path, 0); // arrived - unit goes idle, stops generating traffic
-          LogEvent(Format('{"type":"arrived","unit_id":"%s"}', [Keys[i]]));
-          SendLine(Format('{"topic":"game.event.arrived","payload":"{\"unit_id\":\"%s\"}"}', [Keys[i]]));
+          LogEvent('{"type":"arrived","unit_id":' + JsonQuote(Keys[i]) + '}');
+          SendLine(MakeEventLine('game.event.arrived', '{"unit_id":' + JsonQuote(Keys[i]) + '}'));
         end;
       end
       else
@@ -3840,8 +3946,8 @@ begin
 
       Units.AddOrSetValue(Keys[i], U);
 
-      SendLine(Format('{"topic":"game.event.position","payload":"{\"unit_id\":\"%s\",\"lon\":%.4f,\"lat\":%.4f}"}',
-        [Keys[i], GridToLon(U.GX), GridToLat(U.GY)]));
+      SendLine(MakeEventLine('game.event.position', '{"unit_id":' + JsonQuote(Keys[i]) +
+        ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) + ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) + '}'));
     finally
       UnitsLock.Leave;
     end;
