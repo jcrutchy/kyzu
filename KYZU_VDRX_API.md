@@ -60,6 +60,7 @@ All commands are fire-and-forget from the caller's side — a command either pro
 | `game.cmd.get_development` | *(none)* | Full snapshot of the current density field |
 | `game.cmd.attack` | `attacker_unit_id`, `target_unit_id` **or** `target_city_id`, `by` | Requires an owned, combat-capable (`attack`>0) attacker within `attack_range_cells`; see §6. Also the trigger for auto-war (§8) and blocked outright between allies |
 | `game.cmd.list_nodes` | *(none)* | Full snapshot of every resource node |
+| `game.cmd.list_units` | *(none)* | Full snapshot of every current unit (id, owner, type, position, HP, level) |
 | `game.cmd.list_tech_defs` | *(none)* | Full snapshot of the tech.json registry (id, prerequisites, cost, research_ticks) |
 | `game.cmd.get_tech` | `by` | The caller's own researched techs + in-progress research only |
 | `game.cmd.start_research` | `tech_id`, `by` | Requires unresearched, prerequisites met, no research already in flight for `by`, and an affordable `cost`; deducts cost immediately, completes after `research_ticks` |
@@ -95,6 +96,7 @@ All commands are fire-and-forget from the caller's side — a command either pro
 | `game.event.development_delta` | Incremental density-field change, broadcast every `development_update_ticks` |
 | `game.event.development_snapshot` | Reply to `get_development` — full current field |
 | `game.event.node_list` | Reply to `list_nodes` |
+| `game.event.unit_list` | Reply to `list_units` |
 | `game.event.unit_attacked` / `attack_failed` | Unit-vs-unit combat outcome (includes attacker XP/level) |
 | `game.event.unit_leveled_up` | Notification-only, redundant with fields already in `unit_attacked` |
 | `game.event.city_attacked` / `city_captured` | Unit-vs-city siege outcome |

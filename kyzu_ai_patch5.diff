@@ -1,0 +1,115 @@
+--- /mnt/data/kyzu_rebased_clean/kyzu_ai.pas	2026-09-11 11:08:38.000000000 +0000
++++ /mnt/data/kyzu_patch5/kyzu_rebased_clean/kyzu_ai.pas	2026-09-11 12:01:00.393493455 +0000
+@@ -41,6 +41,8 @@
+   UnitPair: specialize TPair<string, TUnit>;
+   i, BestIdx: Integer;
+   BestDist, Dist: Double;
++  Nearest1, Nearest2: Integer;
++  NearestDist1, NearestDist2: Double;
+ begin
+   SetLength(Regions, Length(ACityKeys));
+   CitiesLock.Enter;
+@@ -142,7 +144,7 @@
+   WorkerCount, SettlerCount, SoldierCount: Integer;
+   UnitKeys: array of string;
+   UnitPair: specialize TPair<string, TUnit>;
+-  i, j, KeyIdx, TryX, TryY, SiteGX, SiteGY: Integer;
++  i, j, k, KeyIdx, TryX, TryY, SiteGX, SiteGY: Integer;
+   U, OtherU: TUnit;
+   AssignedNodeID, NewUnitID, AssignedTarget, TargetTechID: string;
+   Node: TResourceNode;
+@@ -158,6 +160,8 @@
+   CityA, CityB: TCity;
+   TargetUnitID, TargetCityID: string;
+   BestTargetDist: Double;
++  Nearest1, Nearest2: Integer;
++  NearestDist1, NearestDist2: Double;
+   OtherCity: TCity;
+   Def: TTechDef;
+   AlreadyResearching: Boolean;
+@@ -261,32 +265,63 @@
+       end;
+     end;
+ 
+-    // Road building: link every pair of AI-owned cities that isn't
+-    // already directly connected. O(n^2) over AI's own city count,
+-    // which stays tiny for the foreseeable lifetime of this project
+-    // (same "fine at this scale" reasoning the worker-node search
+-    // above already leans on).
++    // Road building: connect each AI city to only its nearest two
++    // AI-owned cities. The old all-pairs policy produced a complete
++    // graph: 95 cities meant 4,465 roads for one faction alone.
++    // Keeping two nearest neighbours preserves a useful network while
++    // preventing quadratic road growth and enormous map snapshots.
+     for i := 0 to High(AiCityKeys) do
+-      for j := i + 1 to High(AiCityKeys) do
+-        if not RoadExistsBetween(AiCityKeys[i], AiCityKeys[j]) then
++    begin
++      Nearest1 := -1;
++      Nearest2 := -1;
++      NearestDist1 := MaxDouble;
++      NearestDist2 := MaxDouble;
++
++      CitiesLock.Enter;
++      try
++        if not Cities.TryGetValue(AiCityKeys[i], CityA) then
++          Continue;
++
++        for j := 0 to High(AiCityKeys) do
+         begin
+-          CitiesLock.Enter;
+-          try
+-            if not (Cities.TryGetValue(AiCityKeys[i], CityA) and Cities.TryGetValue(AiCityKeys[j], CityB)) then
+-              Continue;
+-          finally
+-            CitiesLock.Leave;
+-          end;
+-          PayloadStr := '{"road_id":' + JsonQuote('ai_road_' + AiCityKeys[i] + '_' + AiCityKeys[j]) +
+-            ',"from_city_id":' + JsonQuote(AiCityKeys[i]) + ',"to_city_id":' +
+-            JsonQuote(AiCityKeys[j]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
+-          PayloadData := GetJSON(PayloadStr);
+-          try
+-            HandleBuildRoad(TJSONObject(PayloadData));
+-          finally
+-            PayloadData.Free;
++          if j = i then Continue;
++          if not Cities.TryGetValue(AiCityKeys[j], CityB) then Continue;
++          Dist := WrappedDistance(CityA.GX + 0.5, CityA.GY + 0.5,
++            CityB.GX + 0.5, CityB.GY + 0.5);
++          if Dist < NearestDist1 then
++          begin
++            Nearest2 := Nearest1;
++            NearestDist2 := NearestDist1;
++            Nearest1 := j;
++            NearestDist1 := Dist;
++          end
++          else if Dist < NearestDist2 then
++          begin
++            Nearest2 := j;
++            NearestDist2 := Dist;
+           end;
+         end;
++      finally
++        CitiesLock.Leave;
++      end;
++
++      for k := 1 to 2 do
++      begin
++        if k = 1 then j := Nearest1 else j := Nearest2;
++        if j < 0 then Continue;
++        if RoadExistsBetween(AiCityKeys[i], AiCityKeys[j]) then Continue;
++
++        PayloadStr := '{"road_id":' + JsonQuote('ai_road_' + AiCityKeys[i] + '_' + AiCityKeys[j]) +
++          ',"from_city_id":' + JsonQuote(AiCityKeys[i]) + ',"to_city_id":' +
++          JsonQuote(AiCityKeys[j]) + ',"by":' + JsonQuote(AConfig.FactionName) + '}';
++        PayloadData := GetJSON(PayloadStr);
++        try
++          HandleBuildRoad(TJSONObject(PayloadData));
++        finally
++          PayloadData.Free;
++        end;
++      end;
++    end;
+ 
+     // Research: at most one tech in flight at a time (HandleStartResearch
+     // enforces this too - the check here just avoids the noise of a

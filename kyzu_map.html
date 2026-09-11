@@ -1,0 +1,1338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Kyzu :: map</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #0a0e0c;
+    font-family: "IBM Plex Mono", "Consolas", monospace;
+  }
+  canvas {
+    display: block;
+    width: 100vw; height: 100vh;
+    cursor: grab;
+  }
+  canvas.dragging { cursor: grabbing; }
+  canvas.spawn-armed { cursor: crosshair; }
+
+  #hud {
+    position: fixed; top: 10px; left: 10px;
+    color: #5ee6a8; font-size: 12px;
+    background: rgba(10,14,12,0.7);
+    border: 1px solid #1c2620;
+    padding: 6px 10px;
+    pointer-events: none;
+    line-height: 1.5;
+  }
+  #hud .dim { color: #5c6b62; }
+  #hud .wsdot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #e65e5e; margin-right: 4px;
+  }
+  #hud .wsdot.up { background: #5ee6a8; }
+
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(230,94,94,0.92); color: #0a0e0c;
+    padding: 8px 18px; font-size: 12px; font-weight: 600;
+    border-radius: 3px;
+    opacity: 0; transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+
+  #layerPanel {
+    position: fixed; top: 10px; right: 10px;
+    background: rgba(10,14,12,0.85);
+    border: 1px solid #1c2620;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: #c9d6cd;
+    min-width: 160px;
+  }
+  #layerPanel .section { margin-bottom: 8px; }
+  #layerPanel .label { color: #5c6b62; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  #layerPanel button {
+    background: #0f1512; border: 1px solid #1c2620; color: #5c6b62;
+    font: inherit; font-size: 11px; padding: 4px 8px; margin-right: 4px; margin-bottom: 4px;
+    cursor: pointer;
+  }
+  #layerPanel button.active { color: #5ee6a8; border-color: #2c5c46; }
+  #layerPanel button:hover { color: #5ee6a8; }
+  #layerPanel select {
+    background: #0f1512; border: 1px solid #1c2620; color: #c9d6cd;
+    font: inherit; font-size: 11px; padding: 3px 6px; width: 100%;
+  }
+  #layerPanel input[type=range] { width: 100%; margin-top: 4px; }
+  #layerPanel input[type=text] {
+    background: #0f1512; border: 1px solid #1c2620; color: #c9d6cd;
+    font: inherit; font-size: 11px; padding: 3px 6px; width: 100%;
+    box-sizing: border-box; margin-bottom: 4px;
+  }
+  #overlayOpacityRow { display: none; }
+  #overlayOpacityRow.shown { display: block; }
+  #btnSpawn.armed, #btnFoundCity.armed, #btnRoad.armed, #btnAttack.armed { color: #ffd166; border-color: #6b5a2c; }
+</style>
+</head>
+<body>
+
+<canvas id="mapCanvas"></canvas>
+<div id="hud">
+  <span class="wsdot" id="wsDot"></span>ws: <span id="wsStatus">connecting</span> <span class="dim">| units: <span id="unitCount">0</span></span><br>
+  zoom: <span id="hudZoom">-</span> <span class="dim">(level <span id="hudLevel">-</span>)</span><br>
+  lon/lat: <span id="hudLonLat">-</span> <span class="dim">| cell: <span id="hudCell">-</span></span><br>
+  <span class="dim">selected: <span id="hudSelected">none</span></span><br>
+  <span class="dim">city: <span id="hudSelectedCity">none</span></span>
+</div>
+
+<div id="toast"></div>
+
+<div id="layerPanel">
+  <div class="section">
+    <div class="label">base layer</div>
+    <button id="btnBaseLandcover" class="active">Land Cover</button>
+    <button id="btnBaseHeightmap">Elevation</button>
+    <button id="btnBaseCombined">Combined</button>
+    <button id="btnBaseMovecost">Move Cost</button>
+  </div>
+  <div class="section">
+    <div class="label">overlay</div>
+    <select id="overlaySelect">
+      <option value="none">None</option>
+      <option value="landcover">Land Cover</option>
+      <option value="heightmap">Elevation</option>
+      <option value="combined">Combined</option>
+      <option value="movecost">Move Cost</option>
+    </select>
+    <div id="overlayOpacityRow">
+      <input type="range" id="overlayOpacity" min="0" max="100" value="50">
+    </div>
+  </div>
+  <div class="section">
+    <div class="label">view options</div>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:4px;">
+      <input type="checkbox" id="showGrid" style="margin:0;">
+      <span class="label" style="margin:0;">show movement grid</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <input type="checkbox" id="showPaths" checked style="margin:0;">
+      <span class="label" style="margin:0;">show paths</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;">
+      <input type="checkbox" id="showDevelopment" checked style="margin:0;">
+      <span class="label" style="margin:0;">show development</span>
+    </label>
+  </div>
+  <div class="section">
+    <div class="label">faction</div>
+    <input type="text" id="factionInput" value="me" maxlength="24">
+    <div class="label" style="margin-top:4px;">unit type</div>
+    <select id="unitTypeSelect" style="width:100%;">
+      <option value="generic">Generic</option>
+      <option value="settler">Settler</option>
+      <option value="worker">Worker</option>
+      <option value="scout">Scout</option>
+      <option value="soldier">Soldier</option>
+    </select>
+    <button id="btnSpawn" style="width:100%;margin:4px 0 0;">Spawn (S)</button>
+    <button id="btnFoundCity" style="width:100%;margin:4px 0 0;">Found City (F)</button>
+    <button id="btnRoad" style="width:100%;margin:4px 0 0;">Build Road (R)</button>
+    <button id="btnAttack" style="width:100%;margin:4px 0 0;">Attack (A)</button>
+    <div class="label" style="margin-top:4px;">select unit, X to despawn, C to collect</div>
+  </div>
+  <div class="section">
+    <div class="label">stash</div>
+    <div id="stashDisplay" class="dim">-</div>
+  </div>
+</div>
+
+<script src="vdrx.js"></script>
+<script>
+(function(){
+  const TILE_SIZE = 256;
+  const MIN_LEVEL = 0;
+
+  // Canonical movement grid dimensions from kyzu_bake_movement_grid
+  const GRID_WIDTH = 1300;
+  const GRID_HEIGHT = 650;
+
+  const LAYERS = {
+    landcover: { name: 'Land Cover', path: 'http://127.0.0.1:8092/tiles',           maxLevel: 6, cache: new Map() },
+    heightmap: { name: 'Elevation',  path: 'http://127.0.0.1:8092/tiles_heightmap', maxLevel: 6, cache: new Map() },
+    combined:  { name: 'Combined',   path: 'http://127.0.0.1:8092/tiles_combined',  maxLevel: 6, cache: new Map() },
+    movecost:  { name: 'Move Cost',  path: 'http://127.0.0.1:8092/tiles_movecost',  maxLevel: 6, cache: new Map() }
+  };
+  const GLOBAL_MAX_LEVEL = Math.max(...Object.values(LAYERS).map(l => l.maxLevel));
+
+  const state = {
+    baseLayer: 'landcover',
+    overlayLayer: 'none',
+    overlayOpacity: 0.5,
+    showPaths: true,
+    showGrid: false,
+    showDevelopment: true
+  };
+
+  const canvas = document.getElementById('mapCanvas');
+  const ctx = canvas.getContext('2d');
+  const hudZoom = document.getElementById('hudZoom');
+  const hudLevel = document.getElementById('hudLevel');
+  const hudLonLat = document.getElementById('hudLonLat');
+  const hudCell = document.getElementById('hudCell');
+  const hudSelectedCity = document.getElementById('hudSelectedCity');
+
+  const view = { lon: 0, lat: 0, zoom: 2 };
+  let cursorLonLat = { lon: 0, lat: 0 };
+
+  const ICON_ZOOM_THRESHOLD = 4;
+
+  const units = new Map();
+  const unitMeta = new Map();
+  const unitPaths = new Map();
+  const nodes = new Map();
+  const cities = new Map();       // id -> {owner, lon, lat, population}
+  const roads = new Map();        // id -> {fromCityId, toCityId, path:[{lon,lat}]}
+  const development = new Map();  // "gx,gy" -> {gx, gy, level 0-255}
+  let devGeneration = 0; // bumped on every development.set/clear - see drawDevelopment's cache
+  let selectedUnitId = null;
+  let selectedCityId = null;
+  const hudSelected = document.getElementById('hudSelected');
+
+  // Mirrors the server's GridToLon/GridToLat exactly, so a development
+  // cell paints at the same spot the server computed it for.
+  function gridToLon(gx) { return -180 + (gx + 0.5) * (360 / GRID_WIDTH); }
+  function gridToLat(gy) { return 90 - (gy + 0.5) * (180 / GRID_HEIGHT); }
+
+  const myLedger = {};
+  const stashDisplay = document.getElementById('stashDisplay');
+  function renderStash() {
+    const entries = Object.entries(myLedger).filter(([, v]) => v > 0);
+    stashDisplay.textContent = entries.length
+      ? entries.map(([k, v]) => k + ': ' + v).join(', ')
+      : '-';
+  }
+
+  function setSelectedUnit(id) {
+    selectedUnitId = id;
+    hudSelected.textContent = id || 'none';
+  }
+
+  let toastTimeout = null;
+  function showToast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimeout);
+    toastTimeout = setTimeout(() => el.classList.remove('show'), 2200);
+  }
+  let bus = null;
+
+  const wsDot = document.getElementById('wsDot');
+  const wsStatus = document.getElementById('wsStatus');
+  const unitCountEl = document.getElementById('unitCount');
+
+  function setWsStatus(state) {
+    wsDot.classList.toggle('up', state === 'up');
+    wsStatus.textContent = state;
+  }
+
+  function hashColor(str, fallback) {
+    if (!str) return fallback;
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+    }
+    return 'hsl(' + (hash % 360) + ', 70%, 60%)';
+  }
+  function colorForOwner(owner) { return hashColor(owner, '#5ee6a8'); }
+
+  function onUnitPosition(unitId, lon, lat) {
+    const now = performance.now();
+    const existing = units.get(unitId);
+    if (existing) {
+      existing.prevLon = existing.lon; existing.prevLat = existing.lat; existing.prevUpdateTime = existing.updateTime;
+      existing.lon = lon; existing.lat = lat; existing.updateTime = now;
+    } else {
+      units.set(unitId, { lon, lat, prevLon: lon, prevLat: lat, updateTime: now, prevUpdateTime: now });
+    }
+    unitCountEl.textContent = String(units.size);
+  }
+
+  function getUnitDisplayPosition(u) {
+    const interval = u.updateTime - u.prevUpdateTime;
+    const t = interval > 0 ? Math.min(1, (performance.now() - u.updateTime) / interval) : 1;
+    return {
+      lon: u.prevLon + (u.lon - u.prevLon) * t,
+      lat: u.prevLat + (u.lat - u.prevLat) * t
+    };
+  }
+
+  function publish(topic, payload) {
+    if (bus) bus.publish(topic, payload);
+  }
+
+  let spawnArmed = false;
+  const btnSpawn = document.getElementById('btnSpawn');
+  const factionInput = document.getElementById('factionInput');
+  const unitTypeSelect = document.getElementById('unitTypeSelect');
+
+  function setSpawnArmed(armed) {
+    spawnArmed = armed;
+    btnSpawn.classList.toggle('armed', armed);
+    canvas.classList.toggle('spawn-armed', armed);
+  }
+  btnSpawn.addEventListener('click', () => setSpawnArmed(!spawnArmed));
+
+  factionInput.addEventListener('change', () => {
+    Object.keys(myLedger).forEach(k => delete myLedger[k]);
+    renderStash();
+    publish('game.cmd.get_ledger', { by: factionInput.value || '' });
+  });
+
+  function spawnUnitAt(lon, lat) {
+    const unitId = 'u_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    publish('game.cmd.spawn', {
+      unit_id: unitId,
+      lon: lon,
+      lat: lat,
+      owner: factionInput.value || '',
+      unit_type: unitTypeSelect.value
+    });
+  }
+
+  // Founding no longer arms a click-to-place mode - a city now always
+  // comes from a settler-capable unit standing where it'll be founded,
+  // so "Found City" acts on whichever unit is currently selected rather
+  // than a raw map click. Roads still work the same way (they connect
+  // two already-placed cities, not units).
+  let roadArmed = false;
+  let roadFromCityId = null;
+  const btnFoundCity = document.getElementById('btnFoundCity');
+  const btnRoad = document.getElementById('btnRoad');
+
+  function setRoadArmed(armed) {
+    roadArmed = armed;
+    roadFromCityId = null;
+    btnRoad.classList.toggle('armed', armed);
+  }
+  btnFoundCity.addEventListener('click', () => foundCityWithSelectedUnit());
+  btnRoad.addEventListener('click', () => setRoadArmed(!roadArmed));
+
+  // Attack fires from the currently selected unit against whatever the
+  // next click lands on - a unit (any owner but your own) or a city
+  // (any owner but your own). One click, one shot: it disarms
+  // regardless of whether the click actually hit a valid target, same
+  // "click always consumes the mode" idiom as Spawn.
+  let attackArmed = false;
+  const btnAttack = document.getElementById('btnAttack');
+  function setAttackArmed(armed) {
+    if (armed && !selectedUnitId) {
+      showToast('select your unit first');
+      return;
+    }
+    attackArmed = armed;
+    btnAttack.classList.toggle('armed', armed);
+  }
+  btnAttack.addEventListener('click', () => setAttackArmed(!attackArmed));
+
+  function foundCityWithSelectedUnit() {
+    if (!selectedUnitId) {
+      showToast('select a unit first');
+      return;
+    }
+    const cityId = 'c_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    publish('game.cmd.found_city', { city_id: cityId, unit_id: selectedUnitId, by: factionInput.value || '' });
+  }
+
+  function findCityNear(mx, my) {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    let closestId = null, closestDist = 20;
+    for (const [id, c] of cities) {
+      const w = lonLatToWorld(c.lon, c.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      const d = Math.hypot(mx - sx, my - sy);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    return closestId;
+  }
+
+  function findUnitNear(mx, my) {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const hitRadius = view.zoom >= ICON_ZOOM_THRESHOLD ? 14 : 10;
+    let closestId = null, closestDist = hitRadius;
+
+    for (const [id, u] of units) {
+      const pos = getUnitDisplayPosition(u);
+      const w = lonLatToWorld(pos.lon, pos.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      const d = Math.hypot(mx - sx, my - sy);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    return closestId;
+  }
+
+  function handleClick(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = clientX - rect.left, my = clientY - rect.top;
+
+    if (attackArmed) {
+      attackArmed = false;
+      btnAttack.classList.remove('armed');
+      const hitUnit = findUnitNear(mx, my);
+      if (hitUnit && hitUnit !== selectedUnitId) {
+        publish('game.cmd.attack', { attacker_unit_id: selectedUnitId, target_unit_id: hitUnit, by: factionInput.value || '' });
+        return;
+      }
+      const hitCityForAttack = findCityNear(mx, my);
+      if (hitCityForAttack) {
+        publish('game.cmd.attack', { attacker_unit_id: selectedUnitId, target_city_id: hitCityForAttack, by: factionInput.value || '' });
+        return;
+      }
+      showToast('no target there');
+      return;
+    }
+
+    if (roadArmed) {
+      const hitCity = findCityNear(mx, my);
+      if (!hitCity) return;
+      if (!roadFromCityId) {
+        roadFromCityId = hitCity;
+        showToast('road from ' + hitCity + ' - click destination city');
+      } else if (hitCity !== roadFromCityId) {
+        const roadId = 'r_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        publish('game.cmd.build_road', { road_id: roadId, from_city_id: roadFromCityId, to_city_id: hitCity, by: factionInput.value || '' });
+        setRoadArmed(false);
+      }
+      return;
+    }
+
+    const hitCity = findCityNear(mx, my);
+    if (hitCity && !spawnArmed) {
+      selectedCityId = hitCity;
+      hudSelectedCity.textContent = hitCity;
+      return;
+    }
+
+    if (spawnArmed) {
+      setSpawnArmed(false);
+      const hitUnit = findUnitNear(mx, my);
+      if (hitUnit) return;
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const worldX = centerWorld.x + (mx - canvas.width / 2);
+      const worldY = centerWorld.y + (my - canvas.height / 2);
+      const target = worldToLonLat(worldX, worldY, view.zoom);
+      spawnUnitAt(target.lon, target.lat);
+      return;
+    }
+
+    const hitUnit = findUnitNear(mx, my);
+    if (hitUnit) {
+      setSelectedUnit(hitUnit);
+      return;
+    }
+
+    if (selectedUnitId) {
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const worldX = centerWorld.x + (mx - canvas.width / 2);
+      const worldY = centerWorld.y + (my - canvas.height / 2);
+      const target = worldToLonLat(worldX, worldY, view.zoom);
+      publish('game.cmd.move', { unit_id: selectedUnitId, to_lon: target.lon, to_lat: target.lat, by: factionInput.value || '' });
+    }
+  }
+
+  function despawnSelected() {
+    if (!selectedUnitId) return;
+    publish('game.cmd.despawn', { unit_id: selectedUnitId, by: factionInput.value || '' });
+  }
+
+  function collectFromNearestNode() {
+    if (!selectedUnitId) return;
+    const u = units.get(selectedUnitId);
+    if (!u || nodes.size === 0) return;
+    const pos = getUnitDisplayPosition(u);
+    let closestId = null, closestDist = Infinity;
+    for (const [id, n] of nodes) {
+      const d = Math.hypot(n.lon - pos.lon, n.lat - pos.lat);
+      if (d < closestDist) { closestDist = d; closestId = id; }
+    }
+    if (closestId) {
+      publish('game.cmd.collect', { unit_id: selectedUnitId, node_id: closestId, by: factionInput.value || '' });
+    }
+  }
+
+  function connectWS() {
+    bus = new VdrxBus({
+      autoSubscribe: false,
+      onStatus: (state) => { setWsStatus(state); },
+      onAuthed: () => {
+        // Subscribe only to events the map actually renders. The old default
+        // game.> filter also delivered high-volume non-map traffic (notably
+        // every AI/game tick) to the browser.
+        [
+          'game.event.position', 'game.event.spawned', 'game.event.despawned',
+          'game.event.spawn_failed', 'game.event.despawn_failed',
+          'game.event.unit_attacked', 'game.event.attack_failed',
+          'game.event.city_attacked', 'game.event.city_captured',
+          'game.event.city_upkeep_spent', 'game.event.city_population_decayed',
+          'game.event.city_abandoned', 'game.event.road_removed',
+          'game.event.node_list', 'game.event.collected', 'game.event.city_growth_spent',
+          'game.event.ledger', 'game.event.collect_failed', 'game.event.path_found',
+          'game.event.arrived', 'game.event.move_failed', 'game.event.city_founded',
+          'game.event.city_grew', 'game.event.city_failed', 'game.event.city_list',
+          'game.event.road_built', 'game.event.road_failed', 'game.event.road_list',
+          'game.event.unit_list', 'game.event.development_delta',
+          'game.event.development_snapshot'
+        ].forEach(filter => bus.subscribe(filter));
+        publish('game.cmd.list_units', {});
+        publish('game.cmd.list_nodes', {});
+        publish('game.cmd.get_ledger', { by: factionInput.value || '' });
+        publish('game.cmd.list_cities', {});
+        publish('game.cmd.list_roads', {});
+        publish('game.cmd.get_development', {});
+      },
+      onMessage: (topic, payload) => {
+        if (topic === 'game.event.position') {
+          if (payload && payload.unit_id !== undefined) {
+            onUnitPosition(payload.unit_id, payload.lon, payload.lat);
+          }
+        } else if (topic === 'game.event.spawned') {
+          if (payload && payload.unit_id !== undefined) {
+            unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', hp: payload.hp });
+            onUnitPosition(payload.unit_id, payload.lon, payload.lat);
+          }
+        } else if (topic === 'game.event.unit_list') {
+          if (payload && Array.isArray(payload.units)) {
+            units.clear();
+            unitMeta.clear();
+            for (const u of payload.units) {
+              const unitId = u.unit_id !== undefined ? u.unit_id : u.id;
+              if (unitId === undefined || u.lon === undefined || u.lat === undefined) continue;
+              unitMeta.set(unitId, { owner: u.owner || '', unitType: u.unit_type || 'generic', hp: u.hp, level: u.level });
+              onUnitPosition(unitId, u.lon, u.lat);
+            }
+            unitCountEl.textContent = String(units.size);
+          }
+        } else if (topic === 'game.event.despawned') {
+          if (payload && payload.unit_id !== undefined) {
+            units.delete(payload.unit_id);
+            unitMeta.delete(payload.unit_id);
+            unitPaths.delete(payload.unit_id);
+            if (selectedUnitId === payload.unit_id) setSelectedUnit(null);
+            unitCountEl.textContent = String(units.size);
+          }
+        } else if (topic === 'game.event.spawn_failed') {
+          showToast('spawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.despawn_failed') {
+          showToast('despawn failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.unit_attacked') {
+          if (payload && payload.target_unit_id !== undefined) {
+            const meta = unitMeta.get(payload.target_unit_id);
+            if (meta) meta.hp = payload.remaining_hp;
+            if (payload.by === factionInput.value || (meta && meta.owner === factionInput.value)) {
+              showToast(payload.attacker_unit_id + ' hit ' + payload.target_unit_id + ' for ' + payload.damage + ' (' + payload.remaining_hp + ' hp left)');
+            }
+          }
+        } else if (topic === 'game.event.attack_failed') {
+          showToast('attack failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_attacked') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id);
+            if (c) c.population = payload.population_remaining;
+            showToast(payload.city_id + ' under siege - ' + payload.population_remaining + ' population left');
+          }
+        } else if (topic === 'game.event.city_captured') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id) || {};
+            c.owner = payload.new_owner;
+            c.population = payload.population;
+            cities.set(payload.city_id, c);
+            showToast(payload.city_id + ' captured by ' + payload.new_owner);
+          }
+        } else if (topic === 'game.event.city_upkeep_spent') {
+          if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+            for (const c of payload.costs) {
+              myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+            }
+            renderStash();
+          }
+        } else if (topic === 'game.event.city_population_decayed') {
+          if (payload && payload.city_id !== undefined) {
+            const c = cities.get(payload.city_id);
+            if (c) c.population = payload.population;
+            showToast(payload.city_id + ' is short on upkeep - population down to ' + payload.population);
+          }
+        } else if (topic === 'game.event.city_abandoned') {
+          if (payload && payload.city_id !== undefined) {
+            cities.delete(payload.city_id);
+            if (selectedCityId === payload.city_id) {
+              selectedCityId = null;
+              hudSelectedCity.textContent = 'none';
+            }
+            showToast(payload.city_id + ' was abandoned - upkeep unpaid too long');
+          }
+        } else if (topic === 'game.event.road_removed') {
+          if (payload && payload.road_id !== undefined) {
+            roads.delete(payload.road_id);
+            roadGeneration++; invalidateRoadDrawCache();
+          }
+        } else if (topic === 'game.event.node_list') {
+          if (payload && Array.isArray(payload.nodes)) {
+            nodes.clear();
+            for (const n of payload.nodes) {
+              nodes.set(n.id, { resourceType: n.resource_type, lon: n.lon, lat: n.lat, amount: n.amount });
+            }
+          }
+        } else if (topic === 'game.event.collected') {
+          if (payload && payload.node_id !== undefined) {
+            const n = nodes.get(payload.node_id);
+            if (n) n.amount = payload.remaining;
+            if (payload.by === factionInput.value) {
+              myLedger[payload.resource_type] = (myLedger[payload.resource_type] || 0) + payload.amount;
+              renderStash();
+            }
+            showToast('collected ' + payload.amount + ' ' + (payload.resource_type || '') + ' (' + payload.remaining + ' left)');
+          }
+        } else if (topic === 'game.event.city_growth_spent') {
+          if (payload && payload.owner === factionInput.value && Array.isArray(payload.costs)) {
+            for (const c of payload.costs) {
+              myLedger[c.resource_type] = Math.max(0, (myLedger[c.resource_type] || 0) - c.amount);
+            }
+            renderStash();
+            const costStr = payload.costs.map(c => c.amount + ' ' + c.resource_type).join(', ');
+            showToast('city ' + payload.city_id + ' grew - spent ' + costStr);
+          }
+        } else if (topic === 'game.event.ledger') {
+          if (payload && payload.owner === factionInput.value && payload.totals) {
+            Object.keys(myLedger).forEach(k => delete myLedger[k]);
+            Object.assign(myLedger, payload.totals);
+            renderStash();
+          }
+        } else if (topic === 'game.event.collect_failed') {
+          showToast('collect failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.path_found') {
+          if (payload && payload.unit_id !== undefined && Array.isArray(payload.path)) {
+            unitPaths.set(payload.unit_id, payload.path.map(p => ({ lon: p[0], lat: p[1] })));
+          }
+        } else if (topic === 'game.event.arrived') {
+          if (payload && payload.unit_id !== undefined) {
+            unitPaths.delete(payload.unit_id);
+          }
+        } else if (topic === 'game.event.move_failed') {
+          showToast('move failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_founded' || topic === 'game.event.city_grew') {
+          if (payload && payload.city_id !== undefined) {
+            const existing = cities.get(payload.city_id) || {};
+            cities.set(payload.city_id, {
+              owner: payload.owner !== undefined ? payload.owner : existing.owner,
+              lon: payload.lon !== undefined ? payload.lon : existing.lon,
+              lat: payload.lat !== undefined ? payload.lat : existing.lat,
+              population: payload.population
+            });
+          }
+        } else if (topic === 'game.event.city_failed') {
+          showToast('found city failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.city_list') {
+          if (payload && Array.isArray(payload.cities)) {
+            cities.clear();
+            for (const c of payload.cities) {
+              cities.set(c.id, { owner: c.owner, lon: c.lon, lat: c.lat, population: c.population });
+            }
+          }
+        } else if (topic === 'game.event.road_built') {
+          if (payload && payload.road_id !== undefined && Array.isArray(payload.path)) {
+            roads.set(payload.road_id, {
+              fromCityId: payload.from_city_id,
+              toCityId: payload.to_city_id,
+              path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
+            });
+            roadGeneration++; invalidateRoadDrawCache();
+          }
+        } else if (topic === 'game.event.road_failed') {
+          showToast('build road failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
+        } else if (topic === 'game.event.road_list') {
+          if (payload && Array.isArray(payload.roads)) {
+            roads.clear();
+            for (const r of payload.roads) {
+              roads.set(r.id, {
+                fromCityId: r.from_city_id,
+                toCityId: r.to_city_id,
+                path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
+              });
+            }
+            roadGeneration++; invalidateRoadDrawCache();
+          }
+        } else if (topic === 'game.event.development_delta' || topic === 'game.event.development_snapshot') {
+          if (payload && Array.isArray(payload.cells)) {
+            if (topic === 'game.event.development_snapshot') development.clear();
+            for (const c of payload.cells) {
+              development.set(c.gx + ',' + c.gy, { gx: c.gx, gy: c.gy, level: c.d });
+            }
+            devGeneration++;
+          }
+        }
+      }
+    });
+
+    bus.connect();
+  }
+
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  function worldPixelWidth(z)  { return TILE_SIZE * Math.pow(2, z + 1); }
+  function worldPixelHeight(z) { return TILE_SIZE * Math.pow(2, z); }
+
+  function lonLatToWorld(lon, lat, z) {
+    return {
+      x: (lon + 180) / 360 * worldPixelWidth(z),
+      y: (90 - lat) / 180 * worldPixelHeight(z)
+    };
+  }
+  function worldToLonLat(x, y, z) {
+    return {
+      lon: x / worldPixelWidth(z) * 360 - 180,
+      lat: 90 - y / worldPixelHeight(z) * 180
+    };
+  }
+
+  function getTile(layerKey, z, x, y) {
+    const layer = LAYERS[layerKey];
+    const key = z + '/' + x + '/' + y;
+    let entry = layer.cache.get(key);
+    if (!entry) {
+      const img = new Image();
+      entry = { img: img, loaded: false, failed: false };
+      img.onload = () => { entry.loaded = true; };
+      img.onerror = () => { entry.failed = true; };
+      img.src = layer.path + '/' + key + '.png';
+      layer.cache.set(key, entry);
+    }
+    return entry;
+  }
+
+  function clampView() {
+    view.zoom = Math.max(MIN_LEVEL, Math.min(GLOBAL_MAX_LEVEL, view.zoom));
+    view.lat = Math.max(-90, Math.min(90, view.lat));
+    view.lon = Math.max(-180, Math.min(180, view.lon));
+  }
+
+  function drawLayer(layerKey, alpha) {
+    const layer = LAYERS[layerKey];
+    const cw = canvas.width, ch = canvas.height;
+    const L = Math.max(MIN_LEVEL, Math.min(layer.maxLevel, Math.round(view.zoom)));
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+
+    const topLeft = worldToLonLat(centerWorld.x - cw / 2, centerWorld.y - ch / 2, view.zoom);
+    const bottomRight = worldToLonLat(centerWorld.x + cw / 2, centerWorld.y + ch / 2, view.zoom);
+
+    const tilesAcross = Math.pow(2, L + 1);
+    const tilesDown = Math.pow(2, L);
+
+    let txMin = Math.floor((topLeft.lon + 180) / 360 * tilesAcross) - 1;
+    let txMax = Math.ceil((bottomRight.lon + 180) / 360 * tilesAcross) + 1;
+    let tyMin = Math.floor((90 - topLeft.lat) / 180 * tilesDown) - 1;
+    let tyMax = Math.ceil((90 - bottomRight.lat) / 180 * tilesDown) + 1;
+
+    txMin = Math.max(0, txMin); txMax = Math.min(tilesAcross - 1, txMax);
+    tyMin = Math.max(0, tyMin); tyMax = Math.min(tilesDown - 1, tyMax);
+
+    ctx.globalAlpha = alpha;
+    for (let ty = tyMin; ty <= tyMax; ty++) {
+      for (let tx = txMin; tx <= txMax; tx++) {
+        const lonMin = -180 + tx * (360 / tilesAcross);
+        const lonMax = lonMin + 360 / tilesAcross;
+        const latMax = 90 - ty * (180 / tilesDown);
+        const latMin = latMax - 180 / tilesDown;
+
+        const p0 = lonLatToWorld(lonMin, latMax, view.zoom);
+        const p1 = lonLatToWorld(lonMax, latMin, view.zoom);
+
+        const sx = cw / 2 + (p0.x - centerWorld.x);
+        const sy = ch / 2 + (p0.y - centerWorld.y);
+        const sw = p1.x - p0.x;
+        const sh = p1.y - p0.y;
+
+        const entry = getTile(layerKey, L, tx, ty);
+        if (entry.loaded) {
+          ctx.drawImage(entry.img, sx, sy, sw + 1, sh + 1);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Adaptive vector grid overlay matching the simulation's 1300x650 movement grid
+  function drawGrid() {
+    if (!state.showGrid) return;
+
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const worldW = worldPixelWidth(view.zoom);
+    const cellPx = worldW / GRID_WIDTH;
+
+    // Adapt grid line stride at distance to prevent moire screen clutter
+    let stride = 1;
+    if (cellPx < 3) stride = 50;
+    else if (cellPx < 8) stride = 10;
+    else if (cellPx < 14) stride = 5;
+
+    const topLeft = worldToLonLat(centerWorld.x - cw / 2, centerWorld.y - ch / 2, view.zoom);
+    const bottomRight = worldToLonLat(centerWorld.x + cw / 2, centerWorld.y + ch / 2, view.zoom);
+
+    let gxMin = Math.floor((topLeft.lon + 180) / 360 * GRID_WIDTH);
+    let gxMax = Math.ceil((bottomRight.lon + 180) / 360 * GRID_WIDTH);
+    let gyMin = Math.floor((90 - topLeft.lat) / 180 * GRID_HEIGHT);
+    let gyMax = Math.ceil((90 - bottomRight.lat) / 180 * GRID_HEIGHT);
+
+    gyMin = Math.max(0, gyMin);
+    gyMax = Math.min(GRID_HEIGHT, gyMax);
+
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#5ee6a8';
+    ctx.globalAlpha = stride === 1 ? 0.22 : 0.15;
+    ctx.beginPath();
+
+    const startGX = Math.floor(gxMin / stride) * stride;
+    for (let gx = startGX; gx <= gxMax; gx += stride) {
+      const lon = -180 + gx * (360 / GRID_WIDTH);
+      const w = lonLatToWorld(lon, 0, view.zoom);
+      const sx = Math.floor(cw / 2 + (w.x - centerWorld.x)) + 0.5;
+      ctx.moveTo(sx, 0); ctx.lineTo(sx, ch);
+    }
+
+    const startGY = Math.floor(gyMin / stride) * stride;
+    for (let gy = startGY; gy <= gyMax; gy += stride) {
+      const lat = 90 - gy * (180 / GRID_HEIGHT);
+      const w = lonLatToWorld(0, lat, view.zoom);
+      const sy = Math.floor(ch / 2 + (w.y - centerWorld.y)) + 0.5;
+      ctx.moveTo(0, sy); ctx.lineTo(cw, sy);
+    }
+    ctx.stroke();
+
+    // Major 10-cell accent lines when zoomed close enough to distinguish cells
+    if (stride === 1 && cellPx >= 12) {
+      ctx.strokeStyle = '#5ee6a8';
+      ctx.globalAlpha = 0.45;
+      ctx.beginPath();
+      const majorStartGX = Math.floor(gxMin / 10) * 10;
+      for (let gx = majorStartGX; gx <= gxMax; gx += 10) {
+        const lon = -180 + gx * (360 / GRID_WIDTH);
+        const w = lonLatToWorld(lon, 0, view.zoom);
+        const sx = Math.floor(cw / 2 + (w.x - centerWorld.x)) + 0.5;
+        ctx.moveTo(sx, 0); ctx.lineTo(sx, ch);
+      }
+      const majorStartGY = Math.floor(gyMin / 10) * 10;
+      for (let gy = majorStartGY; gy <= gyMax; gy += 10) {
+        const lat = 90 - gy * (180 / GRID_HEIGHT);
+        const w = lonLatToWorld(0, lat, view.zoom);
+        const sy = Math.floor(ch / 2 + (w.y - centerWorld.y)) + 0.5;
+        ctx.moveTo(0, sy); ctx.lineTo(cw, sy);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Offscreen buffer for the development overlay - rebuilding this means
+  // walking every cell in `development` (which can run into the
+  // thousands once several AI factions have founded dozens of cities),
+  // so it's only redone when the underlying data changed (devGeneration,
+  // bumped by the WS handler above) or the view moved - not on every one
+  // of the render loop's 60 frames/sec regardless of whether anything
+  // actually changed on screen.
+  let devBuffer = null;
+  let devBufferGen = -1;
+  let devBufferViewKey = '';
+
+  function drawDevelopment() {
+    if (!state.showDevelopment || development.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const viewKey = view.lon.toFixed(3) + ',' + view.lat.toFixed(3) + ',' + view.zoom.toFixed(3) + ',' + cw + ',' + ch;
+
+    if (!devBuffer || devBufferGen !== devGeneration || devBufferViewKey !== viewKey) {
+      if (!devBuffer || devBuffer.width !== cw || devBuffer.height !== ch) {
+        devBuffer = document.createElement('canvas');
+        devBuffer.width = cw;
+        devBuffer.height = ch;
+      }
+      const bctx = devBuffer.getContext('2d');
+      bctx.clearRect(0, 0, cw, ch);
+
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const cellPx = worldPixelWidth(view.zoom) / GRID_WIDTH;
+
+      for (const cell of development.values()) {
+        if (cell.level <= 0) continue;
+        const w = lonLatToWorld(gridToLon(cell.gx), gridToLat(cell.gy), view.zoom);
+        const sx = cw / 2 + (w.x - centerWorld.x);
+        const sy = ch / 2 + (w.y - centerWorld.y);
+        if (sx < -cellPx || sx > cw + cellPx || sy < -cellPx || sy > ch + cellPx) continue;
+
+        // Green (low density) ramping to warm amber (high density) -
+        // matches the mint/amber accents already used elsewhere in the HUD.
+        const t = cell.level / 255;
+        const r = Math.round(94 + t * (255 - 94));
+        const g = Math.round(230 - t * (230 - 209));
+        const b = Math.round(168 - t * 168);
+        bctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (t * 0.5).toFixed(2) + ')';
+        bctx.fillRect(sx - cellPx / 2, sy - cellPx / 2, cellPx + 1, cellPx + 1);
+      }
+
+      devBufferGen = devGeneration;
+      devBufferViewKey = viewKey;
+    }
+
+    ctx.drawImage(devBuffer, 0, 0);
+  }
+
+  let roadBuffer = null;
+  let roadBufferCtx = null;
+  let roadBufferKey = '';
+
+  function drawRoads() {
+    if (roads.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const viewKey = view.lon.toFixed(3) + ',' + view.lat.toFixed(3) + ',' + view.zoom.toFixed(3) + ',' + cw + ',' + ch + ',' + roadGeneration;
+
+    // A giant Path2D is still expensive to stroke every animation frame.
+    // Render the current road view once into an offscreen bitmap and blit
+    // that bitmap on subsequent frames. Rebuild only after the view or
+    // road data actually changes.
+    if (!roadBuffer || roadBuffer.width !== cw || roadBuffer.height !== ch || roadBufferKey !== viewKey) {
+      if (!roadBuffer || roadBuffer.width !== cw || roadBuffer.height !== ch) {
+        roadBuffer = document.createElement('canvas');
+        roadBuffer.width = cw;
+        roadBuffer.height = ch;
+        roadBufferCtx = roadBuffer.getContext('2d');
+      }
+
+      roadBufferCtx.clearRect(0, 0, cw, ch);
+      roadBufferCtx.lineCap = 'round';
+      const roadPath = new Path2D();
+
+      for (const r of roads.values()) {
+        if (!r.path || r.path.length < 2) continue;
+        for (let i = 0; i < r.path.length; i++) {
+          const w = lonLatToWorld(r.path[i].lon, r.path[i].lat, view.zoom);
+          const sx = cw / 2 + (w.x - centerWorld.x);
+          const sy = ch / 2 + (w.y - centerWorld.y);
+          if (i === 0) roadPath.moveTo(sx, sy); else roadPath.lineTo(sx, sy);
+        }
+      }
+
+      roadBufferCtx.strokeStyle = '#0a0e0c';
+      roadBufferCtx.globalAlpha = 0.9;
+      roadBufferCtx.lineWidth = 4.5;
+      roadBufferCtx.stroke(roadPath);
+      roadBufferCtx.strokeStyle = '#a67c52';
+      roadBufferCtx.lineWidth = 2.5;
+      roadBufferCtx.stroke(roadPath);
+      roadBufferCtx.globalAlpha = 1;
+      roadBufferKey = viewKey;
+    }
+
+    ctx.drawImage(roadBuffer, 0, 0);
+  }
+
+  function drawCities() {
+    if (cities.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useLabels = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, c] of cities) {
+      if (c.lon === undefined || c.lat === undefined) continue;
+      const w = lonLatToWorld(c.lon, c.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue;
+
+      // Log-scaled radius so a 5000-pop metropolis doesn't dwarf the canvas
+      const radius = 6 + Math.min(14, Math.log2(1 + (c.population || 0)));
+
+      if (id === selectedCityId) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, radius + 5, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius, 0, Math.PI * 2);
+      ctx.fillStyle = colorForOwner(c.owner);
+      ctx.fill();
+      ctx.strokeStyle = '#0a0e0c';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      if (useLabels) {
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        const label = id + ' (' + (c.population || 0) + ')';
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.strokeText(label, sx, sy - radius - 6);
+        ctx.fillStyle = '#c9d6cd';
+        ctx.fillText(label, sx, sy - radius - 6);
+      }
+    }
+  }
+
+  function drawPaths() {
+    if (!state.showPaths || unitPaths.size === 0) return;
+
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+
+    ctx.save();
+    ctx.strokeStyle = '#5ee6a8';
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+
+    for (const [id, path] of unitPaths) {
+      if (path.length < 2) continue;
+      ctx.beginPath();
+      for (let i = 0; i < path.length; i++) {
+        const w = lonLatToWorld(path[i].lon, path[i].lat, view.zoom);
+        const sx = cw / 2 + (w.x - centerWorld.x);
+        const sy = ch / 2 + (w.y - centerWorld.y);
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawNodes() {
+    if (nodes.size === 0) return;
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useLabels = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, n] of nodes) {
+      const w = lonLatToWorld(n.lon, n.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue;
+
+      const depleted = n.amount <= 0;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.globalAlpha = depleted ? 0.35 : 1.0;
+      ctx.beginPath();
+      ctx.moveTo(0, -7); ctx.lineTo(7, 0); ctx.lineTo(0, 7); ctx.lineTo(-7, 0);
+      ctx.closePath();
+      ctx.fillStyle = hashColor(n.resourceType, '#c9d6cd');
+      ctx.fill();
+      ctx.strokeStyle = '#0a0e0c';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+
+      if (useLabels) {
+        ctx.fillStyle = '#5c6b62';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(n.resourceType + ' ' + n.amount, sx, sy - 12);
+      }
+    }
+  }
+
+  function drawUnits() {
+    const cw = canvas.width, ch = canvas.height;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const useIcons = view.zoom >= ICON_ZOOM_THRESHOLD;
+
+    for (const [id, u] of units) {
+      const pos = getUnitDisplayPosition(u);
+      const w = lonLatToWorld(pos.lon, pos.lat, view.zoom);
+      const sx = cw / 2 + (w.x - centerWorld.x);
+      const sy = ch / 2 + (w.y - centerWorld.y);
+
+      if (sx < -20 || sx > cw + 20 || sy < -20 || sy > ch + 20) continue;
+
+      const meta = unitMeta.get(id);
+      const fillColor = colorForOwner(meta ? meta.owner : '');
+
+      if (id === selectedUnitId) {
+        ctx.beginPath();
+        ctx.arc(sx, sy, useIcons ? 13 : 9, 0, Math.PI * 2);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      if (useIcons) {
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.beginPath();
+        ctx.moveTo(0, -8); ctx.lineTo(6, 0); ctx.lineTo(0, 8); ctx.lineTo(-6, 0);
+        ctx.closePath();
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.restore();
+
+        const label = id + (meta && meta.hp !== undefined ? ' (' + meta.hp + 'hp)' : '');
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.strokeText(label, sx, sy + 18);
+        ctx.fillStyle = '#c9d6cd';
+        ctx.fillText(label, sx, sy + 18);
+      } else {
+        ctx.beginPath();
+        ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+  }
+
+  function render() {
+    const cw = canvas.width, ch = canvas.height;
+    ctx.fillStyle = '#0a0e0c';
+    ctx.fillRect(0, 0, cw, ch);
+
+    drawLayer(state.baseLayer, 1.0);
+    if (state.overlayLayer !== 'none') {
+      drawLayer(state.overlayLayer, state.overlayOpacity);
+    }
+
+    // Draw vector overlays directly on top of terrain
+    drawDevelopment();
+    drawGrid();
+    drawNodes();
+    drawRoads();
+    drawCities();
+    drawPaths();
+    drawUnits();
+
+    const L = Math.max(MIN_LEVEL, Math.min(LAYERS[state.baseLayer].maxLevel, Math.round(view.zoom)));
+    hudZoom.textContent = view.zoom.toFixed(2);
+    hudLevel.textContent = String(L);
+    hudLonLat.textContent = view.lon.toFixed(2) + ', ' + view.lat.toFixed(2);
+
+    // Compute active cell coordinates for cursor location
+    const curGX = Math.floor((cursorLonLat.lon + 180.0) / 360.0 * GRID_WIDTH);
+    const curGY = Math.floor((90.0 - cursorLonLat.lat) / 180.0 * GRID_HEIGHT);
+    if (curGX >= 0 && curGX < GRID_WIDTH && curGY >= 0 && curGY < GRID_HEIGHT) {
+      hudCell.textContent = curGX + ', ' + curGY;
+    } else {
+      hudCell.textContent = '-';
+    }
+
+    requestAnimationFrame(render);
+  }
+
+  const btnBaseLandcover = document.getElementById('btnBaseLandcover');
+  const btnBaseHeightmap = document.getElementById('btnBaseHeightmap');
+  const btnBaseCombined = document.getElementById('btnBaseCombined');
+  const btnBaseMovecost = document.getElementById('btnBaseMovecost');
+  const overlaySelect = document.getElementById('overlaySelect');
+  const overlayOpacityRow = document.getElementById('overlayOpacityRow');
+  const overlayOpacitySlider = document.getElementById('overlayOpacity');
+  const showPathsCheckbox = document.getElementById('showPaths');
+  const showGridCheckbox = document.getElementById('showGrid');
+
+  function setBaseLayer(key) {
+    state.baseLayer = key;
+    btnBaseLandcover.classList.toggle('active', key === 'landcover');
+    btnBaseHeightmap.classList.toggle('active', key === 'heightmap');
+    btnBaseCombined.classList.toggle('active', key === 'combined');
+    btnBaseMovecost.classList.toggle('active', key === 'movecost');
+    if (state.overlayLayer === key) {
+      state.overlayLayer = 'none';
+      overlaySelect.value = 'none';
+      overlayOpacityRow.classList.remove('shown');
+    }
+  }
+  btnBaseLandcover.addEventListener('click', () => setBaseLayer('landcover'));
+  btnBaseHeightmap.addEventListener('click', () => setBaseLayer('heightmap'));
+  btnBaseCombined.addEventListener('click', () => setBaseLayer('combined'));
+  btnBaseMovecost.addEventListener('click', () => setBaseLayer('movecost'));
+
+  overlaySelect.addEventListener('change', () => {
+    state.overlayLayer = overlaySelect.value;
+    overlayOpacityRow.classList.toggle('shown', state.overlayLayer !== 'none');
+  });
+  overlayOpacitySlider.addEventListener('input', () => {
+    state.overlayOpacity = overlayOpacitySlider.value / 100;
+  });
+
+  showPathsCheckbox.addEventListener('change', () => {
+    state.showPaths = showPathsCheckbox.checked;
+  });
+  showGridCheckbox.addEventListener('change', () => {
+    state.showGrid = showGridCheckbox.checked;
+  });
+  const showDevelopmentCheckbox = document.getElementById('showDevelopment');
+  showDevelopmentCheckbox.addEventListener('change', () => {
+    state.showDevelopment = showDevelopmentCheckbox.checked;
+  });
+
+  let dragging = false, lastX = 0, lastY = 0;
+  let mouseDownX = 0, mouseDownY = 0, mouseMoved = false;
+  const CLICK_MOVE_THRESHOLD = 5;
+
+  canvas.addEventListener('mousedown', (e) => {
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    mouseDownX = e.clientX; mouseDownY = e.clientY; mouseMoved = false;
+    canvas.classList.add('dragging');
+  });
+  window.addEventListener('mouseup', (e) => {
+    dragging = false;
+    canvas.classList.remove('dragging');
+    if (!mouseMoved) handleClick(e.clientX, e.clientY);
+  });
+  window.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    cursorLonLat = worldToLonLat(centerWorld.x + (mx - canvas.width / 2), centerWorld.y + (my - canvas.height / 2), view.zoom);
+
+    if (!dragging) return;
+    if (Math.abs(e.clientX - mouseDownX) > CLICK_MOVE_THRESHOLD ||
+        Math.abs(e.clientY - mouseDownY) > CLICK_MOVE_THRESHOLD) {
+      mouseMoved = true;
+    }
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    view.lon -= dx / worldPixelWidth(view.zoom) * 360;
+    view.lat += dy / worldPixelHeight(view.zoom) * 180;
+    clampView();
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (document.activeElement === factionInput) return;
+    if (e.key === 'Escape') {
+      setSelectedUnit(null);
+      setSpawnArmed(false);
+      setRoadArmed(false);
+      attackArmed = false;
+      btnAttack.classList.remove('armed');
+      selectedCityId = null;
+      hudSelectedCity.textContent = 'none';
+    }
+    if (e.key === 's' || e.key === 'S') setSpawnArmed(!spawnArmed);
+    if (e.key === 'f' || e.key === 'F') foundCityWithSelectedUnit();
+    if (e.key === 'r' || e.key === 'R') setRoadArmed(!roadArmed);
+    if (e.key === 'a' || e.key === 'A') setAttackArmed(!attackArmed);
+    if (e.key === 'Delete' || e.key === 'x' || e.key === 'X') despawnSelected();
+    if (e.key === 'c' || e.key === 'C') collectFromNearestNode();
+  });
+
+  function zoomToward(mx, my, deltaZoom) {
+    const centerWorldBefore = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const cursorWorldBefore = {
+      x: centerWorldBefore.x + (mx - canvas.width / 2),
+      y: centerWorldBefore.y + (my - canvas.height / 2)
+    };
+    const cLonLat = worldToLonLat(cursorWorldBefore.x, cursorWorldBefore.y, view.zoom);
+
+    view.zoom = Math.max(MIN_LEVEL, Math.min(GLOBAL_MAX_LEVEL, view.zoom + deltaZoom));
+
+    const cursorWorldAfter = lonLatToWorld(cLonLat.lon, cLonLat.lat, view.zoom);
+    const newCenterWorld = {
+      x: cursorWorldAfter.x - (mx - canvas.width / 2),
+      y: cursorWorldAfter.y - (my - canvas.height / 2)
+    };
+    const newCenter = worldToLonLat(newCenterWorld.x, newCenterWorld.y, view.zoom);
+    view.lon = newCenter.lon;
+    view.lat = newCenter.lat;
+    clampView();
+  }
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    zoomToward(e.clientX - rect.left, e.clientY - rect.top, -e.deltaY * 0.0025);
+  }, { passive: false });
+
+  let touchMode = null;
+  let touchLastX = 0, touchLastY = 0;
+  let touchStartX = 0, touchStartY = 0, touchMoved = false;
+  const TAP_MOVE_THRESHOLD = 8;
+  let pinchStartDist = 0, pinchStartZoom = 0, pinchMidX = 0, pinchMidY = 0;
+
+  function touchDist(t0, t1) {
+    return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+  }
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      touchMode = 'pan';
+      touchLastX = e.touches[0].clientX;
+      touchLastY = e.touches[0].clientY;
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      touchMoved = false;
+    } else if (e.touches.length === 2) {
+      touchMode = 'pinch';
+      pinchStartDist = touchDist(e.touches[0], e.touches[1]);
+      pinchStartZoom = view.zoom;
+      const rect = canvas.getBoundingClientRect();
+      pinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      pinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (touchMode === 'pan' && e.touches.length === 1) {
+      if (Math.abs(e.touches[0].clientX - touchStartX) > TAP_MOVE_THRESHOLD ||
+          Math.abs(e.touches[0].clientY - touchStartY) > TAP_MOVE_THRESHOLD) {
+        touchMoved = true;
+      }
+      const dx = e.touches[0].clientX - touchLastX;
+      const dy = e.touches[0].clientY - touchLastY;
+      touchLastX = e.touches[0].clientX;
+      touchLastY = e.touches[0].clientY;
+      view.lon -= dx / worldPixelWidth(view.zoom) * 360;
+      view.lat += dy / worldPixelHeight(view.zoom) * 180;
+      clampView();
+    } else if (touchMode === 'pinch' && e.touches.length === 2) {
+      const dist = touchDist(e.touches[0], e.touches[1]);
+      const targetZoom = pinchStartZoom + Math.log2(dist / pinchStartDist);
+      zoomToward(pinchMidX, pinchMidY, targetZoom - view.zoom);
+    }
+  }, { passive: false });
+
+  canvas.addEventListener('touchend', (e) => {
+    if (touchMode === 'pan' && !touchMoved) {
+      handleClick(touchStartX, touchStartY);
+    }
+    if (e.touches.length === 0) touchMode = null;
+  });
+
+  requestAnimationFrame(render);
+  connectWS();
+})();
+</script>
+
+</body>
+</html>

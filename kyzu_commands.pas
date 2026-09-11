@@ -17,6 +17,7 @@ uses
   kyzu_types, kyzu_state, kyzu_pathfinding, kyzu_bakeconfig;
 
 procedure HandleListNodes;
+procedure HandleListUnits;
 procedure HandleSpawn(APayload: TJSONObject);
 procedure HandleDespawn(APayload: TJSONObject);
 procedure HandleMove(APayload: TJSONObject);
@@ -40,6 +41,42 @@ procedure HandleProposePeace(APayload: TJSONObject);
 procedure HandleAcceptPeace(APayload: TJSONObject);
 
 implementation
+
+// Full current unit state for a freshly-connected viewer. Live unit
+// updates continue through spawned/position/despawned events, but a
+// viewer must not have to reconstruct current state from events it may
+// have missed before it connected.
+procedure HandleListUnits;
+var
+  Pair: specialize TPair<string, TUnit>;
+  ListJSON: string;
+  First: Boolean;
+  U: TUnit;
+begin
+  ListJSON := '[';
+  First := True;
+  UnitsLock.Enter;
+  try
+    for Pair in Units do
+    begin
+      U := Pair.Value;
+      if not First then ListJSON := ListJSON + ',';
+      First := False;
+      ListJSON := ListJSON + '{"unit_id":' + JsonQuote(U.ID) +
+        ',"owner":' + JsonQuote(U.Owner) +
+        ',"unit_type":' + JsonQuote(U.UnitType) +
+        ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) +
+        ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) +
+        ',"hp":' + IntToStr(U.HP) +
+        ',"level":' + IntToStr(U.Level) + '}';
+    end;
+  finally
+    UnitsLock.Leave;
+  end;
+  ListJSON := ListJSON + ']';
+
+  SendLine(MakeEventLine('game.event.unit_list', '{"units":' + ListJSON + '}'));
+end;
 
 // Emits the full current node state in one message rather than one
 // event per node - a freshly-connected viewer needs this exactly once

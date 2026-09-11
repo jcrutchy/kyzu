@@ -58,6 +58,8 @@ begin
 
     if Topic = 'game.cmd.ping' then
       SendLine('{"topic":"game.event.pong","payload":"{}"}')
+    else if Topic = 'game.cmd.list_units' then
+      HandleListUnits
     else if Topic = 'game.cmd.spawn' then
     begin
       if Assigned(PayloadData) and (PayloadData.JSONType = jtObject) then

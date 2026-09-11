@@ -472,6 +472,7 @@ var
   StepCost, MoveAmount, DX, DY, Dist: Double;
   Pair: specialize TPair<string, TUnit>;
   KeyIdx: Integer;
+  PositionLine: string;
 begin
   UnitsLock.Enter;
   try
@@ -550,11 +551,17 @@ begin
 
       Units.AddOrSetValue(Keys[i], U);
 
-      SendLine(MakeEventLine('game.event.position', '{"unit_id":' + JsonQuote(Keys[i]) +
-        ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) + ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) + '}'));
+      // Build the event while the unit state is protected, but do not hold
+      // UnitsLock across stdout I/O. A slow downstream consumer (VDRX, a
+      // WebSocket client, or even a full OS pipe) must not stall commands,
+      // combat, spawning, or other simulation work behind this lock.
+      PositionLine := MakeEventLine('game.event.position', '{"unit_id":' + JsonQuote(Keys[i]) +
+        ',"lon":' + Format('%.4f', [GridToLon(U.GX)]) + ',"lat":' + Format('%.4f', [GridToLat(U.GY)]) + '}');
     finally
       UnitsLock.Leave;
     end;
+
+    SendLine(PositionLine);
   end;
 end;
 
