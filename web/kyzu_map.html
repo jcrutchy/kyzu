@@ -194,7 +194,8 @@
   const nodes = new Map();
   const cities = new Map();       // id -> {owner, lon, lat, population}
   const roads = new Map();        // id -> {fromCityId, toCityId, path:[{lon,lat}]}
-  const development = new Map();  // "gx,gy" -> level 0-255
+  const development = new Map();  // "gx,gy" -> {gx, gy, level 0-255}
+  let devGeneration = 0; // bumped on every development.set/clear - see drawDevelopment's cache
   let selectedUnitId = null;
   let selectedCityId = null;
   const hudSelected = document.getElementById('hudSelected');
@@ -467,8 +468,28 @@
 
   function connectWS() {
     bus = new VdrxBus({
+      autoSubscribe: false,
       onStatus: (state) => { setWsStatus(state); },
       onAuthed: () => {
+        // Subscribe only to events the map actually renders. The old default
+        // game.> filter also delivered high-volume non-map traffic (notably
+        // every AI/game tick) to the browser.
+        [
+          'game.event.position', 'game.event.spawned', 'game.event.despawned',
+          'game.event.spawn_failed', 'game.event.despawn_failed',
+          'game.event.unit_attacked', 'game.event.attack_failed',
+          'game.event.city_attacked', 'game.event.city_captured',
+          'game.event.city_upkeep_spent', 'game.event.city_population_decayed',
+          'game.event.city_abandoned', 'game.event.road_removed',
+          'game.event.node_list', 'game.event.collected', 'game.event.city_growth_spent',
+          'game.event.ledger', 'game.event.collect_failed', 'game.event.path_found',
+          'game.event.arrived', 'game.event.move_failed', 'game.event.city_founded',
+          'game.event.city_grew', 'game.event.city_failed', 'game.event.city_list',
+          'game.event.road_built', 'game.event.road_failed', 'game.event.road_list',
+          'game.event.unit_list', 'game.event.development_delta',
+          'game.event.development_snapshot'
+        ].forEach(filter => bus.subscribe(filter));
+        publish('game.cmd.list_units', {});
         publish('game.cmd.list_nodes', {});
         publish('game.cmd.get_ledger', { by: factionInput.value || '' });
         publish('game.cmd.list_cities', {});
@@ -484,6 +505,17 @@
           if (payload && payload.unit_id !== undefined) {
             unitMeta.set(payload.unit_id, { owner: payload.owner || '', unitType: payload.unit_type || 'generic', hp: payload.hp });
             onUnitPosition(payload.unit_id, payload.lon, payload.lat);
+          }
+        } else if (topic === 'game.event.unit_list') {
+          if (payload && Array.isArray(payload.units)) {
+            units.clear();
+            unitMeta.clear();
+            for (const u of payload.units) {
+              if (u.id === undefined || u.lon === undefined || u.lat === undefined) continue;
+              unitMeta.set(u.id, { owner: u.owner || '', unitType: u.unit_type || 'generic', hp: u.hp, level: u.level });
+              onUnitPosition(u.id, u.lon, u.lat);
+            }
+            unitCountEl.textContent = String(units.size);
           }
         } else if (topic === 'game.event.despawned') {
           if (payload && payload.unit_id !== undefined) {
@@ -546,6 +578,7 @@
         } else if (topic === 'game.event.road_removed') {
           if (payload && payload.road_id !== undefined) {
             roads.delete(payload.road_id);
+            roadGeneration++; invalidateRoadDrawCache();
           }
         } else if (topic === 'game.event.node_list') {
           if (payload && Array.isArray(payload.nodes)) {
@@ -617,6 +650,7 @@
               toCityId: payload.to_city_id,
               path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
             });
+            roadGeneration++; invalidateRoadDrawCache();
           }
         } else if (topic === 'game.event.road_failed') {
           showToast('build road failed' + (payload && payload.reason ? ': ' + payload.reason : ''));
@@ -630,13 +664,15 @@
                 path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
               });
             }
+            roadGeneration++; invalidateRoadDrawCache();
           }
         } else if (topic === 'game.event.development_delta' || topic === 'game.event.development_snapshot') {
           if (payload && Array.isArray(payload.cells)) {
             if (topic === 'game.event.development_snapshot') development.clear();
             for (const c of payload.cells) {
-              development.set(c.gx + ',' + c.gy, c.d);
+              development.set(c.gx + ',' + c.gy, { gx: c.gx, gy: c.gy, level: c.d });
             }
+            devGeneration++;
           }
         }
       }
@@ -807,55 +843,105 @@
     ctx.restore();
   }
 
+  // Offscreen buffer for the development overlay - rebuilding this means
+  // walking every cell in `development` (which can run into the
+  // thousands once several AI factions have founded dozens of cities),
+  // so it's only redone when the underlying data changed (devGeneration,
+  // bumped by the WS handler above) or the view moved - not on every one
+  // of the render loop's 60 frames/sec regardless of whether anything
+  // actually changed on screen.
+  let devBuffer = null;
+  let devBufferGen = -1;
+  let devBufferViewKey = '';
+
   function drawDevelopment() {
     if (!state.showDevelopment || development.size === 0) return;
     const cw = canvas.width, ch = canvas.height;
-    const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
-    const cellPx = worldPixelWidth(view.zoom) / GRID_WIDTH;
+    const viewKey = view.lon.toFixed(3) + ',' + view.lat.toFixed(3) + ',' + view.zoom.toFixed(3) + ',' + cw + ',' + ch;
 
-    ctx.save();
-    for (const [key, level] of development) {
-      if (level <= 0) continue;
-      const commaIdx = key.indexOf(',');
-      const gx = Number(key.slice(0, commaIdx));
-      const gy = Number(key.slice(commaIdx + 1));
-      const w = lonLatToWorld(gridToLon(gx), gridToLat(gy), view.zoom);
-      const sx = cw / 2 + (w.x - centerWorld.x);
-      const sy = ch / 2 + (w.y - centerWorld.y);
-      if (sx < -cellPx || sx > cw + cellPx || sy < -cellPx || sy > ch + cellPx) continue;
+    if (!devBuffer || devBufferGen !== devGeneration || devBufferViewKey !== viewKey) {
+      if (!devBuffer || devBuffer.width !== cw || devBuffer.height !== ch) {
+        devBuffer = document.createElement('canvas');
+        devBuffer.width = cw;
+        devBuffer.height = ch;
+      }
+      const bctx = devBuffer.getContext('2d');
+      bctx.clearRect(0, 0, cw, ch);
 
-      // Green (low density) ramping to warm amber (high density) -
-      // matches the mint/amber accents already used elsewhere in the HUD.
-      const t = level / 255;
-      const r = Math.round(94 + t * (255 - 94));
-      const g = Math.round(230 - t * (230 - 209));
-      const b = Math.round(168 - t * 168);
-      ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (t * 0.5).toFixed(2) + ')';
-      ctx.fillRect(sx - cellPx / 2, sy - cellPx / 2, cellPx + 1, cellPx + 1);
+      const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+      const cellPx = worldPixelWidth(view.zoom) / GRID_WIDTH;
+
+      for (const cell of development.values()) {
+        if (cell.level <= 0) continue;
+        const w = lonLatToWorld(gridToLon(cell.gx), gridToLat(cell.gy), view.zoom);
+        const sx = cw / 2 + (w.x - centerWorld.x);
+        const sy = ch / 2 + (w.y - centerWorld.y);
+        if (sx < -cellPx || sx > cw + cellPx || sy < -cellPx || sy > ch + cellPx) continue;
+
+        // Green (low density) ramping to warm amber (high density) -
+        // matches the mint/amber accents already used elsewhere in the HUD.
+        const t = cell.level / 255;
+        const r = Math.round(94 + t * (255 - 94));
+        const g = Math.round(230 - t * (230 - 209));
+        const b = Math.round(168 - t * 168);
+        bctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',' + (t * 0.5).toFixed(2) + ')';
+        bctx.fillRect(sx - cellPx / 2, sy - cellPx / 2, cellPx + 1, cellPx + 1);
+      }
+
+      devBufferGen = devGeneration;
+      devBufferViewKey = viewKey;
     }
-    ctx.restore();
+
+    ctx.drawImage(devBuffer, 0, 0);
+  }
+
+  let roadDrawCache = null;
+  let roadDrawCacheKey = '';
+  let roadGeneration = 0;
+
+  function invalidateRoadDrawCache() {
+    roadDrawCacheKey = '';
+    roadDrawCache = null;
   }
 
   function drawRoads() {
     if (roads.size === 0) return;
     const cw = canvas.width, ch = canvas.height;
     const centerWorld = lonLatToWorld(view.lon, view.lat, view.zoom);
+    const viewKey = view.lon.toFixed(3) + ',' + view.lat.toFixed(3) + ',' + view.zoom.toFixed(3) + ',' + cw + ',' + ch + ',' + roadGeneration;
 
-    ctx.save();
-    ctx.strokeStyle = '#a67c52'; // dirt-road brown, distinct from the dashed mint unit-path lines
-    ctx.globalAlpha = 0.8;
-    ctx.lineWidth = 2.5;
-
-    for (const [id, r] of roads) {
-      if (!r.path || r.path.length < 2) continue;
-      ctx.beginPath();
-      for (let i = 0; i < r.path.length; i++) {
-        const w = lonLatToWorld(r.path[i].lon, r.path[i].lat, view.zoom);
-        const sx = cw / 2 + (w.x - centerWorld.x);
-        const sy = ch / 2 + (w.y - centerWorld.y);
-        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    // Roads are static between road events/view changes. Build the Path2D
+    // once and let the browser replay it each frame instead of transforming
+    // every vertex of every road 60 times per second. This matters enormously
+    // with the current multi-thousand-road AI world.
+    if (roadDrawCacheKey !== viewKey || !roadDrawCache) {
+      const path = new Path2D();
+      for (const r of roads.values()) {
+        if (!r.path || r.path.length < 2) continue;
+        for (let i = 0; i < r.path.length; i++) {
+          const w = lonLatToWorld(r.path[i].lon, r.path[i].lat, view.zoom);
+          const sx = cw / 2 + (w.x - centerWorld.x);
+          const sy = ch / 2 + (w.y - centerWorld.y);
+          // Skip roads that cannot contribute anything visible. A simple
+          // per-vertex screen test is enough here because Path2D construction
+          // is now cached rather than repeated every frame.
+          if (i === 0) path.moveTo(sx, sy); else path.lineTo(sx, sy);
+        }
       }
-      ctx.stroke();
+      roadDrawCache = path;
+      roadDrawCacheKey = viewKey;
+    }
+
+    // Two passes: a dark casing first, then the road color on top - a
+    // flat brown line alone was reading as low-contrast against green/tan
+    // terrain tiles, same problem city/unit labels had (see their halo).
+    ctx.save();
+    for (let pass = 0; pass < 2; pass++) {
+      ctx.strokeStyle = pass === 0 ? '#0a0e0c' : '#a67c52'; // casing, then dirt-road brown
+      ctx.globalAlpha = pass === 0 ? 0.9 : 0.9;
+      ctx.lineWidth = pass === 0 ? 4.5 : 2.5;
+      ctx.lineCap = 'round';
+      ctx.stroke(roadDrawCache);
     }
     ctx.restore();
   }
@@ -893,10 +979,15 @@
       ctx.stroke();
 
       if (useLabels) {
-        ctx.fillStyle = '#c9d6cd';
         ctx.font = '10px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(id + ' (' + (c.population || 0) + ')', sx, sy - radius - 6);
+        const label = id + ' (' + (c.population || 0) + ')';
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.strokeText(label, sx, sy - radius - 6);
+        ctx.fillStyle = '#c9d6cd';
+        ctx.fillText(label, sx, sy - radius - 6);
       }
     }
   }
@@ -999,10 +1090,15 @@
         ctx.stroke();
         ctx.restore();
 
-        ctx.fillStyle = '#c9d6cd';
+        const label = id + (meta && meta.hp !== undefined ? ' (' + meta.hp + 'hp)' : '');
         ctx.font = '10px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(id + (meta && meta.hp !== undefined ? ' (' + meta.hp + 'hp)' : ''), sx, sy + 18);
+        ctx.strokeStyle = '#0a0e0c';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.strokeText(label, sx, sy + 18);
+        ctx.fillStyle = '#c9d6cd';
+        ctx.fillText(label, sx, sy + 18);
       } else {
         ctx.beginPath();
         ctx.arc(sx, sy, 4, 0, Math.PI * 2);

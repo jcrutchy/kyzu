@@ -9,27 +9,85 @@
         <Filename Value="kyzu.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <CursorPos X="14" Y="11"/>
+        <TopLine Value="131"/>
+        <CursorPos X="71" Y="16"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="kyzu_pathfinding.pas"/>
         <IsPartOfProject Value="True"/>
-        <EditorIndex Value="2"/>
-        <CursorPos X="9" Y="4"/>
+        <EditorIndex Value="10"/>
+        <CursorPos X="73" Y="12"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
       <Unit>
         <Filename Value="kyzu_bakeconfig.pas"/>
         <IsPartOfProject Value="True"/>
+        <EditorIndex Value="9"/>
+        <CursorPos X="81" Y="4"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_types.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="8"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_dispatch.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="7"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_persist.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="6"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_ai.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="5"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_sim.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="4"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_commands.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="3"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_loaders.pas"/>
+        <IsPartOfProject Value="True"/>
+        <EditorIndex Value="2"/>
+        <UsageCount Value="20"/>
+        <Loaded Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="kyzu_state.pas"/>
+        <IsPartOfProject Value="True"/>
         <EditorIndex Value="1"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="1">
+    <JumpHistory HistoryIndex="2">
       <Position>
         <Filename Value="kyzu.lpr"/>
         <Caret Line="8" Column="21"/>
@@ -37,6 +95,10 @@
       <Position>
         <Filename Value="kyzu_pathfinding.pas"/>
         <Caret Line="10" Column="45"/>
+      </Position>
+      <Position>
+        <Filename Value="kyzu.lpr"/>
+        <Caret Line="13" Column="41"/>
       </Position>
     </JumpHistory>
     <RunParams>
