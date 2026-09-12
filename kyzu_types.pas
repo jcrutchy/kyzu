@@ -57,11 +57,38 @@ type
   // the same A* used for unit movement, then cached and reused as a
   // linear development source. Roads never move and are never removed
   // once built (no despawn/demolish command exists yet).
+  //
+  // Construction is progressive, not instant: HandleBuildRoad commits
+  // the full Path immediately (so duplicate-route checks and replay
+  // both have the final route to work with) but a freshly-built road
+  // only counts as built out to kyzu_state's RoadBuiltCells(R) - a
+  // deterministic function of (Tick - StartTick) * Balance.
+  // RoadBuildCellsPerTick, same "recompute from a start marker, don't
+  // log every step" idiom TResearchInProgress.StartTick already uses.
+  //
+  // ForceComplete exists because that idiom does NOT extend cleanly to
+  // roads the way it does to research: research reverting to "just
+  // started" on replay costs at most one in-progress research run, but
+  // a road log can easily hold hundreds of long-finished roads, and
+  // Tick itself resets to 0 on every restart - so naively resetting
+  // StartTick to 0 for every replayed road would make the ENTIRE
+  // existing road network revert to 0% built and visibly regrow after
+  // every ordinary restart, not just the deliberate full-log-wipe
+  // restarts meant to watch fresh construction. ForceComplete flips the
+  // default the other way: a road reconstructed from a log line (see
+  // kyzu_persist.pas) is assumed already complete, and only a road
+  // actually created via HandleBuildRoad during the CURRENT run goes
+  // through the timer. The accepted tradeoff is the mirror image of
+  // research's: a road genuinely still under construction at the exact
+  // moment of a shutdown will be treated as finished a little early on
+  // the next restart, rather than the whole network wiping itself.
   TRoad = record
     ID: string;
     FromCityID, ToCityID: string;
     Owner: string;
     Path: TGridPath;
+    StartTick: Int64;
+    ForceComplete: Boolean;
   end;
 
   // Quantized development intensity for one cell, carrying its own GX/GY
@@ -163,6 +190,13 @@ type
     RoadDevelopmentRadiusCells: Integer; // used as a raw FOR-loop bound (see RecomputeDevelopment) - must stay a whole number of cells, unlike the other *Cells fields which are fractional distance thresholds
     RoadDevelopmentPeak: Double;
     DevelopmentBroadcastThreshold: Integer;
+    // How many path cells a road's construction front advances per
+    // tick - see TRoad.StartTick's comment. Deliberately a Double
+    // (like BaseSpeed) even though a "cell" reads as a whole-number
+    // idea: RoadBuiltCells truncates to Integer for the caller, but
+    // keeping the rate fractional means sub-1-cell-per-tick paces
+    // (slow, watchable construction) aren't rounded away to 0.
+    RoadBuildCellsPerTick: Double;
 
     AttackRangeCells: Double;
     SiegeDamagePerAttack: Integer;

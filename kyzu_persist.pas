@@ -234,6 +234,15 @@ begin
           R.FromCityID := Obj.Get('from_city_id', '');
           R.ToCityID := Obj.Get('to_city_id', '');
           R.Owner := Obj.Get('owner', '');
+          // A road reconstructed from the log is assumed already
+          // complete, NOT "just started" - see TRoad.ForceComplete's
+          // comment for why that's the safer default here (unlike
+          // TResearchInProgress.StartTick above, which genuinely does
+          // reset to "just started" on replay). StartTick is set to
+          // match anyway so RoadBuiltCells has a sane value if
+          // ForceComplete is ever cleared by something later.
+          R.StartTick := 0;
+          R.ForceComplete := True;
           PathArr := TJSONArray(Obj.Find('path'));
           if Assigned(PathArr) then
           begin

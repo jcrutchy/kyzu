@@ -104,6 +104,8 @@ procedure DeductCost(const AOwner: string; const ACosts: TResourceCostList);
 function CostsToJSON(const ACosts: TResourceCostList): string;
 function IsCityRoadConnected(const ACityID, AOwner: string): Boolean;
 function RoadExistsBetween(const ACityID1, ACityID2: string): Boolean;
+function RoadBuiltCells(const R: TRoad): Integer;
+function RoadIsComplete(const R: TRoad): Boolean;
 
 implementation
 
@@ -547,12 +549,38 @@ begin
   Result := Result + ']';
 end;
 
+// How many of R.Path's cells are actually built as of the current
+// Tick - a deterministic function of elapsed ticks since StartTick,
+// never logged or persisted directly (see TRoad.StartTick's comment).
+// Capped at Length(R.Path) so a long-finished road doesn't need any
+// special-casing at call sites - "built" and "total" just converge.
+function RoadBuiltCells(const R: TRoad): Integer;
+var
+  Elapsed: Int64;
+begin
+  if R.ForceComplete then Exit(Length(R.Path));
+  Elapsed := Tick - R.StartTick;
+  if Elapsed <= 0 then Exit(0);
+  Result := Trunc(Elapsed * Balance.RoadBuildCellsPerTick);
+  if Result > Length(R.Path) then Result := Length(R.Path);
+end;
+
+function RoadIsComplete(const R: TRoad): Boolean;
+begin
+  Result := RoadBuiltCells(R) >= Length(R.Path);
+end;
+
 // True if ACityID has a road to any OTHER city owned by AOwner. Roads
 // are snapshotted under RoadsLock and released before touching
 // CitiesLock for each endpoint lookup, rather than holding both locks
 // at once - HandleBuildRoad already acquires CitiesLock then RoadsLock
 // (to validate both cities before adding the road), so locking them in
 // the opposite order here would risk a deadlock between the two.
+//
+// Only a COMPLETE road counts - a road still under construction
+// doesn't grant the upkeep-free benefit yet, matching the "it's not
+// actually usable until it's finished" framing that motivated making
+// construction progressive in the first place.
 function IsCityRoadConnected(const ACityID, AOwner: string): Boolean;
 var
   RoadSnapshot: array of TRoad;
@@ -578,6 +606,8 @@ begin
 
   for i := 0 to High(RoadSnapshot) do
   begin
+    if not RoadIsComplete(RoadSnapshot[i]) then Continue;
+
     OtherCityID := '';
     if RoadSnapshot[i].FromCityID = ACityID then
       OtherCityID := RoadSnapshot[i].ToCityID

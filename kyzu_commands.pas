@@ -682,6 +682,14 @@ begin
   R.ToCityID := ToCityID;
   R.Owner := Actor;
   R.Path := Path;
+  // Construction starts now, not "is finished now" - see TRoad.StartTick's
+  // comment. The full Path is committed immediately (duplicate-route
+  // checks and RecomputeDevelopment's road stamping both need it), but
+  // RoadBuiltCells(R) is 0 at this exact Tick. ForceComplete is False
+  // here (unlike a replayed road) because this one genuinely needs to
+  // grow in real time - that's the whole point of building it live.
+  R.StartTick := Tick;
+  R.ForceComplete := False;
 
   RoadsLock.Enter;
   try
@@ -690,12 +698,19 @@ begin
     RoadsLock.Leave;
   end;
 
+  // start_tick is logged (not built_cells - that's recomputed from
+  // start_tick + the replay Tick, same as everything else derived from
+  // a *Tick field) so replay reconstructs the correct construction
+  // progress for wherever the log leaves off, not "always freshly
+  // started".
   LogEvent('{"type":"road_built","road_id":' + JsonQuote(RoadID) +
     ',"from_city_id":' + JsonQuote(FromCityID) + ',"to_city_id":' + JsonQuote(ToCityID) +
-    ',"owner":' + JsonQuote(Actor) + ',"path":' + BuildPathJSON(Path) + '}');
+    ',"owner":' + JsonQuote(Actor) + ',"start_tick":' + IntToStr(R.StartTick) +
+    ',"path":' + BuildPathJSON(Path) + '}');
   SendLine(MakeEventLine('game.event.road_built', '{"road_id":' + JsonQuote(RoadID) +
     ',"from_city_id":' + JsonQuote(FromCityID) + ',"to_city_id":' + JsonQuote(ToCityID) +
-    ',"steps":' + IntToStr(Length(Path)) + ',"path":' + BuildPathJSON(Path) + '}'));
+    ',"steps":' + IntToStr(Length(Path)) + ',"built_cells":0,"total_cells":' + IntToStr(Length(Path)) +
+    ',"path":' + BuildPathJSON(Path) + '}'));
 end;
 
 // Handles both unit-vs-unit and unit-vs-city combat, distinguished by
@@ -1054,6 +1069,8 @@ begin
         ',"from_city_id":' + JsonQuote(R.FromCityID) +
         ',"to_city_id":' + JsonQuote(R.ToCityID) +
         ',"owner":' + JsonQuote(R.Owner) +
+        ',"built_cells":' + IntToStr(RoadBuiltCells(R)) +
+        ',"total_cells":' + IntToStr(Length(R.Path)) +
         ',"path":' + BuildPathJSON(R.Path) + '}';
     end;
   finally

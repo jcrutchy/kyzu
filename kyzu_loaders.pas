@@ -115,6 +115,12 @@ begin
   Result.RoadDevelopmentRadiusCells := 2;
   Result.RoadDevelopmentPeak := 60.0;
   Result.DevelopmentBroadcastThreshold := 2;
+  // 0.2 cells/tick at the ~20 ticks/sec main loop is 1 cell every 5
+  // ticks (~0.25s/cell) - a 20-cell road takes ~5s to finish, a
+  // 200-cell one ~50s. Slow enough to watch a road extend across the
+  // map instead of it just appearing, fast enough not to stall a
+  // spectator session waiting on it.
+  Result.RoadBuildCellsPerTick := 0.2;
 
   Result.AttackRangeCells := 1.5;
   Result.SiegeDamagePerAttack := 20;
@@ -207,6 +213,7 @@ begin
     Result.RoadDevelopmentRadiusCells := Obj.Get('road_development_radius_cells', Result.RoadDevelopmentRadiusCells);
     Result.RoadDevelopmentPeak := Obj.Get('road_development_peak', Result.RoadDevelopmentPeak);
     Result.DevelopmentBroadcastThreshold := Obj.Get('development_broadcast_threshold', Result.DevelopmentBroadcastThreshold);
+    Result.RoadBuildCellsPerTick := Obj.Get('road_build_cells_per_tick', Result.RoadBuildCellsPerTick);
 
     Result.AttackRangeCells := Obj.Get('attack_range_cells', Result.AttackRangeCells);
     Result.SiegeDamagePerAttack := Obj.Get('siege_damage_per_attack', Result.SiegeDamagePerAttack);

@@ -486,6 +486,7 @@
           'game.event.arrived', 'game.event.move_failed', 'game.event.city_founded',
           'game.event.city_grew', 'game.event.city_failed', 'game.event.city_list',
           'game.event.road_built', 'game.event.road_failed', 'game.event.road_list',
+          'game.event.road_progress',
           'game.event.unit_list', 'game.event.development_delta',
           'game.event.development_snapshot'
         ].forEach(filter => bus.subscribe(filter));
@@ -649,7 +650,9 @@
             roads.set(payload.road_id, {
               fromCityId: payload.from_city_id,
               toCityId: payload.to_city_id,
-              path: payload.path.map(p => ({ lon: p[0], lat: p[1] }))
+              path: payload.path.map(p => ({ lon: p[0], lat: p[1] })),
+              builtCells: payload.built_cells || 0,
+              totalCells: payload.total_cells !== undefined ? payload.total_cells : payload.path.length
             });
             invalidateRoadDrawCache();
           }
@@ -659,13 +662,29 @@
           if (payload && Array.isArray(payload.roads)) {
             roads.clear();
             for (const r of payload.roads) {
+              const path = (r.path || []).map(p => ({ lon: p[0], lat: p[1] }));
               roads.set(r.id, {
                 fromCityId: r.from_city_id,
                 toCityId: r.to_city_id,
-                path: (r.path || []).map(p => ({ lon: p[0], lat: p[1] }))
+                path: path,
+                builtCells: r.built_cells !== undefined ? r.built_cells : path.length,
+                totalCells: r.total_cells !== undefined ? r.total_cells : path.length
               });
             }
             invalidateRoadDrawCache();
+          }
+        } else if (topic === 'game.event.road_progress') {
+          if (payload && Array.isArray(payload.roads)) {
+            let changed = false;
+            for (const rp of payload.roads) {
+              const r = roads.get(rp.road_id);
+              if (r) {
+                r.builtCells = rp.built_cells;
+                r.totalCells = rp.total_cells;
+                changed = true;
+              }
+            }
+            if (changed) invalidateRoadDrawCache();
           }
         } else if (topic === 'game.event.development_delta' || topic === 'game.event.development_snapshot') {
           if (payload && Array.isArray(payload.cells)) {
@@ -929,8 +948,12 @@
       const roadPath = new Path2D();
 
       for (const r of roads.values()) {
-        if (!r.path || r.path.length < 2) continue;
-        for (let i = 0; i < r.path.length; i++) {
+        // Only the built portion of the path is a real road yet - the
+        // rest is just the reserved route, so it isn't drawn until the
+        // construction front (updated via road_progress) reaches it.
+        const builtCount = r.builtCells !== undefined ? r.builtCells : (r.path ? r.path.length : 0);
+        if (!r.path || builtCount < 2) continue;
+        for (let i = 0; i < builtCount; i++) {
           const w = lonLatToWorld(r.path[i].lon, r.path[i].lat, view.zoom);
           const sx = cw / 2 + (w.x - centerWorld.x);
           const sy = ch / 2 + (w.y - centerWorld.y);

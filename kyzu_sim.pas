@@ -270,6 +270,8 @@ var
   Pair: specialize TPair<string, TDensityCell>;
   DeltaJSON: string;
   First: Boolean;
+  RoadProgressJSON: string;
+  FirstRoadProgress: Boolean;
 begin
   Contrib := specialize TDictionary<string, TDensityCell>.Create;
   try
@@ -319,10 +321,15 @@ begin
       CitiesLock.Leave;
     end;
 
+    // Only the BUILT portion of each road contributes development -
+    // an in-progress road's still-unbuilt tail is just a pathfinding
+    // result sitting in R.Path, not a real road yet, and shouldn't
+    // stamp density (or, via IsCityRoadConnected, grant upkeep relief)
+    // for ground the construction front hasn't reached.
     RoadsLock.Enter;
     try
       for R in Roads.Values do
-        for i := 0 to High(R.Path) do
+        for i := 0 to RoadBuiltCells(R) - 1 do
           for gy := R.Path[i].Y - Balance.RoadDevelopmentRadiusCells to R.Path[i].Y + Balance.RoadDevelopmentRadiusCells do
             for gx := R.Path[i].X - Balance.RoadDevelopmentRadiusCells to R.Path[i].X + Balance.RoadDevelopmentRadiusCells do
             begin
@@ -398,6 +405,38 @@ begin
     begin
       DeltaJSON := DeltaJSON + ']';
       SendLine(MakeEventLine('game.event.development_delta', '{"cells":' + DeltaJSON + '}'));
+    end;
+
+    // Piggybacks on this same DevelopmentUpdateTicks cadence rather than
+    // a separate timer - roads already get walked above for density, so
+    // this just reports what RoadBuiltCells already computed for each
+    // one. Only still-under-construction roads are reported; once a
+    // road completes, the client already has its full path from
+    // road_built/road_list and needs no further updates - same
+    // "broadcast only while something's actually changing" shape as
+    // development_delta above.
+    if ABroadcast then
+    begin
+      RoadProgressJSON := '[';
+      FirstRoadProgress := True;
+      RoadsLock.Enter;
+      try
+        for R in Roads.Values do
+        begin
+          if RoadIsComplete(R) then Continue;
+          if not FirstRoadProgress then RoadProgressJSON := RoadProgressJSON + ',';
+          FirstRoadProgress := False;
+          RoadProgressJSON := RoadProgressJSON + Format('{"road_id":%s,"built_cells":%d,"total_cells":%d}',
+            [JsonQuote(R.ID), RoadBuiltCells(R), Length(R.Path)]);
+        end;
+      finally
+        RoadsLock.Leave;
+      end;
+      if not FirstRoadProgress then
+      begin
+        RoadProgressJSON := RoadProgressJSON + ']';
+        SendLine(MakeEventLine('game.event.road_progress', '{"roads":' + RoadProgressJSON + '}'));
+      end;
     end;
   finally
     Contrib.Free;
