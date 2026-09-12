@@ -8,7 +8,7 @@ uses
   {$ENDIF}
   SysUtils, Classes, Math, SyncObjs, Generics.Collections, fpjson, jsonparser,
   kyzu_bakeconfig, kyzu_pathfinding,
-  kyzu_types, kyzu_state, kyzu_loaders, kyzu_commands, kyzu_sim, kyzu_ai,
+  kyzu_types, kyzu_state, kyzu_loaders, kyzu_commands, kyzu_sim, kyzu_ai, kyzu_selftest,
   kyzu_dispatch, kyzu_persist;
 
 type
@@ -143,6 +143,17 @@ begin
   // recompute. Not broadcast - nothing is subscribed yet.
   RecomputeDevelopment(False);
 
+  // Run the fast startup regression suite before accepting commands or
+  // entering the simulation loop. The suite only inspects loaded state and
+  // deterministic helper functions, so it cannot mutate the persistent game
+  // log or world. A dedicated --self-test mode uses the exact same startup
+  // path, then exits successfully instead of entering the live tick loop.
+  if not RunStartupSelfTests then
+  begin
+    SendLine(MakeEventLine('game.event.startup_failed', '{"reason":"startup regression tests failed"}'));
+    Halt(1);
+  end;
+
   // Open for appending only after the full replay read pass above - if
   // this were opened first and appended to while also being read, we'd
   // risk replaying partially-written data from this same run.
@@ -151,6 +162,13 @@ begin
     Append(EventLogFile)
   else
     Rewrite(EventLogFile);
+
+  if (ParamCount >= 1) and (ParamStr(1) = '--self-test') then
+  begin
+    LogDiag('KYZU self-test mode complete: PASS');
+    CloseFile(EventLogFile);
+    Halt(0);
+  end;
 
   // Grid/Config/EventLogFile are all read-only or append-only from here
   // on, so it's safe to start the reader thread only now - no window

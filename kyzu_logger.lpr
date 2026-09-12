@@ -136,14 +136,28 @@ begin
   // installs that have the runtime .so.0 but not the -dev package's
   // unversioned "libsqlite3.so" symlink InitializeSqlite's default
   // name expects.
-  Loaded := TryInitializeSqlite() >= 0;
-  if not Loaded then Loaded := TryInitializeSqlite('libsqlite3.so.0') >= 0;
-  if not Loaded then Loaded := TryInitializeSqlite('libsqlite3.so') >= 0;
-  if not Loaded then
-  begin
-    LogDiag('Could not load the SQLite3 library under any known name - is it installed?');
-    Halt(1);
+  LogDiag('[TEST] SQLite library ............... CHECKING');
+  try
+    Loaded := TryInitializeSqlite() >= 0;
+    if not Loaded then Loaded := TryInitializeSqlite('libsqlite3.so.0') >= 0;
+    if not Loaded then Loaded := TryInitializeSqlite('libsqlite3.so') >= 0;
+    if not Loaded then
+    begin
+      LogDiag('[TEST] SQLite library ............... FAIL');
+      LogDiag('       Could not load the SQLite3 library.');
+      LogDiag('       Tried: sqlite3.dll, libsqlite3.so.0 and libsqlite3.so');
+      Halt(1);
+    end;
+    LogDiag('[TEST] SQLite library ............... PASS');
+  except
+    on E: Exception do
+    begin
+      LogDiag('[TEST] SQLite library ............... FAIL');
+      LogDiag('       ' + E.Message);
+      Halt(1);
+    end;
   end;
+  LogDiag('[INFO] SQLite library loaded successfully.');
 
   if sqlite3_open(pansichar(APath), @DB) <> SQLITE_OK then
   begin

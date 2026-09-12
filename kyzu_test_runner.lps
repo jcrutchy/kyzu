@@ -6,25 +6,16 @@
     <BuildModes Active="Default"/>
     <Units>
       <Unit>
-        <Filename Value="kyzu_logger.lpr"/>
+        <Filename Value="kyzu_test_runner.lpr"/>
         <IsPartOfProject Value="True"/>
         <IsVisibleTab Value="True"/>
-        <TopLine Value="135"/>
-        <CursorPos X="98" Y="146"/>
+        <TopLine Value="161"/>
+        <CursorPos Y="204"/>
         <UsageCount Value="20"/>
         <Loaded Value="True"/>
       </Unit>
     </Units>
-    <JumpHistory HistoryIndex="1">
-      <Position>
-        <Filename Value="kyzu_logger.lpr"/>
-        <Caret Line="562" Column="30" TopLine="460"/>
-      </Position>
-      <Position>
-        <Filename Value="kyzu_logger.lpr"/>
-        <Caret Line="157" Column="56" TopLine="125"/>
-      </Position>
-    </JumpHistory>
+    <JumpHistory HistoryIndex="-1"/>
     <RunParams>
       <FormatVersion Value="2"/>
       <Modes ActiveMode=""/>
